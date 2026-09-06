@@ -46,11 +46,11 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
 
     #[cfg(unix)]
     {
-        copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
+        copy_flush(&mut socket_to_stdout, &mut stdout)
     }
     #[cfg(windows)]
     {
-        copy_socket_to_stdout(&mut socket_to_stdout, &mut stdout, &upload_done).map(|_| ())
+        copy_socket_to_stdout(&mut socket_to_stdout, &mut stdout, &upload_done)
     }
 }
 
@@ -59,36 +59,32 @@ fn copy_socket_to_stdout<W: io::Write>(
     stream: &mut crate::ipc::LocalStream,
     stdout: &mut W,
     upload_done: &AtomicBool,
-) -> io::Result<u64> {
+) -> io::Result<()> {
     let mut buffer = [0_u8; 16 * 1024];
-    let mut total = 0;
     while !upload_done.load(Ordering::Acquire) {
         match crate::ipc::poll_local_stream_read_count(stream, &mut buffer)? {
             crate::ipc::LocalStreamReadCount::Data(read) => {
                 stdout.write_all(&buffer[..read])?;
                 stdout.flush()?;
-                total += read as u64;
             }
             crate::ipc::LocalStreamReadCount::Pending => thread::sleep(BRIDGE_READ_POLL),
             crate::ipc::LocalStreamReadCount::Closed => break,
         }
     }
-    Ok(total)
+    Ok(())
 }
 
-fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
+fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
     let mut buffer = [0_u8; 16 * 1024];
-    let mut total = 0;
     loop {
         let read = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(total),
+            Ok(0) => return Ok(()),
             Ok(read) => read,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(err),
         };
         writer.write_all(&buffer[..read])?;
         writer.flush()?;
-        total += read as u64;
     }
 }
 

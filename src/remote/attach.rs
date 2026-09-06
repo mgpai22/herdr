@@ -211,7 +211,9 @@ impl RemoteExecutable {
                 }
                 command
             }
-            Self::WindowsPath(path) => windows_powershell_application_command(path, args),
+            Self::WindowsPath(path) => windows_powershell_script_command(
+                &windows_powershell_application_script(path, args),
+            ),
         }
     }
 
@@ -326,10 +328,6 @@ impl RemoteHerdr {
         self.executable = RemoteExecutable::PosixShellPath(shell_path);
         self
     }
-}
-
-fn windows_powershell_application_command(path: &str, args: &[&str]) -> String {
-    windows_powershell_script_command(&windows_powershell_application_script(path, args))
 }
 
 fn windows_powershell_application_script(path: &str, args: &[&str]) -> String {
@@ -1711,17 +1709,6 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
-fn remote_live_handoff_command(
-    remote_herdr: &RemoteHerdr,
-    session_name: &str,
-    protocol: u32,
-    version: &str,
-) -> String {
-    remote_herdr
-        .executable
-        .live_handoff_command(session_name, protocol, version)
-}
-
 fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io::Result<()> {
     let status = remote_client_status(ssh, remote_herdr)?.ok_or_else(|| {
         io::Error::other("could not inspect the prepared remote herdr binary before live handoff")
@@ -1733,7 +1720,10 @@ fn live_handoff_remote_server(ssh: &RemoteSsh, remote_herdr: &RemoteHerdr) -> io
         .version
         .filter(|version| !version.is_empty())
         .ok_or_else(|| io::Error::other("prepared remote herdr did not report its version"))?;
-    let command = remote_live_handoff_command(remote_herdr, &ssh.session_name, protocol, &version);
+    let command =
+        remote_herdr
+            .executable
+            .live_handoff_command(&ssh.session_name, protocol, &version);
     let output = ssh.shell_output(&remote_herdr.platform, &command)?;
     if !output.status.success() {
         return Err(command_failed("remote server live handoff failed", &output));
@@ -2013,10 +2003,6 @@ fn confirm_remote_install(
     Ok(())
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
-    remote_herdr.executable.bridge_command(session_name)
-}
-
 fn reattach_command(
     program: &str,
     target: &str,
@@ -2233,7 +2219,7 @@ fn bridge_connection(
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
+        .arg(remote_herdr.executable.bridge_command(session_name))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(if noninteractive {
@@ -2960,12 +2946,13 @@ mod tests {
                 format!("{} {command}", herdr.executable.display())
             );
         }
-        assert!(
-            remote_live_handoff_command(&herdr, "agents", 19, "0.7.9").starts_with(&format!(
+        assert!(herdr
+            .executable
+            .live_handoff_command("agents", 19, "0.7.9")
+            .starts_with(&format!(
                 "{} --session agents server live-handoff",
                 herdr.executable.display()
-            ))
-        );
+            )));
     }
 
     #[test]
@@ -3407,7 +3394,9 @@ mod tests {
             arch: "x86_64",
         });
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_herdr
+                .executable
+                .bridge_command(crate::session::DEFAULT_SESSION_NAME),
             "printf '\n%s\n' 'herdr-remote-output-ready:1'\nexec \"$HOME/.local/bin/herdr\" remote-client-bridge"
         );
         assert_eq!(
@@ -3426,7 +3415,9 @@ mod tests {
             .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_herdr
+                .executable
+                .bridge_command(crate::session::DEFAULT_SESSION_NAME),
             "printf '\n%s\n' 'herdr-remote-output-ready:1'\nexec /usr/bin/herdr remote-client-bridge"
         );
     }
@@ -3442,7 +3433,9 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_herdr
+                .executable
+                .bridge_command(crate::session::DEFAULT_SESSION_NAME),
             "printf '\n%s\n' 'herdr-remote-output-ready:1'\nexec '/opt/herdr bin/herdr' remote-client-bridge"
         );
     }
@@ -3458,7 +3451,9 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_herdr
+                .executable
+                .bridge_command(crate::session::DEFAULT_SESSION_NAME),
             "printf '\n%s\n' 'herdr-remote-output-ready:1'\nexec /opt/homebrew/bin/herdr remote-client-bridge"
         );
         assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
@@ -3553,7 +3548,9 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_herdr
+                .executable
+                .bridge_command(crate::session::DEFAULT_SESSION_NAME),
             "printf '\n%s\n' 'herdr-remote-output-ready:1'\nexec '/opt/herdr'\\''s/bin/herdr' remote-client-bridge"
         );
     }
@@ -3879,8 +3876,7 @@ mod tests {
             os: "linux",
             arch: "x86_64",
         });
-        let command = remote_live_handoff_command(
-            &remote_herdr,
+        let command = remote_herdr.executable.live_handoff_command(
             crate::session::DEFAULT_SESSION_NAME,
             19,
             "0.7.9",
