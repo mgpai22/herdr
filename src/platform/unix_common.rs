@@ -19,6 +19,32 @@ pub(crate) fn wait_client_stream_readable(stream: &crate::ipc::LocalStream) -> s
     Ok(())
 }
 
+pub(crate) fn wait_remote_bridge_readable(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // Cancellation shuts down this socket's read half, waking the indefinite wait.
+        // SAFETY: descriptor points to one valid pollfd whose socket remains borrowed here.
+        if unsafe { libc::poll(&mut descriptor, 1, -1) } >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+pub(crate) fn cancel_remote_bridge_read(stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    let crate::ipc::LocalStream::UdSocket(stream) = stream;
+    stream.inner().shutdown(std::net::Shutdown::Read)
+}
+
 pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
 }

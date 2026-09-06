@@ -15,6 +15,19 @@ use std::{
 
 mod clipboard_image;
 
+pub(crate) fn wait_remote_bridge_readable(
+    _stream: &crate::ipc::LocalStream,
+) -> std::io::Result<()> {
+    // Synchronous named pipes still use peek-before-read polling on Windows.
+    std::thread::sleep(Duration::from_millis(1));
+    Ok(())
+}
+
+pub(crate) fn cancel_remote_bridge_read(_stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+    // The named-pipe reader checks its cancellation flag between peeks.
+    Ok(())
+}
+
 pub(crate) fn wait_client_stream_readable(
     _stream: &crate::ipc::LocalStream,
 ) -> std::io::Result<()> {

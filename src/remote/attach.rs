@@ -1938,6 +1938,32 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     })
 }
 
+struct BridgeUploadStop {
+    stopped: AtomicBool,
+    stream: crate::ipc::LocalStream,
+}
+
+impl BridgeUploadStop {
+    fn new(stream: &crate::ipc::LocalStream) -> io::Result<Self> {
+        Ok(Self {
+            stopped: AtomicBool::new(false),
+            stream: stream.try_clone()?,
+        })
+    }
+
+    fn cancel(&self) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            if let Err(error) = crate::platform::cancel_remote_bridge_read(&self.stream) {
+                tracing::debug!(%error, "remote bridge read cancellation failed");
+            }
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+}
+
 fn bridge_connection(
     stream: crate::ipc::LocalStream,
     target: &str,
@@ -1947,6 +1973,7 @@ fn bridge_connection(
     noninteractive: bool,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let upload_stop = Arc::new(BridgeUploadStop::new(&stream)?);
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
     if noninteractive {
@@ -1991,7 +2018,6 @@ fn bridge_connection(
     let mut child_to_stream = stream;
 
     let connection_stop = Arc::new(AtomicBool::new(false));
-    let upload_stop = Arc::new(AtomicBool::new(false));
     let upload_failed = Arc::new(AtomicBool::new(false));
     let download_done = Arc::new(AtomicBool::new(false));
     let client_closed = Arc::new(AtomicBool::new(false));
@@ -2022,7 +2048,7 @@ fn bridge_connection(
             &download_bridge_stop,
         );
         download_done_worker.store(true, Ordering::Release);
-        download_upload_stop.store(true, Ordering::Release);
+        download_upload_stop.cancel();
         result
     });
 
@@ -2030,13 +2056,13 @@ fn bridge_connection(
     let (status_result, child_exited) = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                upload_stop.store(true, Ordering::Release);
+                upload_stop.cancel();
                 break (Ok(status), true);
             }
             Ok(None) => {}
             Err(err) => {
                 connection_stop.store(true, Ordering::Release);
-                upload_stop.store(true, Ordering::Release);
+                upload_stop.cancel();
                 let _ = child.kill();
                 let _ = child.wait();
                 break (Err(err), false);
@@ -2044,7 +2070,7 @@ fn bridge_connection(
         }
         if bridge_stop.load(Ordering::Acquire) {
             connection_stop.store(true, Ordering::Release);
-            upload_stop.store(true, Ordering::Release);
+            upload_stop.cancel();
             let _ = child.kill();
             break (child.wait(), false);
         }
@@ -2052,7 +2078,7 @@ fn bridge_connection(
             || upload_failed.load(Ordering::Acquire)
             || download_done.load(Ordering::Acquire)
         {
-            upload_stop.store(true, Ordering::Release);
+            upload_stop.cancel();
             let stopped_at = stopped_at.get_or_insert_with(Instant::now);
             if stopped_at.elapsed() >= Duration::from_millis(250) {
                 connection_stop.store(true, Ordering::Release);
@@ -2062,7 +2088,7 @@ fn bridge_connection(
         }
         thread::sleep(BRIDGE_ACCEPT_POLL);
     };
-    upload_stop.store(true, Ordering::Release);
+    upload_stop.cancel();
     if !child_exited {
         connection_stop.store(true, Ordering::Release);
     }
@@ -2141,21 +2167,29 @@ fn copy_reader_to_local_stream<R: io::Read>(
 fn copy_local_stream_to_writer<W: io::Write>(
     mut stream: crate::ipc::LocalStream,
     writer: &mut W,
-    connection_stop: &AtomicBool,
+    connection_stop: &BridgeUploadStop,
     bridge_stop: &AtomicBool,
     client_closed: &AtomicBool,
 ) -> io::Result<u64> {
     let mut buffer = [0_u8; 16 * 1024];
     let mut total = 0;
 
-    while !connection_stop.load(Ordering::Acquire) && !bridge_stop.load(Ordering::Acquire) {
+    while !connection_stop.is_stopped() && !bridge_stop.load(Ordering::Acquire) {
+        #[cfg(all(test, unix))]
+        tests::UPLOAD_READ_ATTEMPTS.with(|attempts| {
+            if let Some(attempts) = attempts.borrow().as_ref() {
+                attempts.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         match crate::ipc::poll_local_stream_read_count(&mut stream, &mut buffer)? {
             crate::ipc::LocalStreamReadCount::Data(read) => {
                 writer.write_all(&buffer[..read])?;
                 writer.flush()?;
                 total += read as u64;
             }
-            crate::ipc::LocalStreamReadCount::Pending => thread::sleep(BRIDGE_IO_POLL),
+            crate::ipc::LocalStreamReadCount::Pending => {
+                crate::platform::wait_remote_bridge_readable(&stream)?;
+            }
             crate::ipc::LocalStreamReadCount::Closed => {
                 client_closed.store(true, Ordering::Release);
                 break;
@@ -2242,6 +2276,135 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    thread_local! {
+        pub(super) static UPLOAD_READ_ATTEMPTS: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicUsize>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    fn upload_test_streams(name: &str) -> (crate::ipc::LocalStream, crate::ipc::LocalStream) {
+        let socket = local_forward_socket_path(name, "upload-test");
+        let listener = crate::ipc::bind_private_local_listener(&socket).unwrap();
+        let client = crate::ipc::connect_local_stream(&socket).unwrap();
+        let server = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        (client, server)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_upload_idle_waits_without_repeated_reads_and_cancels() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        let (mut client, stream) = upload_test_streams("idle");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let stop = Arc::new(BridgeUploadStop::new(&stream).unwrap());
+        let worker_stop = Arc::clone(&stop);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            UPLOAD_READ_ATTEMPTS.with(|slot| *slot.borrow_mut() = Some(worker_attempts));
+            let mut output = Vec::new();
+            let closed = AtomicBool::new(false);
+            let result = copy_local_stream_to_writer(
+                stream,
+                &mut output,
+                &worker_stop,
+                &AtomicBool::new(false),
+                &closed,
+            );
+            done_tx
+                .send((result, output, closed.load(Ordering::Acquire)))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "upload worker did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(100));
+        let idle_reads = attempts.load(Ordering::Relaxed);
+        client.write_all(b"pane input").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::Relaxed) < idle_reads + 2 {
+            assert!(
+                Instant::now() < deadline,
+                "input did not wake the upload worker"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(100));
+        let reads_after_input = attempts.load(Ordering::Relaxed);
+        stop.cancel();
+        let (result, output, closed) = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), 10);
+        assert_eq!(output, b"pane input");
+        assert!(!closed, "cancellation is not a peer disconnect");
+        assert_eq!(idle_reads, 1, "idle forwarding must wait, not retry reads");
+        assert_eq!(
+            reads_after_input, 3,
+            "forwarding must sleep again after input"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_upload_cancel_before_wait_preserves_download() {
+        use std::io::Read as _;
+
+        let (mut client, stream) = upload_test_streams("cancel-before-wait");
+        let mut download = stream.try_clone().unwrap();
+        let stop = BridgeUploadStop::new(&stream).unwrap();
+        stop.cancel();
+        stop.cancel();
+        let closed = AtomicBool::new(false);
+        let count = copy_local_stream_to_writer(
+            stream,
+            &mut Vec::new(),
+            &stop,
+            &AtomicBool::new(false),
+            &closed,
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+        assert!(!closed.load(Ordering::Acquire));
+        download.write_all(b"final frame").unwrap();
+        let mut output = [0; 11];
+        client.read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"final frame");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_upload_drains_input_before_peer_eof() {
+        let (mut client, stream) = upload_test_streams("drain");
+        let payload = vec![b'x'; 1024 * 1024];
+        let expected = payload.clone();
+        let worker = thread::spawn(move || {
+            let stop = BridgeUploadStop::new(&stream).unwrap();
+            let mut output = Vec::new();
+            let closed = AtomicBool::new(false);
+            let count = copy_local_stream_to_writer(
+                stream,
+                &mut output,
+                &stop,
+                &AtomicBool::new(false),
+                &closed,
+            )
+            .unwrap();
+            assert!(closed.load(Ordering::Acquire));
+            assert_eq!(count, output.len() as u64);
+            output
+        });
+        client.write_all(&payload).unwrap();
+        drop(client);
+        assert_eq!(worker.join().unwrap(), expected);
+    }
 
     #[cfg(unix)]
     #[test]
