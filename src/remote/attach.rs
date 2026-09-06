@@ -613,6 +613,7 @@ impl RemoteSsh {
         let mut command = self.command();
         command
             .arg(remote_command)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = if self.noninteractive {
