@@ -8,7 +8,7 @@ use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use interprocess::local_socket::traits::{Listener as _, Stream as _};
+use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::ListenerNonblockingMode;
 use interprocess::TryClone as _;
 use serde::Deserialize;
@@ -216,12 +216,16 @@ impl RemoteExecutable {
     }
 
     fn session_command(&self, session_name: &str, args: &[&str]) -> String {
+        self.command(&Self::session_args(session_name, args))
+    }
+
+    fn session_args<'a>(session_name: &'a str, args: &[&'a str]) -> Vec<&'a str> {
         let mut session_args = Vec::with_capacity(args.len() + 2);
         if session_name != crate::session::DEFAULT_SESSION_NAME {
             session_args.extend(["--session", session_name]);
         }
         session_args.extend_from_slice(args);
-        self.command(&session_args)
+        session_args
     }
 
     fn exists_command(&self) -> String {
@@ -245,18 +249,24 @@ impl RemoteExecutable {
     }
 
     fn bridge_command(&self, session_name: &str) -> String {
-        let command = self.session_command(session_name, &["remote-client-bridge"]);
+        let args = Self::session_args(session_name, &["remote-client-bridge"]);
         match self {
-            Self::PosixShellPath(_) => posix_remote_output_command(&format!("exec {command}")),
-            Self::WindowsPath(_) => command,
+            Self::PosixShellPath(_) => {
+                posix_remote_output_command(&format!("exec {}", self.command(&args)))
+            }
+            Self::WindowsPath(path) => {
+                windows_powershell_streaming_application_command(path, &args)
+            }
         }
     }
 
     fn saved_bridge_command(&self, session_name: &str) -> String {
-        let command = self.session_command(session_name, &["remote-client-bridge"]);
+        let args = Self::session_args(session_name, &["remote-client-bridge"]);
         match self {
-            Self::PosixShellPath(_) => format!("exec {command} </dev/null"),
-            Self::WindowsPath(_) => command,
+            Self::PosixShellPath(_) => format!("exec {} </dev/null", self.command(&args)),
+            Self::WindowsPath(path) => {
+                windows_powershell_streaming_application_command(path, &args)
+            }
         }
     }
 
@@ -330,6 +340,19 @@ fn windows_powershell_application_script(path: &str, args: &[&str]) -> String {
     }
     script.push_str("; exit $LASTEXITCODE");
     script
+}
+
+fn windows_powershell_streaming_application_command(path: &str, args: &[&str]) -> String {
+    let command_line = args
+        .iter()
+        .map(|arg| crate::platform::quote_windows_command_line_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    windows_powershell_script_command(&format!(
+        "$process = Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait -PassThru -ErrorAction Stop; exit $process.ExitCode",
+        crate::platform::quote_powershell_arg(path),
+        crate::platform::quote_powershell_arg(&command_line),
+    ))
 }
 
 fn posix_remote_output_command(command: &str) -> String {
@@ -2193,7 +2216,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
 }
 
 fn bridge_connection(
-    stream: crate::ipc::LocalStream,
+    mut stream: crate::ipc::LocalStream,
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
@@ -2237,7 +2260,7 @@ fn bridge_connection(
             return Err(err);
         }
     };
-    if let Err(err) = stream.set_nonblocking(true) {
+    if let Err(err) = crate::ipc::set_local_stream_polling(&mut stream, true) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);
@@ -2605,6 +2628,67 @@ mod tests {
 
         drop(server);
         drop(client);
+        drop(listener);
+        let _ = std::fs::remove_file(socket);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bridge_stream_delivers_large_frame_before_delayed_reply() {
+        use std::io::Read as _;
+        use std::sync::mpsc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn read_frame(stream: &mut crate::ipc::LocalStream) -> Vec<u8> {
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).expect("read frame length");
+            let length = usize::try_from(u32::from_le_bytes(length)).expect("frame length fits");
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).expect("read frame body");
+            body
+        }
+
+        fn write_frame(stream: &mut crate::ipc::LocalStream, body: &[u8]) {
+            let length = u32::try_from(body.len()).expect("frame length fits");
+            stream
+                .write_all(&length.to_le_bytes())
+                .expect("write frame length");
+            stream.write_all(body).expect("write frame body");
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-large-frame-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = crate::ipc::bind_private_local_listener(&socket).expect("bind listener");
+        let (large_received_tx, large_received_rx) = mpsc::channel();
+        let client_socket = socket.clone();
+        let client = thread::spawn(move || {
+            let mut stream =
+                crate::ipc::connect_local_stream(&client_socket).expect("connect client");
+            assert_eq!(read_frame(&mut stream), b"welcome");
+            assert_eq!(read_frame(&mut stream), vec![b'x'; 16 * 1024]);
+            large_received_tx.send(()).expect("signal large frame");
+            assert_eq!(read_frame(&mut stream), b"pong");
+        });
+        let mut server = prepare_remote_bridge_stream(listener.accept().expect("accept client"))
+            .expect("prepare bridge stream");
+
+        crate::ipc::set_local_stream_polling(&mut server, true)
+            .expect("enable bridge read polling");
+        write_frame(&mut server, b"welcome");
+        write_frame(&mut server, &vec![b'x'; 16 * 1024]);
+        large_received_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("client received large frame");
+        write_frame(&mut server, b"pong");
+
+        client.join().expect("client thread");
+        drop(server);
         drop(listener);
         let _ = std::fs::remove_file(socket);
     }
@@ -3196,12 +3280,12 @@ mod tests {
             (
                 "direct bridge",
                 executable.bridge_command("agents"),
-                "& herdr.exe '--session' agents remote-client-bridge; exit $LASTEXITCODE",
+                "$process = Start-Process -FilePath herdr.exe -ArgumentList '--session agents remote-client-bridge' -NoNewWindow -Wait -PassThru -ErrorAction Stop; exit $process.ExitCode",
             ),
             (
                 "saved bridge with closed stdin",
                 executable.saved_bridge_command("agents"),
-                "& herdr.exe '--session' agents remote-client-bridge; exit $LASTEXITCODE",
+                "$process = Start-Process -FilePath herdr.exe -ArgumentList '--session agents remote-client-bridge' -NoNewWindow -Wait -PassThru -ErrorAction Stop; exit $process.ExitCode",
             ),
         ];
 

@@ -641,7 +641,7 @@ fn powershell_agent_script(argv: &[String]) -> Option<String> {
         .join(" ");
     let command_line = args
         .iter()
-        .map(|arg| quote_windows_command_line_arg(arg))
+        .map(|arg| super::quote_windows_command_line_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
@@ -652,35 +652,6 @@ fn powershell_agent_script(argv: &[String]) -> Option<String> {
         super::quote_powershell_arg(program),
         super::quote_powershell_arg(&command_line),
     ))
-}
-
-fn quote_windows_command_line_arg(value: &str) -> String {
-    if !value.is_empty()
-        && !value
-            .chars()
-            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\x0b' | '"'))
-    {
-        return value.to_string();
-    }
-
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for ch in value.chars() {
-        if ch == '\\' {
-            backslashes += 1;
-            continue;
-        }
-        if ch == '"' {
-            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
-        } else {
-            quoted.push_str(&"\\".repeat(backslashes));
-        }
-        backslashes = 0;
-        quoted.push(ch);
-    }
-    quoted.push_str(&"\\".repeat(backslashes * 2));
-    quoted.push('"');
-    quoted
 }
 
 fn cmd_encoded_powershell_command(script: &str) -> String {
@@ -987,7 +958,7 @@ fn windows_command_line(command: &std::process::Command) -> std::io::Result<Stri
         .chain(command.get_args())
         .map(|value| {
             unicode_windows_value(value, "server command argument")
-                .map(|value| quote_windows_command_line_arg(&value))
+                .map(|value| super::quote_windows_command_line_arg(&value))
         })
         .collect::<std::io::Result<Vec<_>>>()
         .map(|parts| parts.join(" "))
