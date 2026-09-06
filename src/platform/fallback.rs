@@ -3,6 +3,13 @@ use std::process::Command;
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
+pub fn observe_process(_pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process incarnation observation is unsupported on this platform",
+    ))
+}
+
 #[cfg(unix)]
 pub(crate) use super::unix_common::set_default_plugin_pane_pwd;
 

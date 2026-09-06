@@ -1,4 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -156,6 +158,44 @@ pub(crate) fn clear_explicit_session_for_test() {
 
 pub fn data_dir() -> PathBuf {
     data_dir_for(active_name().as_deref())
+}
+
+#[derive(Debug)]
+pub(crate) struct StartupLock {
+    _file: std::fs::File,
+}
+
+pub(crate) fn acquire_startup_lock() -> std::io::Result<StartupLock> {
+    StartupLock::acquire_at(&data_dir().join("startup.lock"))
+}
+
+impl StartupLock {
+    fn acquire_at(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.try_lock().map_err(|err| match err {
+            std::fs::TryLockError::WouldBlock => std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("session startup already locked at {}", path.display()),
+            ),
+            std::fs::TryLockError::Error(err) => std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to lock session startup file {}: {err}",
+                    path.display()
+                ),
+            ),
+        })?;
+        Ok(Self { _file: file })
+    }
 }
 
 pub fn data_dir_for(name: Option<&str>) -> PathBuf {
@@ -483,6 +523,69 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_lock_allows_only_one_concurrent_owner() {
+        let path = unique_test_path("startup-lock-race").join("startup.lock");
+        let contenders = 8;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+        let attempted = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+        let handles = (0..contenders)
+            .map(|_| {
+                let path = path.clone();
+                let start = start.clone();
+                let attempted = attempted.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let lock = StartupLock::acquire_at(&path);
+                    attempted.wait();
+                    lock.is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_locks_are_scoped_by_session_path() {
+        let root = unique_test_path("startup-lock-sessions");
+        let first = StartupLock::acquire_at(&root.join("first/startup.lock")).unwrap();
+        let second = StartupLock::acquire_at(&root.join("second/startup.lock")).unwrap();
+
+        drop((first, second));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_lock_is_private_and_released_on_drop() {
+        let root = unique_test_path("startup-lock-release");
+        let path = root.join("startup.lock");
+        let lock = StartupLock::acquire_at(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            StartupLock::acquire_at(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+
+        drop(lock);
+        StartupLock::acquire_at(&path).unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

@@ -1,4 +1,9 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use tracing::warn;
 
@@ -39,6 +44,47 @@ fn resolve_write_target(path: &Path) -> std::io::Result<PathBuf> {
         };
     }
     Ok(current)
+}
+
+static STRICT_SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn save_strict(snapshot: &SessionSnapshot) -> std::io::Result<()> {
+    save_strict_to_path(&session_path(), snapshot)
+}
+
+fn save_strict_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
+    let target = resolve_write_target(path)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("session path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let suffix = STRICT_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(
+        ".session.json.{}.{}.{}.tmp",
+        std::process::id(),
+        stamp,
+        suffix,
+    ));
+    let json = serde_json::to_vec_pretty(snapshot)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let result = (|| {
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, &target)?;
+        std::fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
@@ -336,5 +382,37 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(target.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn strict_save_replaces_with_private_durable_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_session_path("strict");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_strict_to_path(&path, &empty_snapshot()).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            parse_snapshot(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .version,
+            SNAPSHOT_VERSION
+        );
+        assert!(std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            }));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

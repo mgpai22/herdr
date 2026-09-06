@@ -3075,6 +3075,61 @@
           ],
           "type": "object"
         },
+        "PaneReportAgentSessionV2Params": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "agent_session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_session_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "launch_profile": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session_start_source": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "source",
+            "agent",
+            "launch_profile",
+            "agent_pid"
+          ],
+          "type": "object"
+        },
         "PaneReportMetadataParams": {
           "properties": {
             "agent": {
@@ -6030,6 +6085,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.report_agent_session_v2",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportAgentSessionV2Params"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.report_metadata",
               "type": "string"
             },
@@ -6651,8 +6722,20 @@
             "interactive_ready": {
               "type": "boolean"
             },
+            "launch_executable": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "launch_pending": {
               "type": "boolean"
+            },
+            "launch_profile": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "name": {
               "type": [

@@ -220,6 +220,8 @@ pub enum Method {
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]
     PaneReportAgentSession(PaneReportAgentSessionParams),
+    #[serde(rename = "pane.report_agent_session_v2")]
+    PaneReportAgentSessionV2(PaneReportAgentSessionV2Params),
     #[serde(rename = "pane.report_metadata")]
     PaneReportMetadata(PaneReportMetadataParams),
     #[serde(rename = "pane.clear_agent_authority")]

@@ -23,6 +23,13 @@ pub(crate) use super::unix_common::{
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
+pub fn observe_process(_pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process incarnation observation is unsupported on macOS",
+    ))
+}
+
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false
 }

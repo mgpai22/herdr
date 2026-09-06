@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -268,12 +271,15 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// Trusted OMP profile names mapped to one executable each.
+    pub omp_launchers: BTreeMap<String, String>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            omp_launchers: BTreeMap::new(),
         }
     }
 }
@@ -1338,9 +1344,29 @@ new_cwd = "~/Projects"
         let toml = r#"
 [session]
 resume_agents_on_restore = false
+
+[session.omp_launchers]
+default = "/opt/bin/omp-default"
+restricted = "/opt/bin/omp restricted"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
+        assert_eq!(
+            config
+                .session
+                .omp_launchers
+                .get("default")
+                .map(String::as_str),
+            Some("/opt/bin/omp-default")
+        );
+        assert_eq!(
+            config
+                .session
+                .omp_launchers
+                .get("restricted")
+                .map(String::as_str),
+            Some("/opt/bin/omp restricted")
+        );
     }
 
     #[test]

@@ -526,9 +526,13 @@ Herdr resumes supported Agent conversations after a server restart by default:
 ```toml
 [session]
 resume_agents_on_restore = true
+
+[session.omp_launchers]
+default = "/usr/local/bin/omp-default"
+restricted = "/usr/local/bin/omp-restricted"
 ```
 
-Only panes with a valid native session reference from an official integration can resume; other panes restore as normal shells. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
+Only panes with a valid native session reference from an official integration can resume. OMP recovery also requires Linux process identity checks and an explicit launcher for every reported profile, including `default`. Each value is one executable, not shell text. The executable must select its own profile; Herdr adds only `--resume=<session>` and never adds `--profile`. Unknown legacy profiles, unknown owners, and unsupported platforms restore the pane for manual recovery without starting OMP. See [Session state and restore](/docs/session-state/) for supported Agents and persistence behavior.
 
 ## IME cursor tracking
 

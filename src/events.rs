@@ -93,8 +93,8 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_start_source: Option<String>,
+        recovery: Option<(String, crate::platform::OwnerProcessIncarnation)>,
     },
-    /// Display-only agent metadata was reported for a pane.
     HookMetadataReported {
         pane_id: PaneId,
         source: String,

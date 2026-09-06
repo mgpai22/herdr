@@ -136,6 +136,7 @@ pub struct App {
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    pub(crate) omp_launchers: std::collections::BTreeMap<String, String>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     pub(crate) detached_process_children: Vec<std::process::Child>,
@@ -377,15 +378,10 @@ impl App {
                 .pane_history
                 .then(crate::persist::load_history)
                 .flatten();
-            let (ws, terminals, terminal_runtimes) = crate::persist::restore(
+            let (ws, terminals, terminal_runtimes) = crate::persist::restore_with_omp_launchers(
                 &snap,
                 history.as_ref(),
-                24,
-                80,
-                config.advanced.scrollback_limit_bytes,
-                &config.terminal.default_shell,
-                config.terminal.shell_mode,
-                config.session.resume_agents_on_restore,
+                config,
                 event_tx.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -596,6 +592,7 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            omp_launchers: config.session.omp_launchers.clone(),
             session_save_deadline: None,
             session_save_thread: None,
             detached_process_children: Vec::new(),
@@ -915,6 +912,10 @@ impl App {
             self.state.default_shell = config.terminal.default_shell.clone();
             self.state.shell_mode = config.terminal.shell_mode;
             self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
+        }
+
+        if !invalid_section("session") {
+            self.omp_launchers = config.session.omp_launchers.clone();
         }
 
         if !invalid_section("worktrees") {
@@ -1669,7 +1670,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[server]\nheadless_cols = 160\nheadless_rows = 50\n[ui]\nagent_panel_sort = \"priority\"\n[ui.toast]\ndelivery = \"herdr\"\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[server]\nheadless_cols = 160\nheadless_rows = 50\n[session.omp_launchers]\ndefault = \"/opt/omp-default\"\nrestricted = \"/opt/omp-restricted\"\n[ui]\nagent_panel_sort = \"priority\"\n[ui.toast]\ndelivery = \"herdr\"\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -1709,6 +1710,10 @@ mod tests {
         assert!(!app.update_manifest_check_enabled);
         assert!(app.next_auto_update_check.is_none());
         assert!(app.next_agent_manifest_update_check.is_none());
+        assert_eq!(
+            app.omp_launchers.get("restricted").map(String::as_str),
+            Some("/opt/omp-restricted")
+        );
         assert!(app.state.config_diagnostic.is_none());
         let toast = app.state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);

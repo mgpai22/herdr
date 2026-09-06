@@ -56,7 +56,13 @@ Native agent session restore is enabled by default. Disable it with:
 resume_agents_on_restore = false
 ```
 
-Herdr only resumes panes that reported a native session reference through a current official Herdr integration.
+Herdr only resumes panes that reported a native session reference through a current official Herdr integration. OMP also reports its launch profile and verified process owner. Herdr blocks automatic OMP recovery when the owner is live or unknown, the saved profile is unregistered, or the platform cannot verify the saved Linux process incarnation. The pane and session reference remain available for manual recovery.
+
+Before Herdr starts a recovered OMP process, it saves an owner-unknown barrier to private durable storage. A failed save prevents the process from starting. The resumed OMP process uses the saved foreground OMP directory, including directory changes made after launch.
+
+:::caution[Back up before downgrade]
+An older Herdr binary can replace a version 4 snapshot and erase saved layout and OMP recovery data. Downgrade is unsupported. Back up the session directory and use an isolated data path before you run an older binary.
+:::
 
 After a client attaches and provides terminal size and theme context, Herdr resumes eligible restored agent panes across workspaces and tabs without waiting for each pane to be focused.
 
@@ -66,7 +72,7 @@ Native session restore requires these Herdr integration versions or newer:
 | --- | --- | --- |
 | Pi | `2` | `pi --session <path-or-id>` |
 | Antigravity CLI | `1` | `agy --conversation <id>` |
-| OMP | `3` | `omp --resume=<path-or-id>` |
+| OMP | `9` | `<configured-profile-executable> --resume=<path-or-id>` |
 | Claude Code | `6` | `claude --resume <id>` |
 | Codex | `5` | `codex resume <id>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |

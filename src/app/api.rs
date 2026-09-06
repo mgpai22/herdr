@@ -1140,6 +1140,9 @@ impl App {
             Method::PaneReportAgentSession(params) => {
                 return self.handle_pane_report_agent_session(request.id, params);
             }
+            Method::PaneReportAgentSessionV2(params) => {
+                return self.handle_pane_report_agent_session_v2(request.id, params);
+            }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }
@@ -2224,6 +2227,8 @@ mod tests {
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session")
                 .expect("test session id should be valid"),
+            launch_profile: None,
+            owner_process: None,
         });
 
         app.handle_internal_event(AppEvent::PaneDied { pane_id });

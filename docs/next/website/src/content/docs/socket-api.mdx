@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_agent_session_v2`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -713,7 +713,7 @@ Integrations report agent state with `pane.report_agent`.
 `state` carries semantic agent state and affects waits, notifications, and
 rollups. Report display-only values separately through metadata.
 
-Session-only official integrations report native session references with `pane.report_agent_session`. State-reporting integrations can still include native session references in `pane.report_agent`. State-independent session reports do not affect waits, notifications, or rollups.
+Session-only official integrations report native session references with `pane.report_agent_session`. OMP integration version 10 uses `pane.report_agent_session_v2` with `launch_profile` and `agent_pid`; Herdr accepts it only after the PID remains the same live process around a foreground-pane membership check and the profile resolves through `session.omp_launchers`. State-independent session reports do not affect waits, notifications, or rollups.
 
 ```json
 {
@@ -728,6 +728,8 @@ Session-only official integrations report native session references with `pane.r
 }
 ```
 
+OMP's versioned report has the same session fields plus `launch_profile` and `agent_pid`. It is reserved for the bundled OMP integration. A caller must receive a response with the same request `id` and `result.type: "ok"`; errors and partial or mismatched responses do not register recovery metadata.
+
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` expose a read-only `agent_session` object when Herdr has a stored native session reference:
 
 ```json
@@ -741,7 +743,7 @@ Session-only official integrations report native session references with `pane.r
 }
 ```
 
-If no native session reference is stored, the field is omitted.
+If no native session reference is stored, the field is omitted. `AgentInfo` also exposes optional `launch_profile` and server-resolved `launch_executable` fields for a profile-safe OMP session. Callers must treat missing fields as unsafe and must never reconstruct an executable from the profile name.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 

@@ -208,6 +208,10 @@ pub struct AgentInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_executable: Option<String>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,

@@ -25,6 +25,7 @@ use super::{
 struct AgentRestoreState<'a> {
     enabled: bool,
     resumed_sessions: &'a mut HashSet<String>,
+    omp_launchers: &'a std::collections::BTreeMap<String, String>,
 }
 
 struct PaneRestoreStartup<'a> {
@@ -38,6 +39,7 @@ struct RestoreRuntimeContext<'a> {
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'a>,
     resume_agents_on_restore: bool,
+    omp_launchers: &'a std::collections::BTreeMap<String, String>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -62,7 +64,8 @@ type RestoredTab = (
 type RestoreFailures<T> = (T, usize);
 
 /// Restore workspaces from a snapshot. Each pane gets a fresh shell in its saved cwd.
-pub fn restore(
+#[cfg(test)]
+fn restore(
     snapshot: &SessionSnapshot,
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
@@ -76,18 +79,54 @@ pub fn restore(
     render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
     let mut imported_panes = HashMap::new();
+    let launchers = std::collections::BTreeMap::new();
+    let runtime_context = RestoreRuntimeContext {
+        scrollback_limit_bytes,
+        shell_config: crate::pane::PaneShellConfig::new(default_shell, shell_mode),
+        resume_agents_on_restore,
+        omp_launchers: &launchers,
+        events,
+        render_notify,
+        render_dirty,
+    };
     restore_with_imports(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        resume_agents_on_restore,
+        &runtime_context,
         &mut imported_panes,
+    )
+}
+
+pub fn restore_with_omp_launchers(
+    snapshot: &SessionSnapshot,
+    history: Option<&SessionHistorySnapshot>,
+    config: &crate::config::Config,
+    events: mpsc::Sender<AppEvent>,
+    render_notify: Arc<Notify>,
+    render_dirty: Arc<RenderSignal>,
+) -> RestoredSession {
+    let mut imported_panes = HashMap::new();
+    let runtime_context = RestoreRuntimeContext {
+        scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
+        shell_config: crate::pane::PaneShellConfig::new(
+            &config.terminal.default_shell,
+            config.terminal.shell_mode,
+        ),
+        resume_agents_on_restore: config.session.resume_agents_on_restore,
+        omp_launchers: &config.session.omp_launchers,
         events,
         render_notify,
         render_dirty,
+    };
+    restore_with_imports(
+        snapshot,
+        history,
+        24,
+        80,
+        &runtime_context,
+        &mut imported_panes,
     )
 }
 
@@ -198,18 +237,23 @@ fn restore_with_imports_strict(
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
+    let launchers = std::collections::BTreeMap::new();
+    let runtime_context = RestoreRuntimeContext {
+        scrollback_limit_bytes,
+        shell_config,
+        resume_agents_on_restore,
+        omp_launchers: &launchers,
+        events,
+        render_notify,
+        render_dirty,
+    };
     let (restored, failed_imports) = restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
+        &runtime_context,
         imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     );
     if failed_imports > 0 {
         return Err(std::io::Error::other(format!(
@@ -230,26 +274,16 @@ fn restore_with_imports(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> RestoredSession {
     restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
+        runtime_context,
         imported_panes,
-        events,
-        render_notify,
-        render_dirty,
     )
     .0
 }
@@ -259,13 +293,8 @@ fn restore_with_imports_and_failures(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> RestoreFailures<RestoredSession> {
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
@@ -273,20 +302,12 @@ fn restore_with_imports_and_failures(
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
-        let runtime_context = RestoreRuntimeContext {
-            scrollback_limit_bytes,
-            shell_config,
-            resume_agents_on_restore,
-            events: events.clone(),
-            render_notify: render_notify.clone(),
-            render_dirty: render_dirty.clone(),
-        };
         let (restored, workspace_failed_imports) = restore_workspace(
             ws_snap,
             history.and_then(|history| history.workspaces.get(idx)),
             rows,
             cols,
-            &runtime_context,
+            runtime_context,
             &mut resumed_agent_sessions,
             imported_panes,
         );
@@ -503,6 +524,7 @@ fn restore_tab(
             let mut agent_restore = AgentRestoreState {
                 enabled: runtime_context.resume_agents_on_restore,
                 resumed_sessions: resumed_agent_sessions,
+                omp_launchers: runtime_context.omp_launchers,
             };
             pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
         };
@@ -745,8 +767,13 @@ fn pane_restore_startup<'a>(
     // resumable agent session and resume is enabled, do not replay saved pane
     // presentation history into that terminal, even when this pane is a
     // duplicate suppressed by session de-duplication.
-    let restore_plan =
-        session.and_then(|session| restore_plan_for_snapshot(session, agent_restore.enabled));
+    let restore_plan = session.and_then(|session| {
+        restore_plan_for_snapshot_with_launchers(
+            session,
+            agent_restore.enabled,
+            agent_restore.omp_launchers,
+        )
+    });
     let has_native_agent_restore = restore_plan.is_some();
     // Reserve before spawning so later panes in the same restore pass cannot
     // launch the same native agent session. The caller rolls this reservation
@@ -781,26 +808,53 @@ fn pane_restore_startup<'a>(
     }
 }
 
-fn restore_plan_for_snapshot(
+fn restore_plan_for_snapshot_with_launchers(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
+    omp_launchers: &std::collections::BTreeMap<String, String>,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
     if !resume_agents_on_restore {
         return None;
     }
     let persisted = persisted_agent_session_from_snapshot(session)?;
-    crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)
+    let mut plan =
+        crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)?;
+    if session.agent == "omp" {
+        match crate::agent_resume::omp_recovery_executable(&persisted, omp_launchers) {
+            Ok(executable) => plan.argv[0] = executable,
+            Err(reason) => {
+                tracing::warn!(
+                    reason,
+                    "automatic OMP recovery blocked; recover the saved session manually"
+                );
+                return None;
+            }
+        }
+    }
+    Some(plan)
+}
+
+#[cfg(test)]
+fn restore_plan_for_snapshot(
+    session: &PaneAgentSessionSnapshot,
+    resume_agents_on_restore: bool,
+) -> Option<crate::agent_resume::AgentResumePlan> {
+    let launchers = std::collections::BTreeMap::new();
+    restore_plan_for_snapshot_with_launchers(session, resume_agents_on_restore, &launchers)
 }
 
 fn persisted_agent_session_from_snapshot(
     session: &PaneAgentSessionSnapshot,
 ) -> Option<crate::agent_resume::PersistedAgentSession> {
-    crate::agent_resume::session_ref_from_snapshot(
+    let mut persisted = crate::agent_resume::session_ref_from_snapshot(
         &session.source,
         &session.agent,
         session.kind,
         &session.value,
-    )
+    )?;
+    persisted.launch_profile = session.launch_profile.clone();
+    persisted.owner_process = session.owner_process.clone();
+    Some(persisted)
 }
 
 fn restored_terminal_agent_session(
@@ -1017,6 +1071,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            launch_profile: None,
+            owner_process: None,
         };
 
         assert!(restore_plan_for_snapshot(&session, false).is_none());
@@ -1030,6 +1086,8 @@ mod tests {
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
+            launch_profile: None,
+            owner_process: None,
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
     }
@@ -1042,6 +1100,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            launch_profile: None,
+            owner_process: None,
         };
         let mut resumed = HashSet::new();
 
@@ -1064,15 +1124,19 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_profile: None,
+            owner_process: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
             lines: 1,
         };
         let mut resumed = HashSet::new();
+        let launchers = std::collections::BTreeMap::new();
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            omp_launchers: &launchers,
         };
 
         let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
@@ -1089,15 +1153,19 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_profile: None,
+            owner_process: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
             lines: 1,
         };
         let mut resumed = HashSet::new();
+        let launchers = std::collections::BTreeMap::new();
         let mut agent_restore = AgentRestoreState {
             enabled: true,
             resumed_sessions: &mut resumed,
+            omp_launchers: &launchers,
         };
 
         let first = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
@@ -1117,15 +1185,19 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_profile: None,
+            owner_process: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
             lines: 1,
         };
         let mut resumed = HashSet::new();
+        let launchers = std::collections::BTreeMap::new();
         let mut agent_restore = AgentRestoreState {
             enabled: false,
             resumed_sessions: &mut resumed,
+            omp_launchers: &launchers,
         };
 
         let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
@@ -1143,6 +1215,8 @@ mod tests {
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
+            launch_profile: None,
+            owner_process: None,
         };
 
         let preserved = restored_terminal_agent_session(Some(&session), false)
@@ -1159,6 +1233,8 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            launch_profile: None,
+            owner_process: None,
         };
         let mut resumed = HashSet::new();
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
@@ -1196,6 +1272,8 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                launch_profile: None,
+                                owner_process: None,
                             }),
                             launch_argv: None,
                         },
@@ -1356,6 +1434,8 @@ mod tests {
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
+                launch_profile: None,
+                owner_process: None,
             }),
             launch_argv: None,
         };
@@ -1507,6 +1587,8 @@ mod tests {
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
+                                launch_profile: None,
+                                owner_process: None,
                             }),
                             launch_argv: None,
                         },
