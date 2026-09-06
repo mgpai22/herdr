@@ -1,17 +1,7 @@
 //! Remote-host side of the SSH stdio bridge.
 
-use interprocess::TryClone as _;
 use std::io;
-#[cfg(windows)]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
 use std::time::Duration;
-
-#[cfg(windows)]
-const BRIDGE_READ_POLL: Duration = Duration::from_millis(1);
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     ensure_remote_server_running()?;
@@ -27,65 +17,7 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
         )
     })?;
 
-    let mut stdout = io::stdout().lock();
-    let mut socket_to_stdout = stream.try_clone()?;
-    let mut stdin_to_socket = stream;
-    #[cfg(windows)]
-    let upload_done = Arc::new(AtomicBool::new(false));
-    #[cfg(windows)]
-    let upload_done_worker = Arc::clone(&upload_done);
-
-    let _upload = thread::spawn(move || {
-        let mut stdin = io::stdin();
-        let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
-        #[cfg(unix)]
-        let _ = crate::ipc::shutdown_local_stream_write(&stdin_to_socket);
-        #[cfg(windows)]
-        upload_done_worker.store(true, Ordering::Release);
-    });
-
-    #[cfg(unix)]
-    {
-        copy_flush(&mut socket_to_stdout, &mut stdout)
-    }
-    #[cfg(windows)]
-    {
-        copy_socket_to_stdout(&mut socket_to_stdout, &mut stdout, &upload_done)
-    }
-}
-
-#[cfg(windows)]
-fn copy_socket_to_stdout<W: io::Write>(
-    stream: &mut crate::ipc::LocalStream,
-    stdout: &mut W,
-    upload_done: &AtomicBool,
-) -> io::Result<()> {
-    let mut buffer = [0_u8; 16 * 1024];
-    while !upload_done.load(Ordering::Acquire) {
-        match crate::ipc::poll_local_stream_read_count(stream, &mut buffer)? {
-            crate::ipc::LocalStreamReadCount::Data(read) => {
-                stdout.write_all(&buffer[..read])?;
-                stdout.flush()?;
-            }
-            crate::ipc::LocalStreamReadCount::Pending => thread::sleep(BRIDGE_READ_POLL),
-            crate::ipc::LocalStreamReadCount::Closed => break,
-        }
-    }
-    Ok(())
-}
-
-fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(read) => read,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-        writer.write_all(&buffer[..read])?;
-        writer.flush()?;
-    }
+    crate::platform::forward_remote_bridge_stdio(stream)
 }
 
 fn ensure_remote_server_running() -> io::Result<()> {
