@@ -1507,14 +1507,16 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
+                recovery,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    terminal.set_agent_session_ref_for_session_start_with_recovery(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
+                        recovery,
                     )
                 })
                 .into_iter()
@@ -3211,6 +3213,7 @@ mod tests {
                 seq: Some(seq),
                 session_ref: crate::agent_resume::AgentSessionRef::id(session),
                 session_start_source: Some(reason.into()),
+                recovery: None,
             });
             if seq == 1 {
                 for state in [AgentState::Working, AgentState::Idle] {
@@ -3695,6 +3698,8 @@ mod tests {
                     .to_string(),
             )
             .unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_hook_authority(
             "herdr:pi".into(),

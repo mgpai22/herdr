@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+use interprocess::local_socket::traits::{ListenerExt as _, Stream as _, StreamCommon as _};
 use tracing::{debug, error, info, warn};
 
 #[cfg(all(test, unix))]
@@ -239,7 +239,13 @@ fn handle_connection_with_stop(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let peer_pid = stream
+        .peer_creds()
+        .ok()
+        .and_then(|credentials| credentials.pid());
+    #[cfg(unix)]
+    let peer_pid = peer_pid.and_then(|pid| u32::try_from(pid).ok());
+    let mut request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
             // Recover correlation without relaxing typed request validation or accepting
@@ -267,6 +273,9 @@ fn handle_connection_with_stop(
             return Ok(());
         }
     };
+    if let Method::PaneReportAgentSessionV2(params) = &mut request.method {
+        params.peer_pid = peer_pid;
+    }
 
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -568,6 +577,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneRead(_) => "pane.read",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
+        Method::PaneReportAgentSessionV2(_) => "pane.report_agent_session_v2",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",

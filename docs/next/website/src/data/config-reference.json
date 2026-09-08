@@ -1425,6 +1425,12 @@
       "title": "Session",
       "keys": [
         {
+          "key": "session.omp_launchers",
+          "type": "table",
+          "default": "{}",
+          "description": "Trusted OMP profile names mapped to one executable each; register default explicitly."
+        },
+        {
           "key": "session.resume_agents_on_restore",
           "type": "boolean",
           "default": "true",

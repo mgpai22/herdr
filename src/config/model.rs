@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, num::NonZeroUsize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroUsize,
+};
 
 use crossterm::event::KeyModifiers;
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -270,6 +273,8 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Trusted OMP profile names mapped to one executable each.
+    pub omp_launchers: BTreeMap<String, String>,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +282,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            omp_launchers: BTreeMap::new(),
         }
     }
 }
@@ -1406,10 +1412,30 @@ new_cwd = "~/Projects"
 [session]
 resume_agents_on_restore = false
 startup_per_agent_delay_ms = 0
+
+[session.omp_launchers]
+default = "/opt/bin/omp-default"
+restricted = "/opt/bin/omp restricted"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
         assert_eq!(config.session.startup_per_agent_delay_ms, 0);
+        assert_eq!(
+            config
+                .session
+                .omp_launchers
+                .get("default")
+                .map(String::as_str),
+            Some("/opt/bin/omp-default")
+        );
+        assert_eq!(
+            config
+                .session
+                .omp_launchers
+                .get("restricted")
+                .map(String::as_str),
+            Some("/opt/bin/omp restricted")
+        );
     }
 
     #[test]

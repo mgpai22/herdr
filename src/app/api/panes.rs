@@ -10,11 +10,11 @@ use crate::api::schema::{
     PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneReportAgentSessionV2Params, PaneReportMetadataParams, PaneResizeParams, PaneResizeReason,
+    PaneResizeResult, PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason,
+    PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -1598,8 +1598,169 @@ impl App {
             session_start_source: crate::agent_resume::normalize_session_start_source(
                 params.session_start_source,
             ),
+            recovery: None,
         });
 
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_report_agent_session_v2(
+        &mut self,
+        id: String,
+        params: PaneReportAgentSessionV2Params,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
+            return invalid_agent(id);
+        };
+        if params.source != "herdr:omp" || agent_label != "omp" {
+            return encode_error(
+                id,
+                "invalid_agent",
+                "v2 session reports are reserved for OMP",
+            );
+        }
+        let profile = params.launch_profile.trim().to_string();
+        if profile.is_empty() || profile.len() > 64 || profile.chars().any(char::is_control) {
+            return encode_error(
+                id,
+                "invalid_launch_profile",
+                "OMP launch profile is invalid",
+            );
+        }
+        let Some(session_ref) = crate::agent_resume::session_ref_from_report(
+            &params.source,
+            &agent_label,
+            params.agent_session_id,
+            params.agent_session_path,
+        ) else {
+            return encode_error(
+                id,
+                "invalid_agent_session",
+                "OMP session reference is invalid",
+            );
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+            .is_some_and(|saved| {
+                saved.source == params.source
+                    && saved.agent == agent_label
+                    && saved.session_ref == session_ref
+                    && saved
+                        .launch_profile
+                        .as_deref()
+                        .is_some_and(|expected| expected != profile)
+            })
+        {
+            return encode_error(
+                id,
+                "launch_profile_mismatch",
+                "OMP reported a different launch profile",
+            );
+        }
+        if params.peer_pid != Some(params.agent_pid) {
+            return encode_error(
+                id,
+                "process_mismatch",
+                "OMP process does not match the socket peer",
+            );
+        }
+        let Some(terminal) = self.state.terminals.get(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if !terminal.hook_report_is_fresh(&params.source, params.seq) {
+            return encode_error(
+                id,
+                "stale_report",
+                "OMP session report sequence is stale or missing",
+            );
+        }
+        let Some(runtime) = self.terminal_runtimes.get(&terminal_id) else {
+            return encode_error(id, "process_unavailable", "pane runtime is unavailable");
+        };
+        let owner_before = match crate::platform::observe_process(params.agent_pid) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return encode_error(id, "process_unavailable", "OMP process is not live"),
+            Err(_) => {
+                return encode_error(
+                    id,
+                    "process_unknown",
+                    "OMP process identity cannot be verified",
+                )
+            }
+        };
+        let is_foreground_member = runtime
+            .child_pid()
+            .and_then(crate::detect::foreground_job)
+            .is_some_and(|job| {
+                job.processes
+                    .iter()
+                    .any(|process| process.pid == params.agent_pid)
+            });
+        if !is_foreground_member {
+            return encode_error(
+                id,
+                "process_mismatch",
+                "OMP process is not in the pane foreground job",
+            );
+        }
+        let owner_after = match crate::platform::observe_process(params.agent_pid) {
+            Ok(Some(owner)) if owner == owner_before => owner,
+            Ok(_) => {
+                return encode_error(
+                    id,
+                    "process_changed",
+                    "OMP process identity changed during verification",
+                )
+            }
+            Err(_) => {
+                return encode_error(
+                    id,
+                    "process_unknown",
+                    "OMP process identity cannot be verified",
+                )
+            }
+        };
+        self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
+            pane_id,
+            source: params.source.clone(),
+            agent_label: agent_label.clone(),
+            seq: params.seq,
+            session_ref: Some(session_ref.clone()),
+            session_start_source: crate::agent_resume::normalize_session_start_source(
+                params.session_start_source,
+            ),
+            recovery: Some((profile.clone(), owner_after.clone())),
+        });
+        let applied = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+            .is_some_and(|saved| {
+                saved.source == params.source
+                    && saved.agent == agent_label
+                    && saved.session_ref == session_ref
+                    && saved.launch_profile.as_ref() == Some(&profile)
+                    && saved.owner_process.as_ref() == Some(&owner_after)
+            });
+        if !applied {
+            return encode_error(id, "report_rejected", "OMP session report was rejected");
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -2238,6 +2399,36 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    #[test]
+    fn v2_session_report_ignores_json_peer_pid_and_rejects_peer_mismatch() {
+        let mut params: PaneReportAgentSessionV2Params =
+            serde_json::from_value(serde_json::json!({
+                "pane_id": "ignored",
+                "source": "herdr:omp",
+                "agent": "omp",
+                "seq": 1,
+                "agent_session_path": "/tmp/session.jsonl",
+                "session_start_source": "startup",
+                "launch_profile": "default",
+                "agent_pid": 22,
+                "peer_pid": 22
+            }))
+            .unwrap();
+        assert_eq!(params.peer_pid, None);
+
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        params.pane_id = public_pane_id;
+        params.peer_pid = Some(21);
+        let response = app.handle_pane_report_agent_session_v2("peer".into(), params);
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "process_mismatch");
+        assert!(app
+            .state
+            .terminals
+            .values()
+            .all(|terminal| terminal.persisted_agent_session.is_none()));
     }
 
     #[test]

@@ -375,6 +375,16 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let launch_profile = terminal
+            .persisted_agent_session
+            .as_ref()
+            .filter(|session| session.agent == "omp")
+            .and_then(|session| session.launch_profile.clone());
+        let launch_executable = launch_profile
+            .as_ref()
+            .and_then(|profile| self.omp_launchers.get(profile))
+            .filter(|executable| !executable.is_empty())
+            .cloned();
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -388,6 +398,8 @@ impl App {
             state_labels: pane.state_labels,
             tokens: pane.tokens,
             agent_session: pane.agent_session,
+            launch_profile,
+            launch_executable,
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
             pane_id: pane.pane_id,

@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
@@ -23,44 +23,52 @@ function enabled() {
   return HERDR_ENV === "1" && !!socketPath && !!paneId && !nestedOmpSession;
 }
 
-let requestQueue = Promise.resolve();
+let requestQueue: Promise<boolean> = Promise.resolve(true);
 
-function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
+function sendRequestAttempt(request: any, timeoutMs: number): Promise<boolean> {
   if (!enabled()) {
     return Promise.resolve(true);
   }
 
   return new Promise((resolve) => {
     let done = false;
+    let response = "";
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const finish = (delivered: boolean) => {
       if (done) return;
       done = true;
-      if (timeout) {
-        clearTimeout(timeout);
-      }
+      if (timeout) clearTimeout(timeout);
       socket.destroy();
       resolve(delivered);
     };
 
     const socket = net.createConnection(socketEndpoint!);
+    socket.setEncoding("utf8");
     socket.on("error", () => finish(false));
     socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on("data", () => finish(true));
+    socket.on("data", (chunk) => {
+      response += chunk;
+      const newline = response.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        const parsed = JSON.parse(response.slice(0, newline));
+        finish(parsed?.id === request.id && parsed?.result?.type === "ok");
+      } catch {
+        finish(false);
+      }
+    });
     socket.on("end", () => finish(false));
     timeout = setTimeout(() => finish(false), timeoutMs);
     timeout.unref?.();
   });
 }
 
-async function sendRequestNow(request: unknown): Promise<void> {
-  if (await sendRequestAttempt(request, 500)) {
-    return;
-  }
-  await sendRequestAttempt(request, 1500);
+async function sendRequestNow(request: unknown): Promise<boolean> {
+  if (await sendRequestAttempt(request, 500)) return true;
+  return sendRequestAttempt(request, 1500);
 }
 
-function sendRequest(request: unknown): Promise<void> {
+function sendRequest(request: unknown): Promise<boolean> {
   requestQueue = requestQueue.then(
     () => sendRequestNow(request),
     () => sendRequestNow(request),
@@ -83,6 +91,8 @@ const retryableErrorPattern =
 let reportSeq = Date.now() * 1000;
 let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
+let registeredSessionKey: string | undefined;
+const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() || "default";
 
 function nextReportSeq(): number {
   reportSeq += 1;
@@ -97,6 +107,7 @@ export function isAbsoluteSessionPath(file: unknown): file is string {
 }
 
 function updateSessionRef(ctx: any): void {
+  const previousKey = currentSessionKey();
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
     currentAgentSessionPath = isAbsoluteSessionPath(file) ? file : undefined;
@@ -110,15 +121,19 @@ function updateSessionRef(ctx: any): void {
   } catch {
     currentAgentSessionId = undefined;
   }
+  if (currentSessionKey() !== previousKey) registeredSessionKey = undefined;
 }
 
-function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
-  if (currentAgentSessionPath) {
-    return { ...params, agent_session_path: currentAgentSessionPath };
-  }
-  if (currentAgentSessionId) {
-    return { ...params, agent_session_id: currentAgentSessionId };
-  }
+function currentSessionKey(): string | undefined {
+  if (currentAgentSessionPath) return `path\0${currentAgentSessionPath}`;
+  if (currentAgentSessionId) return `id\0${currentAgentSessionId}`;
+  return undefined;
+}
+
+function withRegisteredSessionRef(params: Record<string, unknown>): Record<string, unknown> {
+  if (registeredSessionKey !== currentSessionKey()) return params;
+  if (currentAgentSessionPath) return { ...params, agent_session_path: currentAgentSessionPath };
+  if (currentAgentSessionId) return { ...params, agent_session_id: currentAgentSessionId };
   return params;
 }
 
@@ -144,31 +159,39 @@ function currentSessionRef(): Record<string, unknown> | undefined {
   return undefined;
 }
 
-function reportSession(sessionStartSource = "startup"): Promise<void> {
+async function reportSession(sessionStartSource = "startup"): Promise<void> {
   const sessionRef = currentSessionRef();
-  if (!sessionRef) {
-    return Promise.resolve();
-  }
+  const sessionKey = currentSessionKey();
+  registeredSessionKey = undefined;
+  if (!sessionRef || !sessionKey) return;
 
-  return sendRequest({
+  const delivered = await sendRequest({
     id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-    method: "pane.report_agent_session",
+    method: "pane.report_agent_session_v2",
     params: {
       pane_id: paneId,
       source,
       agent: "omp",
       seq: nextReportSeq(),
       session_start_source: sessionStartSource,
+      launch_profile: launchProfile,
+      agent_pid: process.pid,
       ...sessionRef,
     },
   });
+  if (delivered && currentSessionKey() === sessionKey) registeredSessionKey = sessionKey;
 }
 
-function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
-  return sendRequest({
+async function sendState(
+  state: AgentState,
+  message?: string,
+  seq = nextReportSeq(),
+): Promise<void> {
+  await requestQueue;
+  await sendRequest({
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
-    params: withSessionRef({
+    params: withRegisteredSessionRef({
       pane_id: paneId,
       source,
       agent: "omp",
@@ -390,6 +413,9 @@ export default function (pi) {
   });
 
   pi.on("agent_start", (_event, ctx) => {
+    if (ctx?.hasUI !== true) {
+      return;
+    }
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }

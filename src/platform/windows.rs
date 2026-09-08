@@ -58,6 +58,13 @@ impl RemoteBridgeWake {
     }
 }
 
+pub fn observe_process(_pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process incarnation observation is unsupported on Windows",
+    ))
+}
+
 pub(crate) fn wait_client_stream_readable(
     _stream: &crate::ipc::LocalStream,
 ) -> std::io::Result<()> {

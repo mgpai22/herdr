@@ -127,6 +127,37 @@ impl App {
         }
         self.save_session_now();
     }
+
+    pub(super) fn persist_owner_unknown_before_resume(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> std::io::Result<()> {
+        if !self.policy.persist_session {
+            return Err(std::io::Error::other("session persistence is disabled"));
+        }
+        if let Some(thread) = self.session_save_thread.take() {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("session save thread failed"))?;
+        }
+        let session = self
+            .state
+            .terminals
+            .get_mut(terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_mut())
+            .ok_or_else(|| std::io::Error::other("OMP recovery metadata is missing"))?;
+        session.owner_process = None;
+        let SessionSaveJob::Save { snapshot, history } = self.capture_session_save_job() else {
+            return Err(std::io::Error::other("no workspaces to persist"));
+        };
+        self.session_writer
+            .lock()
+            .map_err(|_| std::io::Error::other("session writer is poisoned"))?
+            .save_barrier(&snapshot, history.as_ref())?;
+        self.state.session_dirty = false;
+        self.session_save_deadline = None;
+        Ok(())
+    }
 }
 
 fn run_session_save_job(

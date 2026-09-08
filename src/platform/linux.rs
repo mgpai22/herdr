@@ -691,6 +691,95 @@ fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl
         && (!running_inside_wsl || crate::detect::identify_agent(comm).is_none())
 }
 
+pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
+    if pid == 0 {
+        return Ok(None);
+    }
+
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(start_time_ticks) = process_start_time_ticks_from_stat(&stat)? else {
+        return Ok(None);
+    };
+    let boot_id = parse_boot_id(&std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?)?;
+
+    Ok(Some(super::OwnerProcessIncarnation {
+        pid,
+        boot_id,
+        start_time_ticks,
+    }))
+}
+
+fn process_start_time_ticks_from_stat(stat: &str) -> std::io::Result<Option<u64>> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed /proc process stat",
+        )
+    };
+    let open = stat.find('(').ok_or_else(invalid)?;
+    let close = stat.rfind(')').ok_or_else(invalid)?;
+    if close <= open
+        || stat[..open]
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+            .is_none()
+    {
+        return Err(invalid());
+    }
+    let rest = stat.get(close + 1..).ok_or_else(invalid)?;
+    if !rest
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(invalid());
+    }
+
+    let mut fields = rest.split_whitespace();
+    let state = fields.next().ok_or_else(invalid)?;
+    if state.len() != 1 || !state.as_bytes()[0].is_ascii_alphabetic() {
+        return Err(invalid());
+    }
+    for _ in 0..18 {
+        fields
+            .next()
+            .ok_or_else(invalid)?
+            .parse::<i128>()
+            .map_err(|_| invalid())?;
+    }
+    let start_time_ticks = fields
+        .next()
+        .ok_or_else(invalid)?
+        .parse::<u64>()
+        .map_err(|_| invalid())?;
+    if state == "Z" {
+        return Ok(None);
+    }
+    Ok((start_time_ticks != 0).then_some(start_time_ticks))
+}
+
+fn parse_boot_id(contents: &str) -> std::io::Result<String> {
+    let boot_id = contents.trim_end_matches(['\r', '\n']);
+    let valid = boot_id.len() == 36
+        && boot_id.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) && byte == b'-'
+                || !matches!(index, 8 | 13 | 18 | 23) && byte.is_ascii_hexdigit()
+        });
+    if !valid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed Linux boot ID",
+        ));
+    }
+    Ok(boot_id.to_owned())
+}
+
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {
@@ -1166,6 +1255,78 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};
+
+    fn proc_stat(comm: &str, state: &str, start_time_ticks: &str) -> String {
+        format!(
+            "123 ({comm}) {state} 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 {start_time_ticks}"
+        )
+    }
+
+    #[test]
+    fn process_start_time_parser_uses_field_22_after_last_parenthesis() {
+        let stat = proc_stat("worker ) name with spaces", "S", "4242");
+        assert_eq!(
+            process_start_time_ticks_from_stat(&stat).unwrap(),
+            Some(4242)
+        );
+    }
+
+    #[test]
+    fn process_start_time_parser_treats_zombie_and_zero_as_absent() {
+        assert_eq!(
+            process_start_time_ticks_from_stat(&proc_stat("worker", "Z", "4242")).unwrap(),
+            None
+        );
+        assert_eq!(
+            process_start_time_ticks_from_stat(&proc_stat("worker", "S", "0")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn process_start_time_parser_rejects_malformed_stats() {
+        for stat in [
+            "123 worker) S 1 2 3",
+            "123 (worker) running 1 2 3",
+            "123 (worker) S 1 2 3",
+            &proc_stat("worker", "S", "invalid"),
+        ] {
+            assert_eq!(
+                process_start_time_ticks_from_stat(stat).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn boot_id_parser_accepts_kernel_format_only() {
+        assert_eq!(
+            parse_boot_id("01234567-89ab-cdef-0123-456789abcdef\n").unwrap(),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+        for value in [
+            "",
+            " 01234567-89ab-cdef-0123-456789abcdef\n",
+            "0123456789ab-cdef-0123-456789abcdef\n",
+            "01234567-89ab-cdef-0123-456789abcdeg\n",
+        ] {
+            assert_eq!(
+                parse_boot_id(value).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn observe_process_reads_current_incarnation_and_handles_absent_pids() {
+        let pid = std::process::id();
+        let incarnation = observe_process(pid).unwrap().unwrap();
+        assert_eq!(incarnation.pid, pid);
+        assert_ne!(incarnation.start_time_ticks, 0);
+        assert_eq!(incarnation.boot_id.len(), 36);
+        assert_eq!(observe_process(0).unwrap(), None);
+        assert_eq!(observe_process(u32::MAX).unwrap(), None);
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

@@ -30,6 +30,41 @@ pub struct PersistedAgentSession {
     pub source: String,
     pub agent: String,
     pub session_ref: AgentSessionRef,
+    pub launch_profile: Option<String>,
+    pub owner_process: Option<crate::platform::OwnerProcessIncarnation>,
+}
+
+pub fn omp_recovery_executable(
+    session: &PersistedAgentSession,
+    launchers: &std::collections::BTreeMap<String, String>,
+) -> Result<String, &'static str> {
+    if session.source != "herdr:omp" || session.agent != "omp" {
+        return Err("saved OMP session has no trusted recovery metadata");
+    }
+    if !launchers.contains_key("default") {
+        return Err("session.omp_launchers.default is required");
+    }
+    let profile = session
+        .launch_profile
+        .as_deref()
+        .filter(|profile| !profile.is_empty())
+        .ok_or("saved OMP launch profile is unknown")?;
+    let executable = launchers
+        .get(profile)
+        .filter(|executable| !executable.is_empty())
+        .ok_or("saved OMP launch profile is not registered")?;
+    let owner = session
+        .owner_process
+        .as_ref()
+        .filter(|owner| {
+            owner.pid != 0 && owner.start_time_ticks != 0 && !owner.boot_id.trim().is_empty()
+        })
+        .ok_or("saved OMP owner is unknown")?;
+    match crate::platform::observe_process(owner.pid) {
+        Ok(Some(live)) if live == *owner => Err("saved OMP owner is still live"),
+        Ok(_) => Ok(executable.clone()),
+        Err(_) => Err("saved OMP owner cannot be verified"),
+    }
 }
 
 impl AgentSessionRef {
@@ -84,6 +119,8 @@ pub fn persisted_session_from_launch_args(
         source: "herdr:codex".into(),
         agent: "codex".into(),
         session_ref: AgentSessionRef::id(session_id.clone())?,
+        launch_profile: None,
+        owner_process: None,
     })
 }
 
@@ -130,6 +167,8 @@ pub fn session_ref_from_snapshot(
         source: source.to_string(),
         agent: agent.to_string(),
         session_ref,
+        launch_profile: None,
+        owner_process: None,
     })
 }
 
@@ -307,6 +346,91 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn omp_session(
+        owner_process: Option<crate::platform::OwnerProcessIncarnation>,
+    ) -> PersistedAgentSession {
+        PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: AgentSessionRef::path("/tmp/omp-session.jsonl").unwrap(),
+            launch_profile: Some("restricted".into()),
+            owner_process,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn omp_recovery_requires_default_profile_and_known_owner() {
+        let mut launchers = std::collections::BTreeMap::from([(
+            "restricted".into(),
+            "/opt/omp restricted/wrapper".into(),
+        )]);
+        let unknown = omp_session(None);
+        assert!(omp_recovery_executable(&unknown, &launchers)
+            .unwrap_err()
+            .contains("default"));
+        launchers.insert("default".into(), "/opt/omp-default".into());
+        assert!(omp_recovery_executable(&unknown, &launchers)
+            .unwrap_err()
+            .contains("owner is unknown"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn omp_recovery_rejects_unattested_owner_sentinels() {
+        let launchers = std::collections::BTreeMap::from([
+            ("default".into(), "/opt/omp-default".into()),
+            ("restricted".into(), "/opt/omp-restricted".into()),
+        ]);
+        for owner in [
+            crate::platform::OwnerProcessIncarnation {
+                pid: 0,
+                boot_id: "boot-a".into(),
+                start_time_ticks: 1,
+            },
+            crate::platform::OwnerProcessIncarnation {
+                pid: 42,
+                boot_id: "  ".into(),
+                start_time_ticks: 1,
+            },
+            crate::platform::OwnerProcessIncarnation {
+                pid: 42,
+                boot_id: "boot-a".into(),
+                start_time_ticks: 0,
+            },
+        ] {
+            assert!(
+                omp_recovery_executable(&omp_session(Some(owner)), &launchers)
+                    .unwrap_err()
+                    .contains("owner is unknown")
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn omp_recovery_blocks_live_owner_and_returns_exact_stale_profile_executable() {
+        let launchers = std::collections::BTreeMap::from([
+            ("default".into(), "/opt/omp-default".into()),
+            ("restricted".into(), "/opt/omp restricted/wrapper".into()),
+        ]);
+        let live = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            omp_recovery_executable(&omp_session(Some(live.clone())), &launchers)
+                .unwrap_err()
+                .contains("still live")
+        );
+        let mut stale = live;
+        stale.start_time_ticks = stale.start_time_ticks.saturating_add(1);
+        assert_eq!(
+            omp_recovery_executable(&omp_session(Some(stale)), &launchers).unwrap(),
+            "/opt/omp restricted/wrapper",
+        );
     }
 
     #[test]

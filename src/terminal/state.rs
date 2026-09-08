@@ -609,6 +609,8 @@ impl TerminalState {
                         source: authority.source.clone(),
                         agent: authority.agent_label.clone(),
                         session_ref: session_ref.clone(),
+                        launch_profile: None,
+                        owner_process: None,
                     }
                 })
             });
@@ -761,6 +763,17 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        let retained_persisted_session = session_ref.as_ref().and_then(|session_ref| {
+            self.persisted_agent_session
+                .as_ref()
+                .filter(|saved| {
+                    saved.source == source
+                        && saved.agent == agent_label
+                        && saved.session_ref == *session_ref
+                        && (saved.launch_profile.is_some() || saved.owner_process.is_some())
+                })
+                .cloned()
+        });
         self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref());
         if foreground_takeover_allowed {
             self.suppress_current_full_lifecycle_hook_authority(
@@ -778,7 +791,7 @@ impl TerminalState {
                 }
             }
         }
-        self.persisted_agent_session = None;
+        self.persisted_agent_session = retained_persisted_session;
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
@@ -1220,6 +1233,8 @@ impl TerminalState {
                 source: source.clone(),
                 agent: agent_label,
                 session_ref,
+                launch_profile: None,
+                owner_process: None,
             });
             if let Some(pending) = pending {
                 self.hook_report_sequences.insert(source, pending.seq);
@@ -1445,6 +1460,14 @@ impl TerminalState {
         self.set_agent_session_ref_for_session_start(source, agent_label, session_ref, seq, None)
     }
 
+    pub fn hook_report_is_fresh(&self, source: &str, seq: Option<u64>) -> bool {
+        seq.is_some_and(|seq| {
+            self.hook_report_sequences
+                .get(source)
+                .is_none_or(|previous| seq > *previous)
+        })
+    }
+
     pub fn set_agent_session_ref_for_session_start(
         &mut self,
         source: String,
@@ -1452,6 +1475,25 @@ impl TerminalState {
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         seq: Option<u64>,
         session_start_source: Option<String>,
+    ) -> Option<TerminalStateMutation> {
+        self.set_agent_session_ref_for_session_start_with_recovery(
+            source,
+            agent_label,
+            session_ref,
+            seq,
+            session_start_source,
+            None,
+        )
+    }
+
+    pub fn set_agent_session_ref_for_session_start_with_recovery(
+        &mut self,
+        source: String,
+        agent_label: String,
+        session_ref: Option<crate::agent_resume::AgentSessionRef>,
+        seq: Option<u64>,
+        session_start_source: Option<String>,
+        recovery: Option<(String, crate::platform::OwnerProcessIncarnation)>,
     ) -> Option<TerminalStateMutation> {
         let session_ref = session_ref?;
         let known_agent = crate::detect::parse_agent_label(&agent_label);
@@ -1511,6 +1553,7 @@ impl TerminalState {
             return None;
         }
         if full_lifecycle_source
+            && recovery.is_none()
             && !selection_can_reconcile
             && (!process_present || generation_gated || !session_anchored)
         {
@@ -1533,6 +1576,7 @@ impl TerminalState {
             let previous_presentation =
                 self.effective_presentation_for_state_at(previous_state, now);
             let previous_session = self.current_session_identity_for_persistence();
+            let previous_persisted_session = self.persisted_agent_session.clone();
             let suppressed = self
                 .suppressed_full_lifecycle_hook_reports
                 .entry(source.clone())
@@ -1554,7 +1598,7 @@ impl TerminalState {
                 {
                     suppressed.pending_replacement_report = None;
                 }
-                suppressed.replacement_session_ref = Some(session_ref);
+                suppressed.replacement_session_ref = Some(session_ref.clone());
             }
             self.hook_report_sequences.insert(source.clone(), seq);
 
@@ -1569,7 +1613,8 @@ impl TerminalState {
                         previous_presentation,
                         now,
                     ),
-                    session_ref_changed: previous_session != current_session,
+                    session_ref_changed: previous_session != current_session
+                        || previous_persisted_session != self.persisted_agent_session,
                     agent_released: false,
                 });
             }
@@ -1638,6 +1683,7 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        let previous_persisted_session = self.persisted_agent_session.clone();
         if session_replacement_allowed || foreground_takeover_allowed {
             self.forget_stale_full_lifecycle_hook_session(&source, &agent_label, &session_ref);
         }
@@ -1655,10 +1701,25 @@ impl TerminalState {
             self.hook_authority = None;
         }
         self.reconcile_agent_name_owner(&agent_label, Some(&session_ref));
+        let retained_recovery = self
+            .persisted_agent_session
+            .as_ref()
+            .filter(|saved| {
+                saved.source == source
+                    && saved.agent == agent_label
+                    && saved.session_ref == session_ref
+            })
+            .map(|saved| (saved.launch_profile.clone(), saved.owner_process.clone()))
+            .unwrap_or_default();
+        let (launch_profile, owner_process) = recovery
+            .map(|(profile, owner)| (Some(profile), Some(owner)))
+            .unwrap_or(retained_recovery);
         let persisted_session = crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
             session_ref,
+            launch_profile,
+            owner_process,
         };
         if self.managed_agent_launch_session.as_ref() == Some(&persisted_session) {
             self.managed_agent_launch_session = None;
@@ -1677,7 +1738,8 @@ impl TerminalState {
                 previous_presentation,
                 now,
             ),
-            session_ref_changed: previous_session != current_session,
+            session_ref_changed: previous_session != current_session
+                || previous_persisted_session != self.persisted_agent_session,
             agent_released: false,
         })
     }
@@ -2314,6 +2376,8 @@ mod tests {
             source: source.into(),
             agent: agent_label.into(),
             session_ref,
+            launch_profile: None,
+            owner_process: None,
         });
     }
 
@@ -2434,6 +2498,8 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         assert!(timed_out.reconcile_managed_agent_at(now + Duration::from_millis(20), false));
         assert_eq!(timed_out.agent_name, None);
@@ -2858,6 +2924,8 @@ mod tests {
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(old_session)
                 .expect("test session path should be valid"),
+            launch_profile: None,
+            owner_process: None,
         });
 
         let startup = terminal.set_agent_session_ref_for_session_start(
@@ -2991,6 +3059,92 @@ mod tests {
 
         assert!(stale.is_none());
         assert_eq!(terminal.state, AgentState::Blocked);
+    }
+    #[test]
+    fn fresh_omp_v2_reports_establish_startup_and_fork_sessions() {
+        for start_source in ["startup", "fork"] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+            let session_ref = crate::agent_resume::AgentSessionRef::path(test_session_path(
+                &format!("omp-{start_source}.jsonl"),
+            ));
+            let owner = crate::platform::OwnerProcessIncarnation {
+                pid: 42,
+                boot_id: "boot-a".into(),
+                start_time_ticks: 99,
+            };
+            let mutation = terminal
+                .set_agent_session_ref_for_session_start_with_recovery(
+                    "herdr:omp".into(),
+                    "omp".into(),
+                    session_ref.clone(),
+                    Some(10),
+                    Some(start_source.into()),
+                    Some(("restricted".into(), owner.clone())),
+                )
+                .unwrap();
+            assert!(mutation.session_ref_changed);
+            let saved = terminal.persisted_agent_session.as_ref().unwrap();
+            assert_eq!(saved.session_ref, session_ref.unwrap());
+            assert_eq!(saved.launch_profile.as_deref(), Some("restricted"));
+            assert_eq!(saved.owner_process.as_ref(), Some(&owner));
+        }
+    }
+
+    #[test]
+    fn omp_legacy_and_stale_reports_cannot_erase_recovery_metadata() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("omp-profile.jsonl"));
+        let owner = crate::platform::OwnerProcessIncarnation {
+            pid: 42,
+            boot_id: "boot-a".into(),
+            start_time_ticks: 99,
+        };
+        let registered = terminal
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                session_ref.clone(),
+                Some(10),
+                Some("startup".into()),
+                Some(("restricted".into(), owner.clone())),
+            )
+            .unwrap();
+        assert!(registered.session_ref_changed);
+
+        let legacy = terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:omp".into(),
+                "omp".into(),
+                session_ref.clone(),
+                Some(11),
+                Some("startup".into()),
+            )
+            .unwrap();
+        assert!(!legacy.session_ref_changed);
+        let saved = terminal.persisted_agent_session.as_ref().unwrap();
+        assert_eq!(saved.launch_profile.as_deref(), Some("restricted"));
+        assert_eq!(saved.owner_process.as_ref(), Some(&owner));
+
+        let stale_owner = crate::platform::OwnerProcessIncarnation {
+            start_time_ticks: 100,
+            ..owner.clone()
+        };
+        assert!(terminal
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                session_ref,
+                Some(9),
+                Some("startup".into()),
+                Some(("wrong".into(), stale_owner)),
+            )
+            .is_none());
+        let saved = terminal.persisted_agent_session.as_ref().unwrap();
+        assert_eq!(saved.launch_profile.as_deref(), Some("restricted"));
+        assert_eq!(saved.owner_process.as_ref(), Some(&owner));
     }
 
     #[test]
@@ -5281,6 +5435,8 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_detected_state(Some(Agent::Grok), AgentState::Idle);
 
@@ -5311,6 +5467,8 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                launch_profile: None,
+                owner_process: None,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5347,6 +5505,8 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                launch_profile: None,
+                owner_process: None,
             });
             terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5382,6 +5542,8 @@ mod tests {
                     source: "herdr:codex".into(),
                     agent: "codex".into(),
                     session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+                    launch_profile: None,
+                    owner_process: None,
                 });
                 terminal.set_detected_state(detected_agent, AgentState::Idle);
 
@@ -5416,6 +5578,8 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
 
@@ -5925,6 +6089,8 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
 
         let mutation = terminal
@@ -5943,6 +6109,8 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
 
@@ -5970,6 +6138,8 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: session_ref.clone(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6003,6 +6173,8 @@ mod tests {
             source: "herdr:claude".into(),
             agent: "claude".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
 
@@ -6035,6 +6207,8 @@ mod tests {
             source: "herdr:codex".into(),
             agent: "codex".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
         terminal.set_detected_agent_process_at(Agent::Codex, Instant::now());
@@ -6144,6 +6318,8 @@ mod tests {
             source: "herdr:opencode".into(),
             agent: "opencode".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
 
         let first =
@@ -6163,6 +6339,8 @@ mod tests {
             source: "herdr:hermes".into(),
             agent: "hermes".into(),
             session_ref: crate::agent_resume::AgentSessionRef::id("hermes-session").unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
 
         let mutation = terminal.set_detected_state_with_mutation(None, AgentState::Unknown);
