@@ -768,3 +768,77 @@ function requestSessionPath(request: unknown): unknown {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
+test("Oh My Pi dropped first v2 response still registers via a fresh retry", async () => {
+  // The test server mirrors production: the first report applies but its
+  // reply is lost, and an identical id retry is rejected as stale. The hook
+  // retry must therefore mint a fresh id and sequence number so the session
+  // registers and later state reports keep it.
+  const recordingSocketPath = join(tmpdir(), `herdr-omp-v2-retry-${process.pid}.sock`);
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+  const requests: any[] = [];
+  const seenIds = new Set<unknown>();
+  const recordingServer = createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      const request = JSON.parse(input.slice(0, newline));
+      requests.push(request);
+      if (requests.length === 1) {
+        seenIds.add(request.id);
+        return;
+      }
+      if (seenIds.has(request.id)) {
+        socket.end(
+          JSON.stringify({ id: request.id, error: { code: "stale_report", message: "stale" } }) + "\n",
+        );
+        return;
+      }
+      seenIds.add(request.id);
+      socket.end(JSON.stringify({ id: request.id, result: { type: "ok" } }) + "\n");
+    });
+  });
+  server = recordingServer;
+  await new Promise<void>((resolve, reject) => {
+    recordingServer.once("error", reject);
+    recordingServer.listen(recordingSocketPath, resolve);
+  });
+  configureIntegrationEnvironment(recordingSocketPath);
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    sessionManager: {
+      getSessionFile: () => "/tmp/retry-session.jsonl",
+      getSessionId: () => "retry-session",
+    },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(
+    () => requests.filter((request) => request.method === "pane.report_agent_session_v2").length >= 2,
+    5_000,
+  );
+  const v2 = requests.filter((request) => request.method === "pane.report_agent_session_v2");
+  expect(v2).toHaveLength(2);
+  expect(v2[0].params.launch_profile).toBe("default");
+  expect(v2[0].params.agent_pid).toBe(process.pid);
+  expect(v2[1].id).not.toBe(v2[0].id);
+  expect(v2[1].params.seq).toBeGreaterThan(v2[0].params.seq);
+  expect(v2[1].params.agent_session_path).toBe("/tmp/retry-session.jsonl");
+  expect(v2[1].params.launch_profile).toBe("default");
+  await handlers.get("agent_end")?.({ messages: [] }, context);
+  await waitFor(
+    () => requests.some((request) => request.method === "pane.report_agent"),
+    5_000,
+  );
+  const state = requests.find((request) => request.method === "pane.report_agent");
+  expect(state.params.agent_session_path).toBe("/tmp/retry-session.jsonl");
+}, 15_000);

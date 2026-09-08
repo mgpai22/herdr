@@ -63,12 +63,18 @@ function sendRequestAttempt(request: any, timeoutMs: number): Promise<boolean> {
   });
 }
 
-async function sendRequestNow(request: unknown): Promise<boolean> {
-  if (await sendRequestAttempt(request, 500)) return true;
-  return sendRequestAttempt(request, 1500);
+async function sendRequestNow(request: unknown | (() => unknown)): Promise<boolean> {
+  const first = typeof request === "function" ? (request as () => unknown)() : request;
+  if (await sendRequestAttempt(first, 500)) return true;
+  // A retry reuses the same wire object, so a lost-then-applied first attempt
+  // turns the retry into a stale duplicate that unregisters the session.
+  // Callers that establish identity pass a builder so each attempt mints a
+  // fresh request and converges unaided.
+  const second = typeof request === "function" ? (request as () => unknown)() : request;
+  return sendRequestAttempt(second, 1500);
 }
 
-function sendRequest(request: unknown): Promise<boolean> {
+function sendRequest(request: unknown | (() => unknown)): Promise<boolean> {
   requestQueue = requestQueue.then(
     () => sendRequestNow(request),
     () => sendRequestNow(request),
@@ -165,7 +171,12 @@ async function reportSession(sessionStartSource = "startup"): Promise<void> {
   registeredSessionKey = undefined;
   if (!sessionRef || !sessionKey) return;
 
-  const delivered = await sendRequest({
+  // Each retry attempt mints a fresh id and sequence number. If the server
+  // applied the first attempt but its reply was lost, an identical retry
+  // would be rejected as stale and leave the session unregistered with no
+  // later session event to recover it. A fresh retry replays the same
+  // profile, PID, and session through every server check and converges.
+  const delivered = await sendRequest(() => ({
     id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent_session_v2",
     params: {
@@ -178,7 +189,7 @@ async function reportSession(sessionStartSource = "startup"): Promise<void> {
       agent_pid: process.pid,
       ...sessionRef,
     },
-  });
+  }));
   if (delivered && currentSessionKey() === sessionKey) registeredSessionKey = sessionKey;
 }
 
