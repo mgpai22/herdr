@@ -26,6 +26,8 @@ struct AgentRestoreState<'a> {
     enabled: bool,
     resumed_sessions: &'a mut HashSet<String>,
     omp_launchers: &'a std::collections::BTreeMap<String, String>,
+    /// The pane keeps a live handed-over runtime, so its plan is never spawned.
+    imported: bool,
 }
 
 struct PaneRestoreStartup<'a> {
@@ -136,24 +138,22 @@ pub fn restore_handoff(
     scrollback_limit_bytes: usize,
     default_shell: &str,
     shell_mode: crate::config::ShellModeConfig,
+    omp_launchers: &std::collections::BTreeMap<String, String>,
     imports: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
-    restore_with_imports_strict(
-        snapshot,
-        None,
-        24,
-        80,
+    let runtime_context = RestoreRuntimeContext {
         scrollback_limit_bytes,
-        crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        true,
-        imports,
+        shell_config: crate::pane::PaneShellConfig::new(default_shell, shell_mode),
+        resume_agents_on_restore: true,
+        omp_launchers,
         events,
         render_notify,
         render_dirty,
-    )
+    };
+    restore_with_imports_strict(snapshot, None, 24, 80, &runtime_context, imports)
 }
 
 #[cfg(unix)]
@@ -229,30 +229,15 @@ fn restore_with_imports_strict(
     history: Option<&SessionHistorySnapshot>,
     rows: u16,
     cols: u16,
-    scrollback_limit_bytes: usize,
-    shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    runtime_context: &RestoreRuntimeContext<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
-    events: mpsc::Sender<AppEvent>,
-    render_notify: Arc<Notify>,
-    render_dirty: Arc<RenderSignal>,
 ) -> std::io::Result<RestoredSession> {
-    let launchers = std::collections::BTreeMap::new();
-    let runtime_context = RestoreRuntimeContext {
-        scrollback_limit_bytes,
-        shell_config,
-        resume_agents_on_restore,
-        omp_launchers: &launchers,
-        events,
-        render_notify,
-        render_dirty,
-    };
     let (restored, failed_imports) = restore_with_imports_and_failures(
         snapshot,
         history,
         rows,
         cols,
-        &runtime_context,
+        runtime_context,
         imported_panes,
     );
     if failed_imports > 0 {
@@ -558,6 +543,7 @@ fn restore_tab(
                 enabled: runtime_context.resume_agents_on_restore,
                 resumed_sessions: resumed_agent_sessions,
                 omp_launchers: runtime_context.omp_launchers,
+                imported: has_import,
             };
             pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
         };
@@ -821,6 +807,7 @@ fn pane_restore_startup<'a>(
             session,
             agent_restore.enabled,
             agent_restore.omp_launchers,
+            agent_restore.imported,
         )
     });
     let has_native_agent_restore = restore_plan.is_some();
@@ -861,6 +848,7 @@ fn restore_plan_for_snapshot_with_launchers(
     session: &PaneAgentSessionSnapshot,
     resume_agents_on_restore: bool,
     omp_launchers: &std::collections::BTreeMap<String, String>,
+    imported: bool,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
     if !resume_agents_on_restore {
         return None;
@@ -868,7 +856,9 @@ fn restore_plan_for_snapshot_with_launchers(
     let persisted = persisted_agent_session_from_snapshot(session)?;
     let mut plan =
         crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)?;
-    if session.agent == "omp" {
+    // An imported pane keeps its live runtime and never spawns the plan; it only
+    // seeds detection and session dedupe, so the owner gate does not apply.
+    if session.agent == "omp" && !imported {
         match crate::agent_resume::omp_recovery_executable(&persisted, omp_launchers) {
             Ok(executable) => plan.argv[0] = executable,
             Err(reason) => {
@@ -889,7 +879,7 @@ fn restore_plan_for_snapshot(
     resume_agents_on_restore: bool,
 ) -> Option<crate::agent_resume::AgentResumePlan> {
     let launchers = std::collections::BTreeMap::new();
-    restore_plan_for_snapshot_with_launchers(session, resume_agents_on_restore, &launchers)
+    restore_plan_for_snapshot_with_launchers(session, resume_agents_on_restore, &launchers, false)
 }
 
 fn persisted_agent_session_from_snapshot(
@@ -1186,6 +1176,7 @@ mod tests {
             enabled: true,
             resumed_sessions: &mut resumed,
             omp_launchers: &launchers,
+            imported: false,
         };
 
         let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
@@ -1215,6 +1206,7 @@ mod tests {
             enabled: true,
             resumed_sessions: &mut resumed,
             omp_launchers: &launchers,
+            imported: false,
         };
 
         let first = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
@@ -1247,6 +1239,7 @@ mod tests {
             enabled: false,
             resumed_sessions: &mut resumed,
             omp_launchers: &launchers,
+            imported: false,
         };
 
         let startup = pane_restore_startup(Some(&session), Some(&history), &mut agent_restore);
@@ -1780,6 +1773,7 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
+            &Default::default(),
             &mut imports,
             mpsc::channel(4).0,
             Arc::new(Notify::new()),
@@ -1798,6 +1792,171 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn omp_handoff_snapshot(owner: crate::platform::OwnerProcessIncarnation) -> SessionSnapshot {
+        let cwd = std::env::current_dir().unwrap();
+        SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:omp".into(),
+                                agent: "omp".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                                value: "/tmp/omp-handoff-session.jsonl".into(),
+                                launch_profile: Some("restricted".into()),
+                                owner_process: Some(owner),
+                            }),
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn omp_handoff_launchers() -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::from([
+            ("default".into(), "/opt/omp-default".into()),
+            ("restricted".into(), "/opt/omp-restricted".into()),
+        ])
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn handoff_restore_keeps_pending_omp_resume_with_configured_launchers() {
+        let mut stale_owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        stale_owner.start_time_ticks = stale_owner.start_time_ticks.saturating_add(1);
+        let snapshot = omp_handoff_snapshot(stale_owner.clone());
+        let mut imports = HashMap::new();
+
+        let (_workspaces, terminals, runtimes) = restore_handoff(
+            &snapshot,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &omp_handoff_launchers(),
+            &mut imports,
+            mpsc::channel(4).0,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .expect("handoff restore should preserve pending OMP resume");
+
+        let terminal = terminals.values().next().unwrap();
+        assert_eq!(
+            terminal
+                .pending_agent_resume_plan
+                .as_ref()
+                .map(|plan| plan.argv.clone()),
+            Some(vec![
+                "/opt/omp-restricted".to_string(),
+                "--resume=/tmp/omp-handoff-session.jsonl".to_string(),
+            ]),
+            "handoff restore should keep the pending OMP resume on the configured launcher"
+        );
+        assert!(
+            runtimes.is_empty(),
+            "handoff restore should not replace a pending OMP resume with a shell runtime"
+        );
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .and_then(|session| session.owner_process.clone()),
+            Some(stale_owner)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn handoff_import_of_live_omp_pane_keeps_agent_seeding() {
+        let live_owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let snapshot = omp_handoff_snapshot(live_owner);
+        let (events, _events_rx) = mpsc::channel(32);
+        let (workspaces, _terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+        let runtime = runtimes.values().next().unwrap();
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mut imports = HashMap::from([(
+            0,
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                state: runtime.handoff_runtime_state(pane_id.raw()),
+            },
+        )]);
+
+        let (_, restored_terminals, restored_runtimes) = restore_handoff(
+            &snapshot,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &omp_handoff_launchers(),
+            &mut imports,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        assert_eq!(restored_runtimes.len(), 1);
+        drop(restored_runtimes);
+        drop(runtimes);
+
+        let terminal = restored_terminals.values().next().unwrap();
+        assert!(terminal.pending_agent_resume_plan.is_none());
+        assert_eq!(
+            terminal.detected_agent,
+            Some(crate::detect::Agent::Omp),
+            "a live imported OMP pane must keep upstream's restore-time agent seeding"
+        );
+        assert!(terminal.persisted_agent_session.is_some());
     }
 
     #[tokio::test]
@@ -1866,6 +2025,7 @@ mod tests {
                 4096,
                 test_restore_shell(),
                 crate::config::ShellModeConfig::NonLogin,
+                &Default::default(),
                 &mut imports,
                 events,
                 Arc::new(Notify::new()),

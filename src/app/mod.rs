@@ -652,6 +652,7 @@ impl App {
             config.advanced.scrollback_limit_bytes,
             &config.terminal.default_shell,
             config.terminal.shell_mode,
+            &config.session.omp_launchers,
             imports,
             app.event_tx.clone(),
             app.render_notify.clone(),

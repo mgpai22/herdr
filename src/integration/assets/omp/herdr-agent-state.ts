@@ -63,21 +63,18 @@ function sendRequestAttempt(request: any, timeoutMs: number): Promise<boolean> {
   });
 }
 
-async function sendRequestNow(request: unknown | (() => unknown)): Promise<boolean> {
-  const first = typeof request === "function" ? (request as () => unknown)() : request;
-  if (await sendRequestAttempt(first, 500)) return true;
-  // A retry reuses the same wire object, so a lost-then-applied first attempt
-  // turns the retry into a stale duplicate that unregisters the session.
-  // Callers that establish identity pass a builder so each attempt mints a
-  // fresh request and converges unaided.
-  const second = typeof request === "function" ? (request as () => unknown)() : request;
-  return sendRequestAttempt(second, 1500);
+async function sendRequestNow(buildRequest: () => unknown): Promise<boolean> {
+  if (await sendRequestAttempt(buildRequest(), 500)) return true;
+  // A retry of the same wire object turns a lost-then-applied first attempt
+  // into a stale duplicate, so each attempt builds a fresh request with a new
+  // id and seq.
+  return sendRequestAttempt(buildRequest(), 1500);
 }
 
-function sendRequest(request: unknown | (() => unknown)): Promise<boolean> {
+function sendRequest(buildRequest: () => unknown): Promise<boolean> {
   requestQueue = requestQueue.then(
-    () => sendRequestNow(request),
-    () => sendRequestNow(request),
+    () => sendRequestNow(buildRequest),
+    () => sendRequestNow(buildRequest),
   );
   return requestQueue;
 }
@@ -87,7 +84,6 @@ type AgentState = "working" | "blocked" | "idle";
 type QueuedState = {
   state: AgentState;
   message?: string;
-  seq: number;
 };
 
 const idleDebounceMs = parseDurationEnv("HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
@@ -193,23 +189,21 @@ async function reportSession(sessionStartSource = "startup"): Promise<void> {
   if (delivered && currentSessionKey() === sessionKey) registeredSessionKey = sessionKey;
 }
 
-async function sendState(
-  state: AgentState,
-  message?: string,
-  seq = nextReportSeq(),
-): Promise<void> {
+async function sendState(state: AgentState, message?: string): Promise<void> {
   await requestQueue;
-  await sendRequest({
-    id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-    method: "pane.report_agent",
-    params: withRegisteredSessionRef({
-      pane_id: paneId,
-      source,
-      agent: "omp",
-      state,
-      message,
-      seq,
-    }),
+  // The server keeps one seq watermark per source across report methods, so
+  // the seq is minted when the queue sends the request, never when it is
+  // queued. Every attempt, retries included, gets a seq above anything sent
+  // before it. The session ref is fixed at the first attempt: a retry must
+  // not drop a ref that was registered when this report was first sent.
+  let params: Record<string, unknown> | undefined;
+  await sendRequest(() => {
+    params ??= withRegisteredSessionRef({ pane_id: paneId, source, agent: "omp", state, message });
+    return {
+      id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.report_agent",
+      params: { ...params, seq: nextReportSeq() },
+    };
   });
 }
 
@@ -217,7 +211,7 @@ let sendInFlight = false;
 let queuedState: QueuedState | undefined;
 
 function queueState(state: AgentState, message?: string): void {
-  queuedState = { state, message, seq: nextReportSeq() };
+  queuedState = { state, message };
   if (!sendInFlight) {
     void drainStateQueue();
   }
@@ -233,7 +227,7 @@ async function drainStateQueue(): Promise<void> {
     while (queuedState) {
       const next = queuedState;
       queuedState = undefined;
-      await sendState(next.state, next.message, next.seq);
+      await sendState(next.state, next.message);
     }
   } finally {
     sendInFlight = false;

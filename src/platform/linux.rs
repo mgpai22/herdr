@@ -692,11 +692,21 @@ fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl
 }
 
 pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
+    observe_process_in(std::path::Path::new("/proc"), pid)
+}
+
+fn observe_process_in(
+    proc_root: &std::path::Path,
+    pid: u32,
+) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
     if pid == 0 {
         return Ok(None);
     }
 
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    // Read boot_id first: a missing stat only proves absence once procfs is visible.
+    let boot_id = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id"))?;
+    let boot_id = parse_boot_id(&boot_id)?;
+    let stat = match std::fs::read_to_string(proc_root.join(format!("{pid}/stat"))) {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -704,7 +714,6 @@ pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIn
     let Some(start_time_ticks) = process_start_time_ticks_from_stat(&stat)? else {
         return Ok(None);
     };
-    let boot_id = parse_boot_id(&std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?)?;
 
     Ok(Some(super::OwnerProcessIncarnation {
         pid,
@@ -1326,6 +1335,37 @@ mod tests {
         assert_eq!(incarnation.boot_id.len(), 36);
         assert_eq!(observe_process(0).unwrap(), None);
         assert_eq!(observe_process(u32::MAX).unwrap(), None);
+    }
+
+    #[test]
+    fn observe_process_fails_closed_until_procfs_is_visible() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-observe-proc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(observe_process_in(&root, 123).is_err());
+
+        let boot_id = "01234567-89ab-cdef-0123-456789abcdef";
+        std::fs::create_dir_all(root.join("sys/kernel/random")).unwrap();
+        std::fs::write(
+            root.join("sys/kernel/random/boot_id"),
+            format!("{boot_id}\n"),
+        )
+        .unwrap();
+        assert_eq!(observe_process_in(&root, 123).unwrap(), None);
+
+        std::fs::create_dir_all(root.join("123")).unwrap();
+        std::fs::write(root.join("123/stat"), proc_stat("omp", "S", "4242")).unwrap();
+        let incarnation = observe_process_in(&root, 123).unwrap().unwrap();
+        assert_eq!(incarnation.boot_id, boot_id);
+        assert_eq!(incarnation.start_time_ticks, 4242);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn env_lock() -> &'static Mutex<()> {

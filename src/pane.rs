@@ -3650,6 +3650,19 @@ impl PaneRuntime {
             None
         }
     }
+
+    /// Persistence variant of `foreground_cwd`: it never probes a PID after the pane
+    /// process exited and records each observation for `cwd_for_persistence`.
+    pub fn foreground_cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
+        if self.cwd_process_exited.load(Ordering::Acquire) {
+            return None;
+        }
+        let cwd = self.foreground_cwd()?;
+        if let Ok(mut known) = self.persistence_cwd.lock() {
+            *known = Some(cwd.clone());
+        }
+        Some(cwd)
+    }
 }
 
 #[cfg(test)]

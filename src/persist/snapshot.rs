@@ -331,8 +331,8 @@ fn capture_tab(
         let omp_foreground_cwd = terminal
             .and_then(|terminal| terminal.persisted_agent_session.as_ref())
             .filter(|session| session.agent == "omp")
-            .and_then(|_| runtime)
-            .and_then(|runtime| runtime.foreground_cwd());
+            .and(runtime)
+            .and_then(|runtime| runtime.foreground_cwd_for_persistence());
         let cwd = omp_foreground_cwd
             .or_else(|| runtime.and_then(|runtime| runtime.cwd_for_persistence()))
             .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
@@ -1158,6 +1158,100 @@ mod tests {
         );
         assert_eq!(after.workspaces[0].identity_cwd, new);
         assert_eq!(runtimes.values().next().unwrap().cwd(), Some(old));
+        for (_, runtime) in runtimes.drain() {
+            runtime.shutdown();
+        }
+        std::fs::remove_dir(new).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_keeps_last_omp_foreground_cwd_after_exit() {
+        let old = std::env::current_dir().unwrap();
+        let new = std::env::temp_dir().join(format!(
+            "herdr-persist-omp-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&new).unwrap();
+        let new = std::fs::canonicalize(new).unwrap();
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("omp-cwd-source")];
+        state.workspaces[0].identity_cwd = old.clone();
+        state.active = Some(0);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].terminal_id(pane_id).unwrap().clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.cwd = old.clone();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path("/tmp/omp-cwd.jsonl").unwrap(),
+            launch_profile: Some("default".into()),
+            owner_process: None,
+        });
+        let (events, _rx) = tokio::sync::mpsc::channel(32);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            24,
+            80,
+            old.clone(),
+            0,
+            Default::default(),
+            None,
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        let pid = runtime.child_pid().unwrap();
+        // No OSC 7: only the observed foreground cwd can report `new`.
+        let command = format!("cd '{}'; exec sleep 30\n", new.display());
+        runtime.try_send_bytes(bytes::Bytes::from(command)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::process_cwd(pid).as_ref() != Some(&new)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(crate::platform::process_cwd(pid), Some(new.clone()));
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        runtimes.insert(terminal_id, runtime);
+        let before = capture_from_state_with_runtimes(&state, &runtimes);
+        assert_eq!(
+            before.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .cwd,
+            new
+        );
+        crate::platform::signal_processes(&[pid], crate::platform::Signal::Kill);
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::process_cwd(pid).is_some()
+            && std::time::Instant::now() < exit_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(crate::platform::process_cwd(pid).is_none());
+        let after = capture_from_state_with_runtimes(&state, &runtimes);
+        assert_eq!(
+            after.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .cwd,
+            new,
+            "an exited OMP pane must keep its last observed foreground cwd"
+        );
         for (_, runtime) in runtimes.drain() {
             runtime.shutdown();
         }
