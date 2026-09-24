@@ -10,6 +10,7 @@ const originalCreateConnection = net.createConnection;
 const originalEnvironment = {
   HERDR_ENV: process.env.HERDR_ENV,
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
+  HERDR_OMP_SESSION_RETRY_MS: process.env.HERDR_OMP_SESSION_RETRY_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
   OMPCODE: process.env.OMPCODE,
@@ -976,6 +977,62 @@ test("Oh My Pi state retry keeps the session ref registered at its first attempt
   expect(working().map((request) => request.params.agent_session_path)).toEqual(
     working().map(() => "/tmp/retry-ref-session.jsonl"),
   );
+}, 15_000);
+
+test("Oh My Pi re-sends an unacknowledged session report without a new event", async () => {
+  // A loaded server drops both attempts of the first session report. The hook
+  // must register the session on its own, so later state reports carry the ref.
+  const recordingSocketPath = join(tmpdir(), `herdr-omp-session-retry-${process.pid}.sock`);
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+  const received: Array<ReportRequest & { params: { agent_session_path?: string } }> = [];
+  let droppedSessionReports = 0;
+  const recordingServer = createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      const request = JSON.parse(input.slice(0, newline));
+      received.push(request);
+      if (request.method === "pane.report_agent_session_v2" && droppedSessionReports < 2) {
+        droppedSessionReports += 1;
+        socket.destroy();
+        return;
+      }
+      socket.end(JSON.stringify({ id: request.id, result: { type: "ok" } }) + "\n");
+    });
+  });
+  server = recordingServer;
+  await new Promise<void>((resolve, reject) => {
+    recordingServer.once("error", reject);
+    recordingServer.listen(recordingSocketPath, resolve);
+  });
+  configureIntegrationEnvironment(recordingSocketPath);
+  process.env.HERDR_OMP_SESSION_RETRY_MS = "10";
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    sessionManager: {
+      getSessionFile: () => "/tmp/session-retry.jsonl",
+      getSessionId: () => "session-retry",
+    },
+  };
+  handlers.get("session_start")?.({ reason: "startup" }, context);
+  const sessionReports = () =>
+    received.filter((request) => request.method === "pane.report_agent_session_v2");
+  await waitFor(() => sessionReports().length >= 3, 5_000);
+  handlers.get("tool_approval_requested")?.({ toolName: "bash" }, context);
+  await waitFor(() => received.at(-1)?.params.state === "blocked", 5_000);
+
+  expect(sessionReports()).toHaveLength(3);
+  expect(received.at(-1)?.params.agent_session_path).toBe("/tmp/session-retry.jsonl");
 }, 15_000);
 
 type ReportRequest = {

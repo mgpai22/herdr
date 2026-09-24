@@ -88,6 +88,11 @@ type QueuedState = {
 
 const idleDebounceMs = parseDurationEnv("HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
 const retryGraceMs = parseDurationEnv("HERDR_OMP_RETRY_GRACE_MS", 2500);
+// An unacknowledged session report (e.g. the server was too loaded to read it) is re-sent
+// with doubling delays, so a resumed session registers without waiting for the next prompt.
+const sessionRetryBaseMs = parseDurationEnv("HERDR_OMP_SESSION_RETRY_MS", 1000);
+const sessionRetryLimit = 8;
+let sessionRetryTimer: ReturnType<typeof setTimeout> | undefined;
 const retryableErrorPattern =
   /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
 let reportSeq = Date.now() * 1000;
@@ -161,10 +166,12 @@ function currentSessionRef(): Record<string, unknown> | undefined {
   return undefined;
 }
 
-async function reportSession(sessionStartSource = "startup"): Promise<void> {
+async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
   const sessionRef = currentSessionRef();
   const sessionKey = currentSessionKey();
   registeredSessionKey = undefined;
+  clearTimeout(sessionRetryTimer);
+  sessionRetryTimer = undefined;
   if (!sessionRef || !sessionKey) return;
 
   // Each retry attempt mints a fresh id and sequence number. If the server
@@ -186,7 +193,17 @@ async function reportSession(sessionStartSource = "startup"): Promise<void> {
       ...sessionRef,
     },
   }));
-  if (delivered && currentSessionKey() === sessionKey) registeredSessionKey = sessionKey;
+  if (delivered && currentSessionKey() === sessionKey) {
+    registeredSessionKey = sessionKey;
+  } else if (!delivered && currentSessionKey() === sessionKey && attempt < sessionRetryLimit) {
+    sessionRetryTimer = setTimeout(() => {
+      sessionRetryTimer = undefined;
+      if (currentSessionKey() === sessionKey && registeredSessionKey !== sessionKey) {
+        void reportSession(sessionStartSource, attempt + 1);
+      }
+    }, Math.min(sessionRetryBaseMs * 2 ** attempt, 30_000));
+    sessionRetryTimer.unref?.();
+  }
 }
 
 async function sendState(state: AgentState, message?: string): Promise<void> {

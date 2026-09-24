@@ -763,17 +763,18 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
-        let retained_persisted_session = session_ref.as_ref().and_then(|session_ref| {
-            self.persisted_agent_session
-                .as_ref()
-                .filter(|saved| {
-                    saved.source == source
-                        && saved.agent == agent_label
-                        && saved.session_ref == *session_ref
-                        && (saved.launch_profile.is_some() || saved.owner_process.is_some())
-                })
-                .cloned()
-        });
+        // A report without a session ref carries no session change: an OMP hook withholds the
+        // ref until its v2 registration is acknowledged, so it must not erase recovery metadata.
+        let retained_persisted_session = self
+            .persisted_agent_session
+            .as_ref()
+            .filter(|saved| {
+                saved.source == source
+                    && saved.agent == agent_label
+                    && session_ref.as_ref().is_none_or(|r| saved.session_ref == *r)
+                    && (saved.launch_profile.is_some() || saved.owner_process.is_some())
+            })
+            .cloned();
         self.reconcile_agent_name_owner(&agent_label, session_ref.as_ref());
         if foreground_takeover_allowed {
             self.suppress_current_full_lifecycle_hook_authority(
@@ -3181,6 +3182,38 @@ mod tests {
         let saved = terminal.persisted_agent_session.as_ref().unwrap();
         assert_eq!(saved.launch_profile.as_deref(), Some("restricted"));
         assert_eq!(saved.owner_process.as_ref(), Some(&owner));
+    }
+
+    #[test]
+    fn omp_state_report_without_session_ref_keeps_restored_recovery_session() {
+        // A resumed OMP whose v2 registration has not been acknowledged reports state without
+        // a session ref; the restored session must survive it.
+        let mut terminal = test_terminal();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("omp-resumed.jsonl"))
+                .unwrap();
+        let restored = crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref,
+            launch_profile: Some("default".into()),
+            owner_process: None,
+        };
+        terminal.set_persisted_agent_session(restored.clone());
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+
+        assert!(terminal
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Working,
+                None,
+                None,
+                Some(5),
+            )
+            .is_some());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(terminal.persisted_agent_session.as_ref(), Some(&restored));
     }
 
     #[test]
