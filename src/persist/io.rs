@@ -74,41 +74,25 @@ pub(super) fn save_strict_to_path(path: &Path, snapshot: &SessionSnapshot) -> st
         let mut file = options.open(&tmp_path)?;
         file.write_all(&json)?;
         file.sync_all()?;
+        std::fs::rename(&tmp_path, &target)?;
         #[cfg(not(windows))]
-        {
-            std::fs::rename(&tmp_path, &target)?;
-            std::fs::File::open(parent)?.sync_all()
-        }
-        // Windows cannot open a directory as a file to sync it; a write-through move returns
-        // only once the replacement is on disk.
+        let dir = std::fs::File::open(parent)?;
+        // Windows opens a directory only with backup semantics, and FlushFileBuffers needs
+        // write access to the handle.
         #[cfg(windows)]
-        rename_write_through(&tmp_path, &target)
+        let dir = {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+                .open(parent)?
+        };
+        dir.sync_all()
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
-}
-
-#[cfg(windows)]
-fn rename_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<u16>>()
-    };
-    let (from, to) = (wide(from), wide(to));
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
@@ -392,7 +376,10 @@ mod tests {
         std::fs::write(&path, "old").unwrap();
 
         save_strict_to_path(&path, &empty_snapshot()).unwrap();
+        // A reader such as Defender or the indexer may hold the snapshot open during a save.
+        let reader = std::fs::File::open(&path).unwrap();
         save_strict_to_path(&path, &empty_snapshot()).unwrap();
+        drop(reader);
 
         assert_eq!(
             parse_snapshot(&std::fs::read_to_string(&path).unwrap())

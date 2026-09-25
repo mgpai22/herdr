@@ -62,7 +62,9 @@ impl RemoteBridgeWake {
 /// An unknown PID, or one whose process has exited but is still held open by another
 /// handle, is `Ok(None)`, matching Linux's absent `/proc/<pid>`.
 pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
-    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
     use windows_sys::Win32::System::Threading::{WaitForSingleObject, PROCESS_SYNCHRONIZE};
 
     if pid == 0 {
@@ -77,22 +79,31 @@ pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIn
             pid,
         )
     };
-    if handle.is_null() {
+    let start_time_ticks = if handle.is_null() {
         let error = std::io::Error::last_os_error();
-        // OpenProcess reports a PID with no process object as ERROR_INVALID_PARAMETER.
-        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-            return Ok(None);
+        match error.raw_os_error() {
+            // OpenProcess reports a PID with no process object as ERROR_INVALID_PARAMETER.
+            Some(code) if code == ERROR_INVALID_PARAMETER as i32 => return Ok(None),
+            // Another user's or a protected process. Linux reads any /proc/<pid>/stat, so read
+            // the creation time from the system process list, which needs no process access.
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
+                match listed_process_creation_time(pid)? {
+                    Some(start_time_ticks) => start_time_ticks,
+                    None => return Ok(None),
+                }
+            }
+            _ => return Err(error),
         }
-        return Err(error);
-    }
-    let process = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
-    match unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) } {
-        WAIT_TIMEOUT => {}
-        WAIT_OBJECT_0 => return Ok(None),
-        _ => return Err(std::io::Error::last_os_error()),
-    }
-    let start_time_ticks = process_creation_time(process.as_raw_handle().cast())
-        .ok_or_else(std::io::Error::last_os_error)?;
+    } else {
+        let process = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+        match unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) } {
+            WAIT_TIMEOUT => {}
+            WAIT_OBJECT_0 => return Ok(None),
+            _ => return Err(std::io::Error::last_os_error()),
+        }
+        process_creation_time(process.as_raw_handle().cast())
+            .ok_or_else(std::io::Error::last_os_error)?
+    };
     if start_time_ticks == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -104,6 +115,73 @@ pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIn
         boot_id,
         start_time_ticks,
     }))
+}
+
+// `SYSTEM_PROCESS_INFORMATION` offsets. windows-sys hides `CreateTime` in a reserved field.
+const SPI_NUMBER_OF_THREADS: usize = 0x04;
+const SPI_CREATE_TIME: usize = 0x20;
+#[cfg(target_pointer_width = "64")]
+const SPI_UNIQUE_PROCESS_ID: usize = 0x50;
+#[cfg(target_pointer_width = "32")]
+const SPI_UNIQUE_PROCESS_ID: usize = 0x44;
+
+/// Creation `FILETIME` of `pid` from `NtQuerySystemInformation(SystemProcessInformation)`.
+fn listed_process_creation_time(pid: u32) -> std::io::Result<Option<u64>> {
+    use windows_sys::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemProcessInformation,
+    };
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_INFO_LENGTH_MISMATCH};
+
+    // u64 elements keep the buffer 8-byte aligned for the kernel's entry layout.
+    let mut buffer = vec![0_u64; 64 * 1024];
+    loop {
+        let mut needed = 0_u32;
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SystemProcessInformation,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len() * size_of::<u64>()).unwrap_or(u32::MAX),
+                &mut needed,
+            )
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            // Processes can start before the next call, so leave 64 KiB of headroom.
+            buffer.resize(needed as usize / size_of::<u64>() + 8 * 1024, 0);
+            continue;
+        }
+        if status < 0 {
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(std::io::Error::from_raw_os_error(code as i32));
+        }
+        let list = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr().cast::<u8>(),
+                buffer.len() * size_of::<u64>(),
+            )
+        };
+        return Ok(listed_creation_time(list, pid));
+    }
+}
+
+/// A listed process with no threads has exited and is only held open, so it is not live.
+fn listed_creation_time(list: &[u8], pid: u32) -> Option<u64> {
+    fn field<const N: usize>(entry: &[u8], offset: usize) -> Option<[u8; N]> {
+        entry.get(offset..offset + N)?.try_into().ok()
+    }
+    let mut offset = 0_usize;
+    loop {
+        let entry = list.get(offset..)?;
+        let unique_process_id = usize::from_ne_bytes(field(entry, SPI_UNIQUE_PROCESS_ID)?);
+        if unique_process_id == pid as usize {
+            let threads = u32::from_ne_bytes(field(entry, SPI_NUMBER_OF_THREADS)?);
+            let created = u64::from_ne_bytes(field(entry, SPI_CREATE_TIME)?);
+            return (threads != 0).then_some(created);
+        }
+        match u32::from_ne_bytes(field(entry, 0)?) {
+            0 => return None,
+            next => offset += next as usize,
+        }
+    }
 }
 
 /// The kernel's per-boot counter. It is fixed for a boot, unlike `BootTime`, which the
@@ -4549,6 +4627,127 @@ mod tests {
         // Windows PIDs are multiples of four, so these never name a process.
         assert_eq!(super::observe_process(u32::MAX).unwrap(), None);
         assert_eq!(super::observe_process(u32::MAX - 4).unwrap(), None);
+    }
+
+    #[test]
+    fn listed_creation_time_walks_system_process_entries() {
+        fn entry(next: u32, pid: usize, threads: u32, created: u64) -> Vec<u8> {
+            let mut entry = vec![0_u8; 0x100];
+            entry[..4].copy_from_slice(&next.to_ne_bytes());
+            entry[super::SPI_NUMBER_OF_THREADS..][..4].copy_from_slice(&threads.to_ne_bytes());
+            entry[super::SPI_CREATE_TIME..][..8].copy_from_slice(&created.to_ne_bytes());
+            entry[super::SPI_UNIQUE_PROCESS_ID..][..super::size_of::<usize>()]
+                .copy_from_slice(&pid.to_ne_bytes());
+            entry
+        }
+        let mut list = entry(0x100, 8, 3, 111);
+        list.extend(entry(0x100, 12, 0, 222));
+        list.extend(entry(0, 16, 1, 333));
+
+        assert_eq!(super::listed_creation_time(&list, 8), Some(111));
+        assert_eq!(super::listed_creation_time(&list, 16), Some(333));
+        // Exited but still held open: listed without threads.
+        assert_eq!(super::listed_creation_time(&list, 12), None);
+        assert_eq!(super::listed_creation_time(&list, 20), None);
+        assert_eq!(super::listed_creation_time(&list[..0x180], 16), None);
+        assert_eq!(super::listed_creation_time(&[], 8), None);
+    }
+
+    #[test]
+    fn listed_creation_time_matches_get_process_times() {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let expected = super::process_creation_time(unsafe { GetCurrentProcess() }).unwrap();
+        assert_eq!(
+            super::listed_process_creation_time(std::process::id()).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn observe_process_reads_processes_it_cannot_open_from_the_system_list() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, ImpersonateLoggedOnUser, InitializeAcl,
+            InitializeSecurityDescriptor, RevertToSelf, SetKernelObjectSecurity,
+            SetSecurityDescriptorDacl, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+            DISABLE_MAX_PRIVILEGE, SECURITY_DESCRIPTOR, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+            TOKEN_IMPERSONATE, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+        let mut child = spawn_idle_child();
+        let process = child.as_raw_handle().cast();
+        let created = super::process_creation_time(process).unwrap();
+        // An empty DACL denies every open; the Child handle keeps the access it was granted.
+        let mut acl = ACL::default();
+        let mut descriptor = super::MaybeUninit::<SECURITY_DESCRIPTOR>::zeroed();
+        let descriptor = descriptor.as_mut_ptr().cast();
+        // An elevated shell (for example over ssh) has SeDebugPrivilege enabled, which bypasses
+        // the DACL, so the checks run on this thread under a copy of its token without privileges.
+        let mut token = std::ptr::null_mut();
+        let mut restricted = std::ptr::null_mut();
+        unsafe {
+            assert_ne!(
+                InitializeAcl(&mut acl, super::size_of::<ACL>() as u32, ACL_REVISION),
+                0
+            );
+            assert_ne!(
+                InitializeSecurityDescriptor(descriptor, SECURITY_DESCRIPTOR_REVISION),
+                0
+            );
+            assert_ne!(SetSecurityDescriptorDacl(descriptor, 1, &acl, 0), 0);
+            assert_ne!(
+                SetKernelObjectSecurity(process, DACL_SECURITY_INFORMATION, descriptor),
+                0
+            );
+            let access = TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), access, &mut token), 0);
+            let token = super::OwnedHandle::from_raw_handle(token);
+            assert_ne!(
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut restricted,
+                ),
+                0
+            );
+        }
+        let restricted = unsafe { super::OwnedHandle::from_raw_handle(restricted) };
+        let current = super::observe_process(std::process::id()).unwrap().unwrap();
+
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let denied =
+            unsafe { super::OpenProcess(super::PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
+        let open_error = std::io::Error::last_os_error().raw_os_error();
+        let live = super::observe_process(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let exited = super::observe_process(child.id());
+        assert_ne!(unsafe { RevertToSelf() }, 0);
+
+        assert!(denied.is_null());
+        assert_eq!(open_error, Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(
+            live.unwrap(),
+            Some(crate::platform::OwnerProcessIncarnation {
+                pid: child.id(),
+                boot_id: current.boot_id,
+                start_time_ticks: created,
+            })
+        );
+        assert_eq!(exited.unwrap(), None);
     }
 
     #[test]
