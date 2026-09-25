@@ -73,6 +73,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        agent_start_profile: true,
     })
 }
 
@@ -1377,6 +1378,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_start_profile: true,
             }),
             None,
             None,
@@ -1385,6 +1387,12 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn server_advertises_agent_start_profile() {
+        // `agent start --profile` refuses to run against a server without this flag.
+        assert!(default_capabilities().unwrap().agent_start_profile);
     }
 
     #[test]

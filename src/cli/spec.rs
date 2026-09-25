@@ -417,6 +417,9 @@ fn agent_command() -> Command {
                         .required(true)
                         .help("Existing pane at an interactive shell prompt"),
                 )
+                .arg(option("profile", "NAME").help(
+                    "OMP launch profile; runs its [session.omp_launchers] executable (kind omp only)",
+                ))
                 .arg(
                     option("timeout", "MS")
                         .help("Wait for interactive readiness (default: 30000; max: 300000)"),
@@ -1300,6 +1303,7 @@ mod tests {
                 .map(str::to_string)
         );
         assert!(has_option(agent_start, "pane"));
+        assert!(has_option(agent_start, "profile"));
         for legacy in ["cwd", "workspace", "tab", "split", "focus", "env", "argv"] {
             assert!(!has_option(agent_start, legacy), "legacy option --{legacy}");
         }

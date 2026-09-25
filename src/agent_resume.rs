@@ -336,6 +336,15 @@ fn valid_session_path(value: &str) -> bool {
         && Path::new(value).is_absolute()
 }
 
+/// Trimmed OMP launch profile name, or `None` when it is empty, longer than
+/// 64 bytes, or contains control characters. Shared by `agent.start` and the
+/// OMP session hook so both accept the same names.
+pub fn validate_omp_launch_profile(raw: &str) -> Option<String> {
+    let profile = raw.trim();
+    (!profile.is_empty() && profile.len() <= 64 && !profile.chars().any(char::is_control))
+        .then(|| profile.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

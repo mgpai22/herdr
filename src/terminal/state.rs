@@ -144,6 +144,8 @@ pub struct TerminalState {
     managed_agent: Option<ManagedAgent>,
     codex_prompt_ready: bool,
     managed_agent_launch_session: Option<crate::agent_resume::PersistedAgentSession>,
+    /// OMP launch profile requested by `agent.start`; shown until the hook reports.
+    managed_omp_launch_profile: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
@@ -182,6 +184,7 @@ impl TerminalState {
             managed_agent: None,
             codex_prompt_ready: false,
             managed_agent_launch_session: None,
+            managed_omp_launch_profile: None,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
@@ -2257,6 +2260,24 @@ impl TerminalState {
         self.agent_name = None;
         self.agent_name_owner = None;
         self.managed_agent = None;
+        self.managed_omp_launch_profile = None;
+    }
+
+    pub fn set_managed_omp_launch_profile(&mut self, profile: String) {
+        self.managed_omp_launch_profile = Some(profile);
+    }
+
+    pub fn managed_omp_launch_profile(&self) -> Option<&str> {
+        self.managed_omp_launch_profile.as_deref()
+    }
+
+    /// Reported OMP launch profile, else the one requested at `agent.start`.
+    pub fn omp_launch_profile(&self) -> Option<&str> {
+        self.persisted_agent_session
+            .as_ref()
+            .filter(|session| session.agent == "omp")
+            .and_then(|session| session.launch_profile.as_deref())
+            .or(self.managed_omp_launch_profile.as_deref())
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
@@ -2542,6 +2563,34 @@ mod tests {
         assert_eq!(timed_out.agent_name, None);
         assert_eq!(timed_out.managed_agent_kind(), None);
         assert!(timed_out.persisted_agent_session.is_none());
+    }
+
+    #[test]
+    fn reported_omp_profile_overrides_start_seed_and_exit_clears_seed() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.begin_managed_agent(
+            "reviewer".into(),
+            Agent::Omp,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_managed_omp_launch_profile("neurable".into());
+        assert_eq!(terminal.omp_launch_profile(), Some("neurable"));
+
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path("/tmp/omp.jsonl").unwrap(),
+            launch_profile: Some("default".into()),
+            owner_process: None,
+        });
+        assert_eq!(terminal.omp_launch_profile(), Some("default"));
+
+        terminal.persisted_agent_session = None;
+        assert!(terminal.reconcile_managed_agent_at(now, true));
+        assert_eq!(terminal.omp_launch_profile(), None);
     }
 
     #[test]

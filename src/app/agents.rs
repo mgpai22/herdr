@@ -153,6 +153,24 @@ impl App {
         let Some(kind) = crate::detect::parse_agent_label(&params.kind) else {
             return Err(AgentStartError::UnsupportedKind(params.kind));
         };
+        let bare_executable = || crate::detect::interactive_agent_executable(kind).to_string();
+        let (executable, omp_launch_profile) = match (kind, params.profile) {
+            (crate::detect::Agent::Omp, Some(raw)) => {
+                let profile = crate::agent_resume::validate_omp_launch_profile(&raw)
+                    .ok_or(AgentStartError::InvalidProfile)?;
+                let Some(executable) = self
+                    .omp_launchers
+                    .get(&profile)
+                    .filter(|executable| !executable.is_empty())
+                    .cloned()
+                else {
+                    return Err(AgentStartError::UnknownProfile(profile));
+                };
+                (executable, Some(profile))
+            }
+            (_, Some(_)) => return Err(AgentStartError::ProfileRequiresOmp),
+            (_, None) => (bare_executable(), None),
+        };
         if params
             .args
             .iter()
@@ -194,7 +212,7 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
-        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
+        let mut argv = vec![executable];
         argv.extend(params.args);
         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
             .ok_or(AgentStartError::InvalidArgument)?;
@@ -219,8 +237,15 @@ impl App {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }
+        if kind == crate::detect::Agent::Omp {
+            // A saved session from an earlier occupant must not stand in for this start.
+            terminal.persisted_agent_session = None;
+        }
         if let Some(session) = persisted_agent_session {
             terminal.set_managed_agent_launch_session(session);
+        }
+        if let Some(profile) = omp_launch_profile {
+            terminal.set_managed_omp_launch_profile(profile);
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
@@ -243,6 +268,20 @@ impl App {
             AgentStartError::UnsupportedKind(kind) => crate::api::schema::ErrorBody {
                 code: "unsupported_agent_kind".into(),
                 message: format!("unsupported interactive agent kind {kind}"),
+            },
+            AgentStartError::ProfileRequiresOmp => crate::api::schema::ErrorBody {
+                code: "agent_profile_requires_omp".into(),
+                message: "a launch profile is only supported for agent kind omp".into(),
+            },
+            AgentStartError::InvalidProfile => crate::api::schema::ErrorBody {
+                code: "invalid_launch_profile".into(),
+                message: "OMP launch profile is invalid".into(),
+            },
+            AgentStartError::UnknownProfile(profile) => crate::api::schema::ErrorBody {
+                code: "unknown_launch_profile".into(),
+                message: format!(
+                    "unknown OMP launch profile \"{profile}\"; add it to [session.omp_launchers]"
+                ),
             },
             AgentStartError::InvalidArgument => crate::api::schema::ErrorBody {
                 code: "invalid_agent_argument".into(),
@@ -375,11 +414,7 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
-        let launch_profile = terminal
-            .persisted_agent_session
-            .as_ref()
-            .filter(|session| session.agent == "omp")
-            .and_then(|session| session.launch_profile.clone());
+        let launch_profile = terminal.omp_launch_profile().map(str::to_string);
         let launch_executable = launch_profile
             .as_ref()
             .and_then(|profile| self.omp_launchers.get(profile))
@@ -461,6 +496,9 @@ fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crat
 pub(super) enum AgentStartError {
     InvalidName,
     UnsupportedKind(String),
+    ProfileRequiresOmp,
+    InvalidProfile,
+    UnknownProfile(String),
     InvalidArgument,
     InvalidTimeout,
     TargetNotFound(String),

@@ -1622,14 +1622,15 @@ impl App {
                 "v2 session reports are reserved for OMP",
             );
         }
-        let profile = params.launch_profile.trim().to_string();
-        if profile.is_empty() || profile.len() > 64 || profile.chars().any(char::is_control) {
+        let Some(profile) =
+            crate::agent_resume::validate_omp_launch_profile(&params.launch_profile)
+        else {
             return encode_error(
                 id,
                 "invalid_launch_profile",
                 "OMP launch profile is invalid",
             );
-        }
+        };
         let Some(session_ref) = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
@@ -1760,6 +1761,21 @@ impl App {
             });
         if !applied {
             return encode_error(id, "report_rejected", "OMP session report was rejected");
+        }
+        if let Some(requested) = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.managed_omp_launch_profile())
+            .filter(|requested| *requested != profile)
+        {
+            tracing::warn!(
+                pane = pane_id.raw(),
+                terminal = %terminal_id,
+                requested,
+                reported = %profile,
+                "OMP reported a launch profile other than the one agent.start requested"
+            );
         }
         encode_success(id, ResponseResult::Ok {})
     }

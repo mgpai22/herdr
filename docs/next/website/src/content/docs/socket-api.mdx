@@ -113,6 +113,8 @@ Raw socket method names use dot notation:
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
 
+`agent.start` accepts an optional `profile` for kind `omp`. Servers that support it advertise `agent_start_profile: true` in the `ping` capabilities; older servers ignore the field and type the bare `omp`, so clients must check the capability first (`herdr agent start --profile` does, and fails with `agent_profile_unsupported` until the server is restarted or handed off). The server trims the name and resolves it through `session.omp_launchers`, then types that entry's value as the single executable (`argv[0]`, quoted as one argument, never split or `~`-expanded). Errors: `agent_profile_requires_omp` when `profile` is set for another kind, `invalid_launch_profile` for an empty, control-character, or over-64-byte name, and `unknown_launch_profile` when no non-empty launcher entry exists. No input is typed on any of these errors. Starting `omp` drops any session saved for the pane by an earlier occupant. The returned `agent.launch_profile` is the requested profile until the OMP integration reports the running profile, which then replaces it; a bare `omp` start has no `launch_profile` until that report. After the agent is ready, `herdr agent start --profile` fails with `launch_profile_mismatch` when the agent does not carry the requested profile. That agent stays running under its name; the error object includes `agent: { pane_id, terminal_id }` so the caller can stop or reuse it.
+
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
@@ -672,7 +674,7 @@ Integrations report agent state with `pane.report_agent`.
 `state` carries semantic agent state and affects waits, notifications, and
 rollups. Report display-only values separately through metadata.
 
-Session-only official integrations report native session references with `pane.report_agent_session`. OMP integration version 11 uses `pane.report_agent_session_v2` with `launch_profile` and `agent_pid`; Herdr accepts it only after the PID remains the same live process around a foreground-pane membership check. Herdr checks the profile name's format but does not resolve it through `session.omp_launchers` when it accepts the report; automatic recovery later requires a `session.omp_launchers` entry for the saved profile. State-independent session reports do not affect waits, notifications, or rollups.
+Session-only official integrations report native session references with `pane.report_agent_session`. OMP integration version 11 uses `pane.report_agent_session_v2` with `launch_profile` and `agent_pid`; Herdr accepts it only after the PID remains the same live process around a foreground-pane membership check. Herdr checks the profile name's format with the same rule as `agent.start` `profile` but does not resolve it through `session.omp_launchers` when it accepts the report; automatic recovery later requires a `session.omp_launchers` entry for the saved profile. The reported profile is authoritative: it replaces the profile requested by `agent.start --profile`, so a launcher that runs a different profile than its key shows the reported one, and the server log records a warning. Session recovery still needs this report; a pane restarted before its first report is not restored. State-independent session reports do not affect waits, notifications, or rollups.
 
 ```json
 {
@@ -702,7 +704,7 @@ OMP's versioned report has the same session fields plus `launch_profile` and `ag
 }
 ```
 
-If no native session reference is stored, the field is omitted. `AgentInfo` also exposes optional `launch_profile` and server-resolved `launch_executable` fields for a profile-safe OMP session. Callers must treat missing fields as unsafe and must never reconstruct an executable from the profile name.
+If no native session reference is stored, the field is omitted. `AgentInfo` also exposes optional `launch_profile` and server-resolved `launch_executable` fields for OMP. They come from the verified OMP session report, or, until that report arrives, from the profile requested by `agent.start --profile`. Callers must treat missing fields as unsafe and must never reconstruct an executable from the profile name.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 

@@ -288,7 +288,7 @@ fn matched_rule_region_preview<'a>(
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
+        eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--profile NAME] [--timeout MS] [-- <agent-args...>]");
         return Ok(2);
     };
     let separator = args
@@ -298,6 +298,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut kind = None;
     let mut pane_id = None;
     let mut timeout_ms = None;
+    let mut profile = None;
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
@@ -315,6 +316,14 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 pane_id = Some(super::normalize_pane_id(value));
+                index += 2;
+            }
+            "--profile" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --profile");
+                    return Ok(2);
+                };
+                profile = Some(value.clone());
                 index += 2;
             }
             "--timeout" => {
@@ -353,6 +362,17 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         Vec::new()
     };
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
+    // Older servers ignore an unknown `profile` field and type the bare executable.
+    if profile.is_some()
+        && !super::server_capabilities("cli:agent:start")?
+            .is_some_and(|capabilities| capabilities.agent_start_profile)
+    {
+        return super::print_response(&cli_agent_error(
+            "cli:agent:start",
+            "agent_profile_unsupported",
+            "the running herdr server predates agent start --profile; restart or hand off the server",
+        ));
+    }
     let retryable_timeout = timeout > crate::app::AGENT_START_SETTLE_DELAY
         && timeout <= crate::app::MAX_AGENT_START_TIMEOUT;
     let pinned_terminal_id = pane_terminal_id(&pane_id)?;
@@ -377,6 +397,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
+                profile: profile.clone(),
             }),
         })?;
         if response.get("error").is_none() {
@@ -425,6 +446,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     );
     match waited {
         Ok(Ok(agent)) => {
+            if let Some(error) = profile
+                .as_deref()
+                .and_then(|requested| launch_profile_mismatch("cli:agent:start", requested, &agent))
+            {
+                return super::print_response(&error);
+            }
             response["result"]["agent"] = agent;
             super::print_response(&response)
         }
@@ -727,6 +754,32 @@ fn agent_wait_timeout() -> serde_json::Value {
     )
 }
 
+/// Error when the started agent does not carry the requested OMP launch profile.
+/// The agent keeps running under its name, so the error carries its pane and terminal.
+fn launch_profile_mismatch(
+    id: &str,
+    requested: &str,
+    agent: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let requested = requested.trim();
+    let actual = agent["launch_profile"].as_str();
+    (actual != Some(requested)).then(|| {
+        let mut error = cli_agent_error(
+            id,
+            "launch_profile_mismatch",
+            format!(
+                "requested OMP launch profile \"{requested}\" but the agent reports {}",
+                actual.map_or_else(|| "none".to_string(), |actual| format!("\"{actual}\""))
+            ),
+        );
+        error["error"]["agent"] = serde_json::json!({
+            "pane_id": agent["pane_id"],
+            "terminal_id": agent["terminal_id"],
+        });
+        error
+    })
+}
+
 fn cli_agent_error(id: &str, code: &str, message: impl Into<String>) -> serde_json::Value {
     serde_json::json!({
         "id": id,
@@ -941,7 +994,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
-        "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+        "  herdr agent start <name> --kind KIND --pane ID [--profile NAME] [--timeout MS] [-- <agent-args...>]"
     );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
@@ -956,4 +1009,36 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn launch_profile_mismatch_requires_the_requested_profile() {
+        let agent = |profile: serde_json::Value| {
+            serde_json::json!({
+                "launch_profile": profile,
+                "pane_id": "w1-1",
+                "terminal_id": "term-7",
+            })
+        };
+        assert!(
+            super::launch_profile_mismatch("id", " neurable ", &agent("neurable".into())).is_none()
+        );
+        for reported in [serde_json::json!("default"), serde_json::Value::Null] {
+            let error =
+                super::launch_profile_mismatch("id", "neurable", &agent(reported.clone())).unwrap();
+            assert_eq!(
+                error["error"]["code"], "launch_profile_mismatch",
+                "{reported}"
+            );
+            assert_eq!(
+                error["error"]["agent"],
+                serde_json::json!({ "pane_id": "w1-1", "terminal_id": "term-7" }),
+                "{reported}"
+            );
+            let message = error["error"]["message"].as_str().unwrap();
+            assert!(message.contains("\"neurable\""), "{message}");
+        }
+    }
 }
