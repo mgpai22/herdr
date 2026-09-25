@@ -74,13 +74,41 @@ pub(super) fn save_strict_to_path(path: &Path, snapshot: &SessionSnapshot) -> st
         let mut file = options.open(&tmp_path)?;
         file.write_all(&json)?;
         file.sync_all()?;
-        std::fs::rename(&tmp_path, &target)?;
-        std::fs::File::open(parent)?.sync_all()
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&tmp_path, &target)?;
+            std::fs::File::open(parent)?.sync_all()
+        }
+        // Windows cannot open a directory as a file to sync it; a write-through move returns
+        // only once the replacement is on disk.
+        #[cfg(windows)]
+        rename_write_through(&tmp_path, &target)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
+}
+
+#[cfg(windows)]
+fn rename_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let (from, to) = (wide(from), wide(to));
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
@@ -355,6 +383,29 @@ mod tests {
             .is_symlink());
         assert!(target.exists());
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn strict_save_replaces_existing_snapshot_on_windows() {
+        let path = temp_session_path("strict-windows");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old").unwrap();
+
+        save_strict_to_path(&path, &empty_snapshot()).unwrap();
+        save_strict_to_path(&path, &empty_snapshot()).unwrap();
+
+        assert_eq!(
+            parse_snapshot(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .version,
+            SNAPSHOT_VERSION
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn strict_save_replaces_with_private_durable_snapshot() {

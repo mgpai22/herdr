@@ -805,6 +805,79 @@ mod windows_tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(path);
     }
+
+    /// A separate client process proves the server stamps the pipe client's PID, not its own,
+    /// and discards a JSON-supplied `peer_pid`.
+    #[test]
+    fn v2_session_report_stamps_named_pipe_client_pid() {
+        use base64::Engine as _;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-peer-pid-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let request = r#"{"id":"peer","method":"pane.report_agent_session_v2","params":{"pane_id":"p","source":"herdr:omp","agent":"omp","launch_profile":"default","agent_pid":1,"peer_pid":22}}"#;
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let script = format!(
+            "$p=New-Object System.IO.Pipes.NamedPipeClientStream('.',{},'InOut');$p.Connect(30000);$w=New-Object System.IO.StreamWriter($p);$w.AutoFlush=$true;$w.WriteLine({});$r=New-Object System.IO.StreamReader($p);[void]$r.ReadLine()",
+            quote(&path.to_string_lossy()),
+            quote(request),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let mut client = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+            ])
+            .arg(encoded)
+            .spawn()
+            .unwrap();
+        let server = listener.accept().unwrap();
+
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let message = api_rx.blocking_recv().unwrap();
+            let Method::PaneReportAgentSessionV2(params) = message.request.method else {
+                panic!("unexpected request: {:?}", message.request.method);
+            };
+            message
+                .respond_to
+                .send(error_response_json(
+                    message.request.id,
+                    "test",
+                    String::new(),
+                ))
+                .unwrap();
+            params.peer_pid
+        });
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        assert!(client.wait().unwrap().success());
+        let peer_pid = responder.join().unwrap();
+        assert_eq!(peer_pid, Some(client.id()));
+        assert_ne!(peer_pid, Some(std::process::id()));
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn stream_subscriptions(

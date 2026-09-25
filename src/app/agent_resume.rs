@@ -280,7 +280,23 @@ impl App {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        #[cfg(not(windows))]
+        let resume_command = shell_command_from_argv(&plan.argv);
+        // Windows panes run PowerShell or cmd, where POSIX quoting breaks launcher paths and
+        // quoted arguments; launch exactly like `agent start` does.
+        #[cfg(windows)]
+        let resume_command = crate::platform::interactive_shell_command(
+            &plan.argv,
+            if crate::pane::uses_windows_powershell_pane_shell(crate::pane::PaneShellConfig::new(
+                &self.state.default_shell,
+                self.state.shell_mode,
+            )) {
+                "powershell"
+            } else {
+                "cmd"
+            },
+        );
+        let Some(resume_command) = resume_command else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -423,6 +439,7 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     )
 }
 
+#[cfg(not(windows))]
 fn shell_command_from_argv(argv: &[String]) -> Option<String> {
     let mut parts = argv.iter();
     let first = shell_quote(parts.next()?);
@@ -434,6 +451,7 @@ fn shell_command_from_argv(argv: &[String]) -> Option<String> {
     Some(command)
 }
 
+#[cfg(not(windows))]
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -1158,6 +1176,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn shell_command_from_argv_quotes_resume_arguments() {
         let argv = vec![

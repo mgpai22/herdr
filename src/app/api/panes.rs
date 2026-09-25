@@ -1704,6 +1704,7 @@ impl App {
                 )
             }
         };
+        #[cfg(not(windows))]
         let is_foreground_member = runtime
             .child_pid()
             .and_then(crate::detect::foreground_job)
@@ -1712,6 +1713,10 @@ impl App {
                     .iter()
                     .any(|process| process.pid == params.agent_pid)
             });
+        #[cfg(windows)]
+        let is_foreground_member = runtime.child_pid().is_some_and(|child_pid| {
+            crate::platform::foreground_job_includes_process(child_pid, params.agent_pid)
+        });
         if !is_foreground_member {
             return encode_error(
                 id,
@@ -2425,7 +2430,7 @@ mod tests {
                 "source": "herdr:omp",
                 "agent": "omp",
                 "seq": 1,
-                "agent_session_path": "/tmp/session.jsonl",
+                "agent_session_path": if cfg!(windows) { r"C:\tmp\session.jsonl" } else { "/tmp/session.jsonl" },
                 "session_start_source": "startup",
                 "launch_profile": "default",
                 "agent_pid": 22,

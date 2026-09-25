@@ -58,11 +58,82 @@ impl RemoteBridgeWake {
     }
 }
 
-pub fn observe_process(_pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "process incarnation observation is unsupported on Windows",
-    ))
+/// Liveness is the same PID with the same creation `FILETIME` in the same boot.
+/// An unknown PID, or one whose process has exited but is still held open by another
+/// handle, is `Ok(None)`, matching Linux's absent `/proc/<pid>`.
+pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+    if pid == 0 {
+        return Ok(None);
+    }
+    // Read the boot identity first: a missing process only proves absence once the boot is known.
+    let boot_id = windows_boot_id()?;
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        // OpenProcess reports a PID with no process object as ERROR_INVALID_PARAMETER.
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+    match unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) } {
+        WAIT_TIMEOUT => {}
+        WAIT_OBJECT_0 => return Ok(None),
+        _ => return Err(std::io::Error::last_os_error()),
+    }
+    let start_time_ticks = process_creation_time(process.as_raw_handle().cast())
+        .ok_or_else(std::io::Error::last_os_error)?;
+    if start_time_ticks == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process creation time is zero",
+        ));
+    }
+    Ok(Some(super::OwnerProcessIncarnation {
+        pid,
+        boot_id,
+        start_time_ticks,
+    }))
+}
+
+/// The kernel's per-boot counter. It is fixed for a boot, unlike `BootTime`, which the
+/// kernel shifts whenever the system clock is set.
+fn windows_boot_id() -> std::io::Result<String> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD,
+    };
+
+    let key = wide_null(
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters",
+    );
+    let value = wide_null("BootId");
+    let mut boot_id = 0_u32;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&mut boot_id as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(boot_id.to_string())
 }
 
 pub(crate) fn wait_client_stream_readable(
@@ -1392,6 +1463,46 @@ pub fn current_process_is_detached_server_daemon() -> bool {
 
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     select_pane_foreground_job_cached(child_pid)
+}
+
+/// Windows has no foreground process group, so `foreground_job` names one selected process.
+/// Its descendants stand in for the rest of the group; that covers launcher shims such as
+/// bun's `omp.exe`, which keeps the reporting `bun.exe` runtime as its child.
+pub(crate) fn foreground_job_includes_process(child_pid: u32, pid: u32) -> bool {
+    let Some(job) = select_pane_foreground_job_cached(child_pid) else {
+        return false;
+    };
+    job.process_group_id == pid
+        || process_descends_from(job.process_group_id, pid, &fresh_foreground_processes())
+}
+
+/// Toolhelp parent PIDs are not held open, so a parent may have exited and its PID been reused.
+/// Each hop therefore also requires the parent to predate its child; a recycled PID never does.
+fn process_descends_from(ancestor_pid: u32, pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    let Some(mut current) = snapshot.entry(pid) else {
+        return false;
+    };
+    let mut visited = HashSet::from([pid]);
+    loop {
+        let parent_pid = current.parent_pid;
+        if parent_pid == 0 || !visited.insert(parent_pid) {
+            return false;
+        }
+        let Some(parent) = snapshot.entry(parent_pid) else {
+            return false;
+        };
+        match (
+            parent.command().creation_time,
+            current.command().creation_time,
+        ) {
+            (Some(parent_created), Some(created)) if parent_created <= created => {}
+            _ => return false,
+        }
+        if parent_pid == ancestor_pid {
+            return true;
+        }
+        current = parent;
+    }
 }
 
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
@@ -4388,6 +4499,87 @@ mod tests {
             name: name.to_string(),
             command,
         }
+    }
+
+    fn spawn_idle_child() -> std::process::Child {
+        std::process::Command::new("ping.exe")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn observe_process_tracks_one_incarnation_per_process() {
+        let current = super::observe_process(std::process::id()).unwrap().unwrap();
+        assert_eq!(current.pid, std::process::id());
+        assert_ne!(current.start_time_ticks, 0);
+        assert!(!current.boot_id.is_empty());
+
+        let mut first = spawn_idle_child();
+        let observed = super::observe_process(first.id()).unwrap().unwrap();
+        assert_eq!(observed.pid, first.id());
+        assert_eq!(observed.boot_id, current.boot_id);
+        assert_eq!(
+            super::observe_process(first.id()).unwrap(),
+            Some(observed.clone())
+        );
+
+        first.kill().unwrap();
+        first.wait().unwrap();
+        // The Child handle keeps the exited process object and its PID alive.
+        assert_eq!(super::observe_process(first.id()).unwrap(), None);
+        drop(first);
+
+        let mut second = spawn_idle_child();
+        let replacement = super::observe_process(second.id()).unwrap().unwrap();
+        assert_ne!(replacement, observed);
+        assert_eq!(replacement.boot_id, observed.boot_id);
+        assert_ne!(
+            super::observe_process(observed.pid).unwrap(),
+            Some(observed)
+        );
+        second.kill().unwrap();
+        second.wait().unwrap();
+    }
+
+    #[test]
+    fn observe_process_reports_unknown_pids_as_absent() {
+        assert_eq!(super::observe_process(0).unwrap(), None);
+        // Windows PIDs are multiples of four, so these never name a process.
+        assert_eq!(super::observe_process(u32::MAX).unwrap(), None);
+        assert_eq!(super::observe_process(u32::MAX - 4).unwrap(), None);
+    }
+
+    #[test]
+    fn foreground_membership_includes_launcher_shim_descendants_only() {
+        let entries = vec![
+            test_entry_with_creation_time(10, 1, "pwsh.exe", &["pwsh.exe"], Some(100)),
+            test_entry_with_creation_time(20, 10, "omp.exe", &["omp.exe"], Some(200)),
+            test_entry_with_creation_time(
+                30,
+                20,
+                "bun.exe",
+                &[
+                    "bun.exe",
+                    r"C:\Users\u\.bun\install\global\node_modules\omp\cli.js",
+                ],
+                Some(300),
+            ),
+            // Its recorded parent PID was reused by the shim, which started later.
+            test_entry_with_creation_time(40, 20, "node.exe", &["node.exe"], Some(150)),
+            test_entry_with_creation_time(50, 60, "bun.exe", &["bun.exe"], Some(400)),
+        ];
+        let job = super::select_pane_foreground_job(10, &entries).unwrap();
+        assert_eq!(job.process_group_id, 20);
+        let snapshot = super::ProcessSnapshot::new(entries);
+
+        assert!(super::process_descends_from(20, 30, &snapshot));
+        assert!(super::process_descends_from(10, 30, &snapshot));
+        assert!(!super::process_descends_from(20, 40, &snapshot));
+        assert!(!super::process_descends_from(20, 50, &snapshot));
+        assert!(!super::process_descends_from(20, 10, &snapshot));
+        assert!(!super::process_descends_from(20, 99, &snapshot));
     }
 
     #[test]
