@@ -173,6 +173,10 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// OMP launch profile. Only valid with kind `omp`; the profile must be a key
+    /// of `session.omp_launchers`, whose value is run as the executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -208,6 +212,10 @@ pub struct AgentInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_executable: Option<String>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,

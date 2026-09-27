@@ -2854,6 +2854,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_start_profile: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2929,6 +2930,7 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     ssh_agent_registration: false,
+                    agent_start_profile: false,
                 }),
             },
         };
@@ -3188,6 +3190,7 @@ mod tests {
                     surface_interest: true,
                     health_check: true,
                     ssh_agent_registration: false,
+                    agent_start_profile: false,
                 }),
             },
         };

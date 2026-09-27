@@ -135,6 +135,7 @@ pub struct App {
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
+    pub(crate) omp_launchers: std::collections::BTreeMap<String, String>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -380,15 +381,10 @@ impl App {
                 .pane_history
                 .then(crate::persist::load_history)
                 .flatten();
-            let (ws, terminals, terminal_runtimes) = crate::persist::restore(
+            let (ws, terminals, terminal_runtimes) = crate::persist::restore_with_omp_launchers(
                 &snap,
                 history.as_ref(),
-                24,
-                80,
-                config.advanced.scrollback_limit_bytes,
-                &config.terminal.default_shell,
-                config.terminal.shell_mode,
-                config.session.resume_agents_on_restore,
+                config,
                 event_tx.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -601,6 +597,7 @@ impl App {
                 config.session.startup_per_agent_delay_ms.into(),
             ),
             next_agent_resume_at: None,
+            omp_launchers: config.session.omp_launchers.clone(),
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,
@@ -655,6 +652,7 @@ impl App {
             config.advanced.scrollback_limit_bytes,
             &config.terminal.default_shell,
             config.terminal.shell_mode,
+            &config.session.omp_launchers,
             imports,
             app.event_tx.clone(),
             app.render_notify.clone(),
@@ -940,6 +938,10 @@ impl App {
             self.state.default_shell = config.terminal.default_shell.clone();
             self.state.shell_mode = config.terminal.shell_mode;
             self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
+        }
+
+        if !invalid_section("session") {
+            self.omp_launchers = config.session.omp_launchers.clone();
         }
 
         if !invalid_section("worktrees") {
@@ -1694,7 +1696,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[server]\nheadless_cols = 160\nheadless_rows = 50\n[ui]\nagent_panel_sort = \"priority\"\n[ui.toast]\ndelivery = \"herdr\"\n",
+            "[terminal]\ndefault_shell = \"nu\"\nshell_mode = \"non_login\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+m\"\nprefix = \"ctrl+a\"\n[update]\nversion_check = false\nmanifest_check = false\n[server]\nheadless_cols = 160\nheadless_rows = 50\n[session.omp_launchers]\ndefault = \"/opt/omp-default\"\nrestricted = \"/opt/omp-restricted\"\n[ui]\nagent_panel_sort = \"priority\"\n[ui.toast]\ndelivery = \"herdr\"\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -1734,6 +1736,10 @@ mod tests {
         assert!(!app.update_manifest_check_enabled);
         assert!(app.next_auto_update_check.is_none());
         assert!(app.next_agent_manifest_update_check.is_none());
+        assert_eq!(
+            app.omp_launchers.get("restricted").map(String::as_str),
+            Some("/opt/omp-restricted")
+        );
         assert!(app.state.config_diagnostic.is_none());
         let toast = app.state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
@@ -2831,6 +2837,7 @@ mod tests {
                 pane_id,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
+                profile: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2873,6 +2880,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
+                profile: None,
             }),
         };
         let response = app.handle_api_request(request());
@@ -2922,6 +2930,105 @@ mod tests {
             app.state.terminals[&terminal_id].agent_name.as_deref(),
             Some("worker")
         );
+    }
+
+    #[tokio::test]
+    async fn agent_start_profile_selects_omp_launcher() {
+        let start = |kind: &str, profile: Option<&str>, saved_session: bool| {
+            let mut app = test_app();
+            app.omp_launchers = std::collections::BTreeMap::from([
+                ("default".into(), "/opt/omp-default".into()),
+                ("neurable".into(), "/opt/omp neurable".into()),
+            ]);
+            let workspace = Workspace::test_new("agent-start-profile");
+            let root = workspace.tabs[0].root_pane;
+            app.state.workspaces = vec![workspace];
+            app.state.ensure_test_terminals();
+            app.state.active = Some(0);
+            app.state.selected = 0;
+            let pane_id = app.pane_info(0, root).unwrap().pane_id;
+            let terminal_id = app.state.workspaces[0].tabs[0].panes[&root]
+                .attached_terminal_id
+                .clone();
+            let (runtime, mut receiver) =
+                crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+            app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+            if saved_session {
+                // A shell left by blocked OMP recovery keeps the earlier occupant's session.
+                app.state
+                    .terminals
+                    .get_mut(&terminal_id)
+                    .unwrap()
+                    .persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    session_ref: crate::agent_resume::AgentSessionRef::path("/tmp/old.jsonl")
+                        .unwrap(),
+                    launch_profile: Some("neurable".into()),
+                    owner_process: None,
+                });
+            }
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "req_agent_start_profile".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "worker".into(),
+                        kind: kind.into(),
+                        pane_id,
+                        args: Vec::new(),
+                        timeout_ms: Some(4_000),
+                        profile: profile.map(str::to_string),
+                    },
+                ),
+            });
+            let sent = receiver.try_recv().ok();
+            let name = app.state.terminals[&terminal_id].agent_name.clone();
+            (
+                serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+                sent,
+                name,
+            )
+        };
+
+        let (response, sent, _) = start("omp", Some(" neurable "), false);
+        assert_eq!(
+            response["result"]["argv"],
+            serde_json::json!(["/opt/omp neurable"])
+        );
+        assert_eq!(response["result"]["agent"]["launch_profile"], "neurable");
+        assert_eq!(
+            response["result"]["agent"]["launch_executable"],
+            "/opt/omp neurable"
+        );
+        let sent = String::from_utf8(sent.unwrap().to_vec()).unwrap();
+        assert!(sent.starts_with("'/opt/omp neurable'"), "{sent:?}");
+
+        // Bare omp claims no profile until the OMP hook reports one, even over a saved session.
+        for saved_session in [false, true] {
+            let (response, _, _) = start("omp", None, saved_session);
+            assert_eq!(response["result"]["argv"], serde_json::json!(["omp"]));
+            assert!(response["result"]["agent"]["launch_profile"].is_null());
+            assert!(response["result"]["agent"]["launch_executable"].is_null());
+        }
+
+        let (response, _, _) = start("omp", Some("default"), true);
+        assert_eq!(response["result"]["agent"]["launch_profile"], "default");
+        assert_eq!(
+            response["result"]["agent"]["launch_executable"],
+            "/opt/omp-default"
+        );
+
+        for (kind, profile, code) in [
+            ("omp", "work", "unknown_launch_profile"),
+            ("omp", "  ", "invalid_launch_profile"),
+            ("omp", "bad\u{7}", "invalid_launch_profile"),
+            ("pi", "neurable", "agent_profile_requires_omp"),
+        ] {
+            let (response, sent, name) = start(kind, Some(profile), false);
+            assert_eq!(response["error"]["code"], code, "{kind} {profile:?}");
+            assert!(sent.is_none(), "{kind} {profile:?} typed into the pane");
+            assert_eq!(name, None);
+        }
     }
 
     #[test]

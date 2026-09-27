@@ -781,6 +781,15 @@ pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
+pub(super) fn server_capabilities(
+    request_id: &str,
+) -> std::io::Result<Option<crate::api::schema::ServerCapabilities>> {
+    let client = target::api_client()?;
+    target::server_status(&client)
+        .map(|status| status.capabilities)
+        .map_err(|err| map_server_not_running_or_io(err, request_id, &client))
+}
+
 fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
     let status = target::server_status(client)
         .map_err(|err| map_server_not_running_or_io(err, request_id, client))?;

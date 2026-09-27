@@ -36,6 +36,13 @@ fn monitor_host_shutdown(
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OwnerProcessIncarnation {
+    pub pid: u32,
+    pub boot_id: String,
+    pub start_time_ticks: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,

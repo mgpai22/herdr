@@ -7343,6 +7343,8 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 source: "herdr:pi".into(),
                 agent: "pi".into(),
                 session_ref: old_session.clone(),
+                launch_profile: None,
+                owner_process: None,
             });
             terminal
                 .set_hook_authority_with_session_ref(
@@ -7521,6 +7523,8 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                     .to_string(),
             )
             .unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
     server
         .app

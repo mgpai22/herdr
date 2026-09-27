@@ -127,6 +127,63 @@ impl App {
         }
         self.save_session_now();
     }
+
+    /// Returns the owner it cleared so callers can restore it if OMP never starts.
+    pub(super) fn persist_owner_unknown_before_resume(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> std::io::Result<Option<crate::platform::OwnerProcessIncarnation>> {
+        if !self.policy.persist_session {
+            return Err(std::io::Error::other("session persistence is disabled"));
+        }
+        if let Some(thread) = self.session_save_thread.take() {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("session save thread failed"))?;
+        }
+        let previous_owner = self
+            .state
+            .terminals
+            .get_mut(terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_mut())
+            .ok_or_else(|| std::io::Error::other("OMP recovery metadata is missing"))?
+            .owner_process
+            .take();
+        if let Err(err) = self.save_owner_unknown_barrier() {
+            self.restore_omp_owner_after_failed_resume(terminal_id, previous_owner);
+            return Err(err);
+        }
+        self.state.session_dirty = false;
+        self.session_save_deadline = None;
+        Ok(previous_owner)
+    }
+
+    fn save_owner_unknown_barrier(&mut self) -> std::io::Result<()> {
+        let SessionSaveJob::Save { snapshot, history } = self.capture_session_save_job() else {
+            return Err(std::io::Error::other("no workspaces to persist"));
+        };
+        self.session_writer
+            .lock()
+            .map_err(|_| std::io::Error::other("session writer is poisoned"))?
+            .save_barrier(&snapshot, history.as_ref())
+    }
+
+    /// No OMP process started, so the cleared owner is still the last known one.
+    pub(super) fn restore_omp_owner_after_failed_resume(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        owner: Option<crate::platform::OwnerProcessIncarnation>,
+    ) {
+        if let Some(session) = self
+            .state
+            .terminals
+            .get_mut(terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_mut())
+        {
+            session.owner_process = owner;
+            self.state.mark_session_dirty();
+        }
+    }
 }
 
 fn run_session_save_job(

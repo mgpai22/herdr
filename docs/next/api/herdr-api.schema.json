@@ -1355,6 +1355,13 @@
             "pane_id": {
               "type": "string"
             },
+            "profile": {
+              "description": "OMP launch profile. Only valid with kind `omp`; the profile must be a key\nof `session.omp_launchers`, whose value is run as the executable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "timeout_ms": {
               "description": "Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.",
               "format": "uint64",
@@ -2974,6 +2981,61 @@
             "pane_id",
             "source",
             "agent"
+          ],
+          "type": "object"
+        },
+        "PaneReportAgentSessionV2Params": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "agent_session_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_session_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "launch_profile": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "session_start_source": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "source",
+            "agent",
+            "launch_profile",
+            "agent_pid"
           ],
           "type": "object"
         },
@@ -5944,6 +6006,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.report_agent_session_v2",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportAgentSessionV2Params"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.report_metadata",
               "type": "string"
             },
@@ -6574,8 +6652,20 @@
             "interactive_ready": {
               "type": "boolean"
             },
+            "launch_executable": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "launch_pending": {
               "type": "boolean"
+            },
+            "launch_profile": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "name": {
               "type": [
@@ -10400,6 +10490,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_start_profile": {
+              "default": false,
+              "description": "Supports `agent.start` `profile` (OMP launch profiles).",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

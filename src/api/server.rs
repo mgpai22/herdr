@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+use interprocess::local_socket::traits::{ListenerExt as _, Stream as _, StreamCommon as _};
 use tracing::{debug, error, info, warn};
 
 #[cfg(all(test, unix))]
@@ -73,6 +73,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        agent_start_profile: true,
     })
 }
 
@@ -239,7 +240,13 @@ fn handle_connection_with_stop(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let peer_pid = stream
+        .peer_creds()
+        .ok()
+        .and_then(|credentials| credentials.pid());
+    #[cfg(unix)]
+    let peer_pid = peer_pid.and_then(|pid| u32::try_from(pid).ok());
+    let mut request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
             // Recover correlation without relaxing typed request validation or accepting
@@ -267,6 +274,9 @@ fn handle_connection_with_stop(
             return Ok(());
         }
     };
+    if let Method::PaneReportAgentSessionV2(params) = &mut request.method {
+        params.peer_pid = peer_pid;
+    }
 
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -568,6 +578,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneRead(_) => "pane.read",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
+        Method::PaneReportAgentSessionV2(_) => "pane.report_agent_session_v2",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",
@@ -792,6 +803,79 @@ mod windows_tests {
             .unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A separate client process proves the server stamps the pipe client's PID, not its own,
+    /// and discards a JSON-supplied `peer_pid`.
+    #[test]
+    fn v2_session_report_stamps_named_pipe_client_pid() {
+        use base64::Engine as _;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-peer-pid-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let request = r#"{"id":"peer","method":"pane.report_agent_session_v2","params":{"pane_id":"p","source":"herdr:omp","agent":"omp","launch_profile":"default","agent_pid":1,"peer_pid":22}}"#;
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let script = format!(
+            "$p=New-Object System.IO.Pipes.NamedPipeClientStream('.',{},'InOut');$p.Connect(30000);$w=New-Object System.IO.StreamWriter($p);$w.AutoFlush=$true;$w.WriteLine({});$r=New-Object System.IO.StreamReader($p);[void]$r.ReadLine()",
+            quote(&path.to_string_lossy()),
+            quote(request),
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let mut client = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+            ])
+            .arg(encoded)
+            .spawn()
+            .unwrap();
+        let server = listener.accept().unwrap();
+
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let message = api_rx.blocking_recv().unwrap();
+            let Method::PaneReportAgentSessionV2(params) = message.request.method else {
+                panic!("unexpected request: {:?}", message.request.method);
+            };
+            message
+                .respond_to
+                .send(error_response_json(
+                    message.request.id,
+                    "test",
+                    String::new(),
+                ))
+                .unwrap();
+            params.peer_pid
+        });
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        assert!(client.wait().unwrap().success());
+        let peer_pid = responder.join().unwrap();
+        assert_eq!(peer_pid, Some(client.id()));
+        assert_ne!(peer_pid, Some(std::process::id()));
+        drop(listener);
         let _ = std::fs::remove_file(path);
     }
 }
@@ -1367,6 +1451,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_start_profile: true,
             }),
             None,
             None,
@@ -1375,6 +1460,12 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+    }
+
+    #[test]
+    fn server_advertises_agent_start_profile() {
+        // `agent start --profile` refuses to run against a server without this flag.
+        assert!(default_capabilities().unwrap().agent_start_profile);
     }
 
     #[test]

@@ -100,14 +100,33 @@ fn agent_start_and_prompt_requests_round_trip() {
             pane_id: "w1:p2".into(),
             args: vec!["--no-session".into()],
             timeout_ms: Some(30_000),
+            profile: None,
         }),
     };
     let start_json = serde_json::to_value(&start).unwrap();
     assert_eq!(start_json["method"], "agent.start");
     assert_eq!(start_json["params"]["pane_id"], "w1:p2");
+    assert!(start_json["params"].get("profile").is_none());
     assert_eq!(
         serde_json::from_value::<Request>(start_json).unwrap(),
         start
+    );
+    let profiled_start = Request {
+        id: "start".into(),
+        method: Method::AgentStart(AgentStartParams {
+            name: "reviewer".into(),
+            kind: "omp".into(),
+            pane_id: "w1:p2".into(),
+            args: Vec::new(),
+            timeout_ms: None,
+            profile: Some("neurable".into()),
+        }),
+    };
+    let profiled_json = serde_json::to_value(&profiled_start).unwrap();
+    assert_eq!(profiled_json["params"]["profile"], "neurable");
+    assert_eq!(
+        serde_json::from_value::<Request>(profiled_json).unwrap(),
+        profiled_start
     );
 
     let prompt = Request {
@@ -727,6 +746,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                agent_start_profile: true,
             }),
         },
     };

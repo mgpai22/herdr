@@ -9,7 +9,7 @@ use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 3;
+pub(super) const SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -117,6 +117,10 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_process: Option<crate::platform::OwnerProcessIncarnation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -323,9 +327,14 @@ fn capture_tab(
     for id in tab.panes.keys() {
         let terminal_id = tab.terminal_id(*id);
         let terminal = terminal_id.and_then(|id| terminals.get(id));
-        let cwd = terminal_id
-            .and_then(|id| terminal_runtimes.get(id))
-            .and_then(|runtime| runtime.cwd_for_persistence())
+        let runtime = terminal_id.and_then(|id| terminal_runtimes.get(id));
+        let omp_foreground_cwd = terminal
+            .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+            .filter(|session| session.agent == "omp")
+            .and(runtime)
+            .and_then(|runtime| runtime.foreground_cwd_for_persistence());
+        let cwd = omp_foreground_cwd
+            .or_else(|| runtime.and_then(|runtime| runtime.cwd_for_persistence()))
             .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
@@ -344,11 +353,21 @@ fn capture_tab(
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
+                    let matching_recovery =
+                        terminal.persisted_agent_session.as_ref().filter(|saved| {
+                            saved.source == authority.source
+                                && saved.agent == authority.agent_label
+                                && saved.session_ref == *session_ref
+                        });
                     return Some(PaneAgentSessionSnapshot {
                         source: authority.source.clone(),
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        launch_profile: matching_recovery
+                            .and_then(|saved| saved.launch_profile.clone()),
+                        owner_process: matching_recovery
+                            .and_then(|saved| saved.owner_process.clone()),
                     });
                 }
             }
@@ -360,6 +379,8 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    launch_profile: session.launch_profile.clone(),
+                    owner_process: session.owner_process.clone(),
                 })
         });
         panes.insert(
@@ -1143,6 +1164,100 @@ mod tests {
         std::fs::remove_dir(new).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_keeps_last_omp_foreground_cwd_after_exit() {
+        let old = std::env::current_dir().unwrap();
+        let new = std::env::temp_dir().join(format!(
+            "herdr-persist-omp-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&new).unwrap();
+        let new = std::fs::canonicalize(new).unwrap();
+        let mut state = AppState::test_new();
+        state.workspaces = vec![Workspace::test_new("omp-cwd-source")];
+        state.workspaces[0].identity_cwd = old.clone();
+        state.active = Some(0);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].terminal_id(pane_id).unwrap().clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.cwd = old.clone();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path("/tmp/omp-cwd.jsonl").unwrap(),
+            launch_profile: Some("default".into()),
+            owner_process: None,
+        });
+        let (events, _rx) = tokio::sync::mpsc::channel(32);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            24,
+            80,
+            old.clone(),
+            0,
+            Default::default(),
+            None,
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        let pid = runtime.child_pid().unwrap();
+        // No OSC 7: only the observed foreground cwd can report `new`.
+        let command = format!("cd '{}'; exec sleep 30\n", new.display());
+        runtime.try_send_bytes(bytes::Bytes::from(command)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::process_cwd(pid).as_ref() != Some(&new)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(crate::platform::process_cwd(pid), Some(new.clone()));
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        runtimes.insert(terminal_id, runtime);
+        let before = capture_from_state_with_runtimes(&state, &runtimes);
+        assert_eq!(
+            before.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .cwd,
+            new
+        );
+        crate::platform::signal_processes(&[pid], crate::platform::Signal::Kill);
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::process_cwd(pid).is_some()
+            && std::time::Instant::now() < exit_deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(crate::platform::process_cwd(pid).is_none());
+        let after = capture_from_state_with_runtimes(&state, &runtimes);
+        assert_eq!(
+            after.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .cwd,
+            new,
+            "an exited OMP pane must keep its last observed foreground cwd"
+        );
+        for (_, runtime) in runtimes.drain() {
+            runtime.shutdown();
+        }
+        std::fs::remove_dir(new).unwrap();
+    }
+
     #[test]
     fn capture_contract_tracks_workspace_identity_and_pane_cwds() {
         let mut state = state_with_workspaces(&["one"]);
@@ -1261,6 +1376,8 @@ mod tests {
             source: "herdr:pi".into(),
             agent: "pi".into(),
             session_ref: crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+            launch_profile: None,
+            owner_process: None,
         });
         terminal.set_hook_authority_with_session_ref(
             "herdr:pi".into(),
@@ -1285,6 +1402,66 @@ mod tests {
         );
         assert_eq!(agent_session.value, session_path);
     }
+    #[test]
+    fn capture_carries_recovery_only_for_matching_hook_session() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        let session_path = test_session_path("omp-session.jsonl");
+        let owner = crate::platform::OwnerProcessIncarnation {
+            pid: 42,
+            boot_id: "boot-a".into(),
+            start_time_ticks: 99,
+        };
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Omp),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(session_path.clone()).unwrap(),
+            launch_profile: Some("restricted".into()),
+            owner_process: Some(owner.clone()),
+        });
+        terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            crate::detect::AgentState::Working,
+            None,
+            crate::agent_resume::AgentSessionRef::path(session_path).clone(),
+            Some(20),
+        );
+
+        let snapshot = capture_from_state(&state);
+        let saved = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .unwrap();
+        assert_eq!(saved.launch_profile.as_deref(), Some("restricted"));
+        assert_eq!(saved.owner_process.as_ref(), Some(&owner));
+
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .hook_authority
+            .as_mut()
+            .unwrap()
+            .session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("other.jsonl"));
+        let snapshot = capture_from_state(&state);
+        let saved = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .unwrap();
+        assert!(saved.launch_profile.is_none());
+        assert!(saved.owner_process.is_none());
+    }
 
     #[test]
     fn capture_contract_preserves_restored_agent_session() {
@@ -1302,6 +1479,8 @@ mod tests {
                 source: "herdr:opencode".into(),
                 agent: "opencode".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("opencode-session").unwrap(),
+                launch_profile: None,
+                owner_process: None,
             });
 
         let snapshot = capture_from_state(&state);

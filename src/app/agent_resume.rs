@@ -222,23 +222,81 @@ impl App {
         }
         changed
     }
+    fn refresh_omp_resume_executable(
+        plan: &mut crate::agent_resume::AgentResumePlan,
+        session: Option<&crate::agent_resume::PersistedAgentSession>,
+        launchers: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), &'static str> {
+        if plan.agent != "omp" {
+            return Ok(());
+        }
+        let session = session.ok_or("saved OMP recovery metadata is missing")?;
+        let current_plan =
+            crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+                .ok_or("saved OMP session cannot resume")?;
+        if current_plan.dedupe_key != plan.dedupe_key {
+            return Err("pending OMP resume no longer matches the saved session");
+        }
+        let executable = crate::agent_resume::omp_recovery_executable(session, launchers)?;
+        let command = plan
+            .argv
+            .first_mut()
+            .ok_or("saved OMP resume command is empty")?;
+        *command = executable;
+        Ok(())
+    }
 
     fn start_pending_agent_resume(
         &mut self,
         pane_id: crate::layout::PaneId,
         terminal_id: crate::terminal::TerminalId,
         cwd: std::path::PathBuf,
-        plan: crate::agent_resume::AgentResumePlan,
+        mut plan: crate::agent_resume::AgentResumePlan,
         rows: u16,
         cols: u16,
         allow_empty_theme: bool,
     ) -> bool {
+        let recovery_session = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_ref());
+        if let Err(reason) =
+            Self::refresh_omp_resume_executable(&mut plan, recovery_session, &self.omp_launchers)
+        {
+            tracing::warn!(pane = pane_id.raw(), terminal = %terminal_id, reason,
+                "automatic OMP recovery blocked before spawn");
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.pending_agent_resume_plan = None;
+                terminal.restore_error = Some(format!(
+                    "Automatic OMP recovery is blocked: {reason}. Recover this session manually."
+                ));
+                terminal.revision = terminal.revision.saturating_add(1);
+            }
+            return true;
+        }
         let host_terminal_theme = self.state.host_terminal_theme;
         if host_terminal_theme.is_empty() && !allow_empty_theme {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        #[cfg(not(windows))]
+        let resume_command = shell_command_from_argv(&plan.argv);
+        // Windows panes run PowerShell or cmd, where POSIX quoting breaks launcher paths and
+        // quoted arguments; launch exactly like `agent start` does.
+        #[cfg(windows)]
+        let resume_command = crate::platform::interactive_shell_command(
+            &plan.argv,
+            if crate::pane::uses_windows_powershell_pane_shell(crate::pane::PaneShellConfig::new(
+                &self.state.default_shell,
+                self.state.shell_mode,
+            )) {
+                "powershell"
+            } else {
+                "cmd"
+            },
+        );
+        let Some(resume_command) = resume_command else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -261,6 +319,27 @@ impl App {
                 terminal.revision = terminal.revision.saturating_add(1);
             }
             return true;
+        }
+
+        let mut cleared_omp_owner = None;
+        if plan.agent == "omp" {
+            match self.persist_owner_unknown_before_resume(&terminal_id) {
+                Ok(owner) => cleared_omp_owner = Some(owner),
+                Err(err) => {
+                    tracing::warn!(
+                        pane = pane_id.raw(),
+                        terminal = %terminal_id,
+                        err = %err,
+                        "automatic OMP recovery blocked because the recovery barrier could not be saved"
+                    );
+                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                        terminal.pending_agent_resume_plan = None;
+                        terminal.restore_error = Some(format!("Could not save the OMP recovery barrier: {err}. Recover this session manually."));
+                        terminal.revision = terminal.revision.saturating_add(1);
+                    }
+                    return true;
+                }
+            }
         }
 
         let runtime = match crate::terminal::TerminalRuntime::spawn(
@@ -286,6 +365,9 @@ impl App {
                     err = %err,
                     "failed to start shell for deferred agent resume"
                 );
+                if let Some(owner) = cleared_omp_owner {
+                    self.restore_omp_owner_after_failed_resume(&terminal_id, owner);
+                }
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.pending_agent_resume_plan = None;
                     terminal.restore_error = Some(format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."));
@@ -306,6 +388,10 @@ impl App {
                 "failed to send deferred agent resume command to shell"
             );
             runtime.shutdown();
+            // The retry re-runs the barrier; it needs the dead owner to pass revalidation.
+            if let Some(owner) = cleared_omp_owner {
+                self.restore_omp_owner_after_failed_resume(&terminal_id, owner);
+            }
             return false;
         }
 
@@ -353,6 +439,7 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     )
 }
 
+#[cfg(not(windows))]
 fn shell_command_from_argv(argv: &[String]) -> Option<String> {
     let mut parts = argv.iter();
     let first = shell_quote(parts.next()?);
@@ -364,6 +451,7 @@ fn shell_command_from_argv(argv: &[String]) -> Option<String> {
     Some(command)
 }
 
+#[cfg(not(windows))]
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -491,6 +579,43 @@ mod tests {
         ]
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_omp_resume_revalidates_mapping_and_session_identity() {
+        let first_ref = crate::agent_resume::AgentSessionRef::path("/tmp/first.jsonl").unwrap();
+        let mut plan = crate::agent_resume::plan("herdr:omp", "omp", &first_ref).unwrap();
+        let session = crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: first_ref,
+            launch_profile: Some("default".into()),
+            owner_process: Some(crate::platform::OwnerProcessIncarnation {
+                pid: u32::MAX,
+                boot_id: "old-boot".into(),
+                start_time_ticks: 1,
+            }),
+        };
+        let launchers =
+            std::collections::BTreeMap::from([("default".into(), "/opt/new-wrapper".into())]);
+        App::refresh_omp_resume_executable(&mut plan, Some(&session), &launchers).unwrap();
+        assert_eq!(plan.argv[0], "/opt/new-wrapper");
+
+        assert!(App::refresh_omp_resume_executable(
+            &mut plan,
+            Some(&session),
+            &std::collections::BTreeMap::new(),
+        )
+        .is_err());
+        let mut different = session.clone();
+        different.session_ref =
+            crate::agent_resume::AgentSessionRef::path("/tmp/second.jsonl").unwrap();
+        assert!(
+            App::refresh_omp_resume_executable(&mut plan, Some(&different), &launchers)
+                .unwrap_err()
+                .contains("no longer matches")
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_deferred_restore_keeps_session_reference_without_retrying_elsewhere() {
@@ -516,6 +641,8 @@ mod tests {
                 source: "herdr:codex".into(),
                 agent: "codex".into(),
                 session_ref: crate::agent_resume::AgentSessionRef::id("resume-test").unwrap(),
+                launch_profile: None,
+                owner_process: None,
             };
             terminal.persisted_agent_session = Some(session.clone());
             terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
@@ -612,6 +739,102 @@ mod tests {
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn omp_resume_restores_owner_when_no_omp_process_starts() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = std::env::temp_dir().join(format!(
+            "herdr-omp-owner-barrier-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let owner = crate::platform::OwnerProcessIncarnation {
+            pid: 42,
+            boot_id: "old-boot".into(),
+            start_time_ticks: 1,
+        };
+        // (persist_session, config home is a regular file, missing shell)
+        for (persist, unwritable, missing_shell) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let _ = std::fs::remove_dir_all(&config_home);
+            let _ = std::fs::remove_file(&config_home);
+            if unwritable {
+                std::fs::write(&config_home, b"not a directory").unwrap();
+            } else {
+                std::fs::create_dir_all(&config_home).unwrap();
+            }
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            let mut app = test_app();
+            app.policy.persist_session = persist;
+            if missing_shell {
+                app.state.default_shell = "__herdr_missing_resume_shell__".into();
+            }
+            let workspace = crate::workspace::Workspace::test_new("restored");
+            let pane_id = workspace.tabs[0].root_pane;
+            let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
+                foreground: Some(crate::terminal_theme::RgbColor {
+                    r: 220,
+                    g: 220,
+                    b: 220,
+                }),
+                background: Some(crate::terminal_theme::RgbColor {
+                    r: 20,
+                    g: 20,
+                    b: 20,
+                }),
+                ..Default::default()
+            };
+            app.omp_launchers
+                .insert("default".into(), "/bin/true".into());
+            let session_ref =
+                crate::agent_resume::AgentSessionRef::path("/tmp/omp-session.jsonl").unwrap();
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.pending_agent_resume_plan =
+                crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+            terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref,
+                launch_profile: Some("default".into()),
+                owner_process: Some(owner.clone()),
+            });
+
+            assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+            assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+            let terminal = &app.state.terminals[&terminal_id];
+            assert!(terminal.pending_agent_resume_plan.is_none());
+            let restore_error = terminal.restore_error.as_deref().unwrap();
+            assert_eq!(
+                restore_error.contains("recovery barrier"),
+                !missing_shell,
+                "{restore_error}"
+            );
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .owner_process
+                    .as_ref(),
+                Some(&owner)
+            );
+        }
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&config_home);
+        let _ = std::fs::remove_file(&config_home);
     }
 
     #[cfg(unix)]
@@ -953,6 +1176,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn shell_command_from_argv_quotes_resume_arguments() {
         let argv = vec![

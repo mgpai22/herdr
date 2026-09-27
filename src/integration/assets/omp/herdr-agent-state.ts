@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=10
+// HERDR_INTEGRATION_VERSION=11
 // @ts-nocheck
 
 import net from "node:net";
@@ -23,47 +23,58 @@ function enabled() {
   return HERDR_ENV === "1" && !!socketPath && !!paneId && !nestedOmpSession;
 }
 
-let requestQueue = Promise.resolve();
+let requestQueue: Promise<boolean> = Promise.resolve(true);
 
-function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
+function sendRequestAttempt(request: any, timeoutMs: number): Promise<boolean> {
   if (!enabled()) {
     return Promise.resolve(true);
   }
 
   return new Promise((resolve) => {
     let done = false;
+    let response = "";
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const finish = (delivered: boolean) => {
       if (done) return;
       done = true;
-      if (timeout) {
-        clearTimeout(timeout);
-      }
+      if (timeout) clearTimeout(timeout);
       socket.destroy();
       resolve(delivered);
     };
 
     const socket = net.createConnection(socketEndpoint!);
+    socket.setEncoding("utf8");
     socket.on("error", () => finish(false));
     socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on("data", () => finish(true));
+    socket.on("data", (chunk) => {
+      response += chunk;
+      const newline = response.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        const parsed = JSON.parse(response.slice(0, newline));
+        finish(parsed?.id === request.id && parsed?.result?.type === "ok");
+      } catch {
+        finish(false);
+      }
+    });
     socket.on("end", () => finish(false));
     timeout = setTimeout(() => finish(false), timeoutMs);
     timeout.unref?.();
   });
 }
 
-async function sendRequestNow(request: unknown): Promise<void> {
-  if (await sendRequestAttempt(request, 500)) {
-    return;
-  }
-  await sendRequestAttempt(request, 1500);
+async function sendRequestNow(buildRequest: () => unknown): Promise<boolean> {
+  if (await sendRequestAttempt(buildRequest(), 500)) return true;
+  // A retry of the same wire object turns a lost-then-applied first attempt
+  // into a stale duplicate, so each attempt builds a fresh request with a new
+  // id and seq.
+  return sendRequestAttempt(buildRequest(), 1500);
 }
 
-function sendRequest(request: unknown): Promise<void> {
+function sendRequest(buildRequest: () => unknown): Promise<boolean> {
   requestQueue = requestQueue.then(
-    () => sendRequestNow(request),
-    () => sendRequestNow(request),
+    () => sendRequestNow(buildRequest),
+    () => sendRequestNow(buildRequest),
   );
   return requestQueue;
 }
@@ -73,16 +84,22 @@ type AgentState = "working" | "blocked" | "idle";
 type QueuedState = {
   state: AgentState;
   message?: string;
-  seq: number;
 };
 
 const idleDebounceMs = parseDurationEnv("HERDR_OMP_IDLE_DEBOUNCE_MS", 250);
 const retryGraceMs = parseDurationEnv("HERDR_OMP_RETRY_GRACE_MS", 2500);
+// An unacknowledged session report (e.g. the server was too loaded to read it) is re-sent
+// with doubling delays, so a resumed session registers without waiting for the next prompt.
+const sessionRetryBaseMs = parseDurationEnv("HERDR_OMP_SESSION_RETRY_MS", 1000);
+const sessionRetryLimit = 8;
+let sessionRetryTimer: ReturnType<typeof setTimeout> | undefined;
 const retryableErrorPattern =
   /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
 let reportSeq = Date.now() * 1000;
 let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
+let registeredSessionKey: string | undefined;
+const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() || "default";
 
 function nextReportSeq(): number {
   reportSeq += 1;
@@ -97,6 +114,7 @@ export function isAbsoluteSessionPath(file: unknown): file is string {
 }
 
 function updateSessionRef(ctx: any): void {
+  const previousKey = currentSessionKey();
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
     currentAgentSessionPath = isAbsoluteSessionPath(file) ? file : undefined;
@@ -110,15 +128,19 @@ function updateSessionRef(ctx: any): void {
   } catch {
     currentAgentSessionId = undefined;
   }
+  if (currentSessionKey() !== previousKey) registeredSessionKey = undefined;
 }
 
-function withSessionRef(params: Record<string, unknown>): Record<string, unknown> {
-  if (currentAgentSessionPath) {
-    return { ...params, agent_session_path: currentAgentSessionPath };
-  }
-  if (currentAgentSessionId) {
-    return { ...params, agent_session_id: currentAgentSessionId };
-  }
+function currentSessionKey(): string | undefined {
+  if (currentAgentSessionPath) return `path\0${currentAgentSessionPath}`;
+  if (currentAgentSessionId) return `id\0${currentAgentSessionId}`;
+  return undefined;
+}
+
+function withRegisteredSessionRef(params: Record<string, unknown>): Record<string, unknown> {
+  if (registeredSessionKey !== currentSessionKey()) return params;
+  if (currentAgentSessionPath) return { ...params, agent_session_path: currentAgentSessionPath };
+  if (currentAgentSessionId) return { ...params, agent_session_id: currentAgentSessionId };
   return params;
 }
 
@@ -144,38 +166,61 @@ function currentSessionRef(): Record<string, unknown> | undefined {
   return undefined;
 }
 
-function reportSession(sessionStartSource = "startup"): Promise<void> {
+async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
   const sessionRef = currentSessionRef();
-  if (!sessionRef) {
-    return Promise.resolve();
-  }
+  const sessionKey = currentSessionKey();
+  registeredSessionKey = undefined;
+  clearTimeout(sessionRetryTimer);
+  sessionRetryTimer = undefined;
+  if (!sessionRef || !sessionKey) return;
 
-  return sendRequest({
+  // Each retry attempt mints a fresh id and sequence number. If the server
+  // applied the first attempt but its reply was lost, an identical retry
+  // would be rejected as stale and leave the session unregistered with no
+  // later session event to recover it. A fresh retry replays the same
+  // profile, PID, and session through every server check and converges.
+  const delivered = await sendRequest(() => ({
     id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-    method: "pane.report_agent_session",
+    method: "pane.report_agent_session_v2",
     params: {
       pane_id: paneId,
       source,
       agent: "omp",
       seq: nextReportSeq(),
       session_start_source: sessionStartSource,
+      launch_profile: launchProfile,
+      agent_pid: process.pid,
       ...sessionRef,
     },
-  });
+  }));
+  if (delivered && currentSessionKey() === sessionKey) {
+    registeredSessionKey = sessionKey;
+  } else if (!delivered && currentSessionKey() === sessionKey && attempt < sessionRetryLimit) {
+    sessionRetryTimer = setTimeout(() => {
+      sessionRetryTimer = undefined;
+      if (currentSessionKey() === sessionKey && registeredSessionKey !== sessionKey) {
+        void reportSession(sessionStartSource, attempt + 1);
+      }
+    }, Math.min(sessionRetryBaseMs * 2 ** attempt, 30_000));
+    sessionRetryTimer.unref?.();
+  }
 }
 
-function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
-  return sendRequest({
-    id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-    method: "pane.report_agent",
-    params: withSessionRef({
-      pane_id: paneId,
-      source,
-      agent: "omp",
-      state,
-      message,
-      seq,
-    }),
+async function sendState(state: AgentState, message?: string): Promise<void> {
+  await requestQueue;
+  // The server keeps one seq watermark per source across report methods, so
+  // the seq is minted when the queue sends the request, never when it is
+  // queued. Every attempt, retries included, gets a seq above anything sent
+  // before it. The session ref is fixed at the first attempt: a retry must
+  // not drop a ref that was registered when this report was first sent.
+  let params: Record<string, unknown> | undefined;
+  await sendRequest(() => {
+    params ??= withRegisteredSessionRef({ pane_id: paneId, source, agent: "omp", state, message });
+    return {
+      id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.report_agent",
+      params: { ...params, seq: nextReportSeq() },
+    };
   });
 }
 
@@ -183,7 +228,7 @@ let sendInFlight = false;
 let queuedState: QueuedState | undefined;
 
 function queueState(state: AgentState, message?: string): void {
-  queuedState = { state, message, seq: nextReportSeq() };
+  queuedState = { state, message };
   if (!sendInFlight) {
     void drainStateQueue();
   }
@@ -199,7 +244,7 @@ async function drainStateQueue(): Promise<void> {
     while (queuedState) {
       const next = queuedState;
       queuedState = undefined;
-      await sendState(next.state, next.message, next.seq);
+      await sendState(next.state, next.message);
     }
   } finally {
     sendInFlight = false;
@@ -390,6 +435,9 @@ export default function (pi) {
   });
 
   pi.on("agent_start", (_event, ctx) => {
+    if (ctx?.hasUI !== true) {
+      return;
+    }
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }

@@ -58,6 +58,162 @@ impl RemoteBridgeWake {
     }
 }
 
+/// Liveness is the same PID with the same creation `FILETIME` in the same boot.
+/// An unknown PID, or one whose process has exited but is still held open by another
+/// handle, is `Ok(None)`, matching Linux's absent `/proc/<pid>`.
+pub fn observe_process(pid: u32) -> std::io::Result<Option<super::OwnerProcessIncarnation>> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, PROCESS_SYNCHRONIZE};
+
+    if pid == 0 {
+        return Ok(None);
+    }
+    // Read the boot identity first: a missing process only proves absence once the boot is known.
+    let boot_id = windows_boot_id()?;
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    let start_time_ticks = if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            // OpenProcess reports a PID with no process object as ERROR_INVALID_PARAMETER.
+            Some(code) if code == ERROR_INVALID_PARAMETER as i32 => return Ok(None),
+            // Another user's or a protected process. Linux reads any /proc/<pid>/stat, so read
+            // the creation time from the system process list, which needs no process access.
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
+                match listed_process_creation_time(pid)? {
+                    Some(start_time_ticks) => start_time_ticks,
+                    None => return Ok(None),
+                }
+            }
+            _ => return Err(error),
+        }
+    } else {
+        let process = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+        match unsafe { WaitForSingleObject(process.as_raw_handle().cast(), 0) } {
+            WAIT_TIMEOUT => {}
+            WAIT_OBJECT_0 => return Ok(None),
+            _ => return Err(std::io::Error::last_os_error()),
+        }
+        process_creation_time(process.as_raw_handle().cast())
+            .ok_or_else(std::io::Error::last_os_error)?
+    };
+    if start_time_ticks == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process creation time is zero",
+        ));
+    }
+    Ok(Some(super::OwnerProcessIncarnation {
+        pid,
+        boot_id,
+        start_time_ticks,
+    }))
+}
+
+// `SYSTEM_PROCESS_INFORMATION` offsets. windows-sys hides `CreateTime` in a reserved field.
+const SPI_NUMBER_OF_THREADS: usize = 0x04;
+const SPI_CREATE_TIME: usize = 0x20;
+#[cfg(target_pointer_width = "64")]
+const SPI_UNIQUE_PROCESS_ID: usize = 0x50;
+#[cfg(target_pointer_width = "32")]
+const SPI_UNIQUE_PROCESS_ID: usize = 0x44;
+
+/// Creation `FILETIME` of `pid` from `NtQuerySystemInformation(SystemProcessInformation)`.
+fn listed_process_creation_time(pid: u32) -> std::io::Result<Option<u64>> {
+    use windows_sys::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemProcessInformation,
+    };
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_INFO_LENGTH_MISMATCH};
+
+    // u64 elements keep the buffer 8-byte aligned for the kernel's entry layout.
+    let mut buffer = vec![0_u64; 64 * 1024];
+    loop {
+        let mut needed = 0_u32;
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SystemProcessInformation,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len() * size_of::<u64>()).unwrap_or(u32::MAX),
+                &mut needed,
+            )
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            // Processes can start before the next call, so leave 64 KiB of headroom.
+            buffer.resize(needed as usize / size_of::<u64>() + 8 * 1024, 0);
+            continue;
+        }
+        if status < 0 {
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(std::io::Error::from_raw_os_error(code as i32));
+        }
+        let list = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr().cast::<u8>(),
+                buffer.len() * size_of::<u64>(),
+            )
+        };
+        return Ok(listed_creation_time(list, pid));
+    }
+}
+
+/// A listed process with no threads has exited and is only held open, so it is not live.
+fn listed_creation_time(list: &[u8], pid: u32) -> Option<u64> {
+    fn field<const N: usize>(entry: &[u8], offset: usize) -> Option<[u8; N]> {
+        entry.get(offset..offset + N)?.try_into().ok()
+    }
+    let mut offset = 0_usize;
+    loop {
+        let entry = list.get(offset..)?;
+        let unique_process_id = usize::from_ne_bytes(field(entry, SPI_UNIQUE_PROCESS_ID)?);
+        if unique_process_id == pid as usize {
+            let threads = u32::from_ne_bytes(field(entry, SPI_NUMBER_OF_THREADS)?);
+            let created = u64::from_ne_bytes(field(entry, SPI_CREATE_TIME)?);
+            return (threads != 0).then_some(created);
+        }
+        match u32::from_ne_bytes(field(entry, 0)?) {
+            0 => return None,
+            next => offset += next as usize,
+        }
+    }
+}
+
+/// The kernel's per-boot counter. It is fixed for a boot, unlike `BootTime`, which the
+/// kernel shifts whenever the system clock is set.
+fn windows_boot_id() -> std::io::Result<String> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD,
+    };
+
+    let key = wide_null(
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters",
+    );
+    let value = wide_null("BootId");
+    let mut boot_id = 0_u32;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&mut boot_id as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(boot_id.to_string())
+}
+
 pub(crate) fn wait_client_stream_readable(
     _stream: &crate::ipc::LocalStream,
 ) -> std::io::Result<()> {
@@ -1385,6 +1541,46 @@ pub fn current_process_is_detached_server_daemon() -> bool {
 
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     select_pane_foreground_job_cached(child_pid)
+}
+
+/// Windows has no foreground process group, so `foreground_job` names one selected process.
+/// Its descendants stand in for the rest of the group; that covers launcher shims such as
+/// bun's `omp.exe`, which keeps the reporting `bun.exe` runtime as its child.
+pub(crate) fn foreground_job_includes_process(child_pid: u32, pid: u32) -> bool {
+    let Some(job) = select_pane_foreground_job_cached(child_pid) else {
+        return false;
+    };
+    job.process_group_id == pid
+        || process_descends_from(job.process_group_id, pid, &fresh_foreground_processes())
+}
+
+/// Toolhelp parent PIDs are not held open, so a parent may have exited and its PID been reused.
+/// Each hop therefore also requires the parent to predate its child; a recycled PID never does.
+fn process_descends_from(ancestor_pid: u32, pid: u32, snapshot: &ProcessSnapshot) -> bool {
+    let Some(mut current) = snapshot.entry(pid) else {
+        return false;
+    };
+    let mut visited = HashSet::from([pid]);
+    loop {
+        let parent_pid = current.parent_pid;
+        if parent_pid == 0 || !visited.insert(parent_pid) {
+            return false;
+        }
+        let Some(parent) = snapshot.entry(parent_pid) else {
+            return false;
+        };
+        match (
+            parent.command().creation_time,
+            current.command().creation_time,
+        ) {
+            (Some(parent_created), Some(created)) if parent_created <= created => {}
+            _ => return false,
+        }
+        if parent_pid == ancestor_pid {
+            return true;
+        }
+        current = parent;
+    }
 }
 
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
@@ -4381,6 +4577,208 @@ mod tests {
             name: name.to_string(),
             command,
         }
+    }
+
+    fn spawn_idle_child() -> std::process::Child {
+        std::process::Command::new("ping.exe")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn observe_process_tracks_one_incarnation_per_process() {
+        let current = super::observe_process(std::process::id()).unwrap().unwrap();
+        assert_eq!(current.pid, std::process::id());
+        assert_ne!(current.start_time_ticks, 0);
+        assert!(!current.boot_id.is_empty());
+
+        let mut first = spawn_idle_child();
+        let observed = super::observe_process(first.id()).unwrap().unwrap();
+        assert_eq!(observed.pid, first.id());
+        assert_eq!(observed.boot_id, current.boot_id);
+        assert_eq!(
+            super::observe_process(first.id()).unwrap(),
+            Some(observed.clone())
+        );
+
+        first.kill().unwrap();
+        first.wait().unwrap();
+        // The Child handle keeps the exited process object and its PID alive.
+        assert_eq!(super::observe_process(first.id()).unwrap(), None);
+        drop(first);
+
+        let mut second = spawn_idle_child();
+        let replacement = super::observe_process(second.id()).unwrap().unwrap();
+        assert_ne!(replacement, observed);
+        assert_eq!(replacement.boot_id, observed.boot_id);
+        assert_ne!(
+            super::observe_process(observed.pid).unwrap(),
+            Some(observed)
+        );
+        second.kill().unwrap();
+        second.wait().unwrap();
+    }
+
+    #[test]
+    fn observe_process_reports_unknown_pids_as_absent() {
+        assert_eq!(super::observe_process(0).unwrap(), None);
+        // Windows PIDs are multiples of four, so these never name a process.
+        assert_eq!(super::observe_process(u32::MAX).unwrap(), None);
+        assert_eq!(super::observe_process(u32::MAX - 4).unwrap(), None);
+    }
+
+    #[test]
+    fn listed_creation_time_walks_system_process_entries() {
+        fn entry(next: u32, pid: usize, threads: u32, created: u64) -> Vec<u8> {
+            let mut entry = vec![0_u8; 0x100];
+            entry[..4].copy_from_slice(&next.to_ne_bytes());
+            entry[super::SPI_NUMBER_OF_THREADS..][..4].copy_from_slice(&threads.to_ne_bytes());
+            entry[super::SPI_CREATE_TIME..][..8].copy_from_slice(&created.to_ne_bytes());
+            entry[super::SPI_UNIQUE_PROCESS_ID..][..super::size_of::<usize>()]
+                .copy_from_slice(&pid.to_ne_bytes());
+            entry
+        }
+        let mut list = entry(0x100, 8, 3, 111);
+        list.extend(entry(0x100, 12, 0, 222));
+        list.extend(entry(0, 16, 1, 333));
+
+        assert_eq!(super::listed_creation_time(&list, 8), Some(111));
+        assert_eq!(super::listed_creation_time(&list, 16), Some(333));
+        // Exited but still held open: listed without threads.
+        assert_eq!(super::listed_creation_time(&list, 12), None);
+        assert_eq!(super::listed_creation_time(&list, 20), None);
+        assert_eq!(super::listed_creation_time(&list[..0x180], 16), None);
+        assert_eq!(super::listed_creation_time(&[], 8), None);
+    }
+
+    #[test]
+    fn listed_creation_time_matches_get_process_times() {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let expected = super::process_creation_time(unsafe { GetCurrentProcess() }).unwrap();
+        assert_eq!(
+            super::listed_process_creation_time(std::process::id()).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn observe_process_reads_processes_it_cannot_open_from_the_system_list() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, ImpersonateLoggedOnUser, InitializeAcl,
+            InitializeSecurityDescriptor, RevertToSelf, SetKernelObjectSecurity,
+            SetSecurityDescriptorDacl, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+            DISABLE_MAX_PRIVILEGE, SECURITY_DESCRIPTOR, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+            TOKEN_IMPERSONATE, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+        let mut child = spawn_idle_child();
+        let process = child.as_raw_handle().cast();
+        let created = super::process_creation_time(process).unwrap();
+        // An empty DACL denies every open; the Child handle keeps the access it was granted.
+        let mut acl = ACL::default();
+        let mut descriptor = super::MaybeUninit::<SECURITY_DESCRIPTOR>::zeroed();
+        let descriptor = descriptor.as_mut_ptr().cast();
+        // An elevated shell (for example over ssh) has SeDebugPrivilege enabled, which bypasses
+        // the DACL, so the checks run on this thread under a copy of its token without privileges.
+        let mut token = std::ptr::null_mut();
+        let mut restricted = std::ptr::null_mut();
+        unsafe {
+            assert_ne!(
+                InitializeAcl(&mut acl, super::size_of::<ACL>() as u32, ACL_REVISION),
+                0
+            );
+            assert_ne!(
+                InitializeSecurityDescriptor(descriptor, SECURITY_DESCRIPTOR_REVISION),
+                0
+            );
+            assert_ne!(SetSecurityDescriptorDacl(descriptor, 1, &acl, 0), 0);
+            assert_ne!(
+                SetKernelObjectSecurity(process, DACL_SECURITY_INFORMATION, descriptor),
+                0
+            );
+            let access = TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), access, &mut token), 0);
+            let token = super::OwnedHandle::from_raw_handle(token);
+            assert_ne!(
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut restricted,
+                ),
+                0
+            );
+        }
+        let restricted = unsafe { super::OwnedHandle::from_raw_handle(restricted) };
+        let current = super::observe_process(std::process::id()).unwrap().unwrap();
+
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let denied =
+            unsafe { super::OpenProcess(super::PROCESS_QUERY_LIMITED_INFORMATION, 0, child.id()) };
+        let open_error = std::io::Error::last_os_error().raw_os_error();
+        let live = super::observe_process(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let exited = super::observe_process(child.id());
+        assert_ne!(unsafe { RevertToSelf() }, 0);
+
+        assert!(denied.is_null());
+        assert_eq!(open_error, Some(ERROR_ACCESS_DENIED as i32));
+        assert_eq!(
+            live.unwrap(),
+            Some(crate::platform::OwnerProcessIncarnation {
+                pid: child.id(),
+                boot_id: current.boot_id,
+                start_time_ticks: created,
+            })
+        );
+        assert_eq!(exited.unwrap(), None);
+    }
+
+    #[test]
+    fn foreground_membership_includes_launcher_shim_descendants_only() {
+        let entries = vec![
+            test_entry_with_creation_time(10, 1, "pwsh.exe", &["pwsh.exe"], Some(100)),
+            test_entry_with_creation_time(20, 10, "omp.exe", &["omp.exe"], Some(200)),
+            test_entry_with_creation_time(
+                30,
+                20,
+                "bun.exe",
+                &[
+                    "bun.exe",
+                    r"C:\Users\u\.bun\install\global\node_modules\omp\cli.js",
+                ],
+                Some(300),
+            ),
+            // Its recorded parent PID was reused by the shim, which started later.
+            test_entry_with_creation_time(40, 20, "node.exe", &["node.exe"], Some(150)),
+            test_entry_with_creation_time(50, 60, "bun.exe", &["bun.exe"], Some(400)),
+        ];
+        let job = super::select_pane_foreground_job(10, &entries).unwrap();
+        assert_eq!(job.process_group_id, 20);
+        let snapshot = super::ProcessSnapshot::new(entries);
+
+        assert!(super::process_descends_from(20, 30, &snapshot));
+        assert!(super::process_descends_from(10, 30, &snapshot));
+        assert!(!super::process_descends_from(20, 40, &snapshot));
+        assert!(!super::process_descends_from(20, 50, &snapshot));
+        assert!(!super::process_descends_from(20, 10, &snapshot));
+        assert!(!super::process_descends_from(20, 99, &snapshot));
     }
 
     #[test]

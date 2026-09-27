@@ -578,6 +578,10 @@ impl TerminalRuntime {
         self.0.foreground_cwd()
     }
 
+    pub fn foreground_cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
+        self.0.foreground_cwd_for_persistence()
+    }
+
     pub fn child_pid(&self) -> Option<u32> {
         self.0.child_pid()
     }

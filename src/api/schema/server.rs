@@ -36,4 +36,7 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Supports `agent.start` `profile` (OMP launch profiles).
+    #[serde(default)]
+    pub agent_start_profile: bool,
 }

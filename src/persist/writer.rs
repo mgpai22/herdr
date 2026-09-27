@@ -58,6 +58,26 @@ impl SessionWriter {
         crate::logging::session_saved(&self.path, snapshot.workspaces.len());
     }
 
+    /// Durable save that must reach disk before an OMP recovery spawn.
+    pub(crate) fn save_barrier(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        history: Option<&SessionHistorySnapshot>,
+    ) -> io::Result<()> {
+        self.preserve_unloaded()?;
+        self.preserve_snapshot_history();
+        super::io::save_strict_to_path(&self.path, snapshot)?;
+        self.protect_unloaded = false;
+        self.preserve_snapshot_history();
+        // History only feeds screen replay; its fingerprint must follow the barrier snapshot.
+        let history_path = self.path.with_file_name("session-history.json");
+        if let Err(err) = super::io::save_history_to_path(&history_path, history) {
+            crate::logging::session_save_failed(&history_path, &err.to_string());
+        }
+        crate::logging::session_saved(&self.path, snapshot.workspaces.len());
+        Ok(())
+    }
+
     pub(crate) fn clear(&mut self) {
         let result = self.preserve_unloaded().and_then(|()| {
             self.preserve_snapshot_history();
@@ -633,6 +653,28 @@ mod tests {
         writer.save(&snapshot(), None);
         writer.clear();
         assert_eq!(backups(&writer), vec![vec![2], vec![3], vec![4]]);
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn barrier_save_backs_up_unloaded_session_and_refreshes_history() {
+        let mut writer = writer(true);
+        std::fs::write(&writer.path, b"unloaded").unwrap();
+        let barrier = snapshot();
+        let history = SessionHistorySnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            layout_fingerprint: super::super::snapshot::layout_fingerprint(&barrier),
+            workspaces: Vec::new(),
+        };
+        writer.save_barrier(&barrier, Some(&history)).unwrap();
+        assert_eq!(backups(&writer), vec![b"unloaded".to_vec()]);
+        assert!(!writer.protect_unloaded);
+        let saved: SessionHistorySnapshot = serde_json::from_slice(
+            &std::fs::read(writer.path.with_file_name("session-history.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(saved.layout_fingerprint.is_some());
+        assert_eq!(saved.layout_fingerprint, history.layout_fingerprint);
         std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
     }
 

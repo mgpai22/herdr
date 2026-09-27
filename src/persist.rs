@@ -11,7 +11,7 @@ mod snapshot;
 mod writer;
 
 pub use self::io::{clear_history, load, load_history};
-pub use self::restore::restore;
+pub use self::restore::restore_with_omp_launchers;
 #[cfg(unix)]
 pub use self::restore::{handoff_pane_aliases, restore_handoff};
 pub use self::snapshot::{
