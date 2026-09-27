@@ -303,11 +303,13 @@ impl App {
                 // The profile prefix depends on the shell that will read the command.
                 #[cfg(not(windows))]
                 let shell_name = crate::pane::pane_shell(&self.state.default_shell);
+                #[cfg(not(windows))]
+                let shell_name = shell_name.as_str();
                 let Some(command) = crate::platform::interactive_shell_command_with_env(
                     &plan.argv,
                     crate::agent_resume::OMP_PROFILE_ENV,
                     profile,
-                    &shell_name,
+                    shell_name,
                 ) else {
                     let reason = format!(
                         "the launcher for profile {profile:?} cannot be typed with its profile into this pane shell; use a launcher path without \"=\""
@@ -828,7 +830,8 @@ mod tests {
             runtime.shutdown();
         }
     }
-    #[cfg(unix)]
+    // Owner observation exists only on Linux (and Windows); other platforms block before the barrier.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn omp_resume_restores_owner_when_no_omp_process_starts() {
         let _guard = crate::config::test_config_env_lock().lock().unwrap();
