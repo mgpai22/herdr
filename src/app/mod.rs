@@ -3001,7 +3001,14 @@ mod tests {
             "/opt/omp neurable"
         );
         let sent = String::from_utf8(sent.unwrap().to_vec()).unwrap();
-        assert!(sent.starts_with("'/opt/omp neurable'"), "{sent:?}");
+        // Windows panes get a PowerShell wrapper (cmd panes an encoded one); platform tests cover it.
+        #[cfg(not(windows))]
+        assert!(
+            sent.starts_with("OMP_PROFILE=neurable '/opt/omp neurable'"),
+            "{sent:?}"
+        );
+        #[cfg(windows)]
+        assert!(!sent.is_empty());
 
         // Bare omp claims no profile until the OMP hook reports one, even over a saved session.
         for saved_session in [false, true] {

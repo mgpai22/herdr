@@ -22,8 +22,9 @@ use super::config_edit::{
 use super::config_file::{check_config_targets, write_config};
 use super::env::{
     antigravity_cli_dir, claude_dir, codex_dir, copilot_dir, cursor_dir, devin_dir, droid_dir,
-    grok_dir, hermes_dir, hermes_plugin_dir, kilo_dir, kimi_dir, letta_dir, mastracode_dir,
-    omp_extension_dir, opencode_dir, opencode_state_dir, pi_extension_dir, qodercli_dir, qwen_dir,
+    grok_dir, hermes_dir, hermes_plugin_dir, is_omp_profile_agent_dir, kilo_dir, kimi_dir,
+    letta_dir, mastracode_dir, omp_extension_dirs, opencode_dir, opencode_state_dir,
+    pi_extension_dir, qodercli_dir, qwen_dir,
 };
 use super::file_ops::{
     make_executable, remove_dir_all_if_exists, remove_file_if_exists, remove_legacy_bash_hook_file,
@@ -86,24 +87,58 @@ pub(crate) fn install_pi() -> io::Result<PathBuf> {
     Ok(path)
 }
 
-pub(crate) fn install_omp() -> io::Result<OmpInstallPaths> {
-    let dir = omp_extension_dir()?;
+pub(crate) fn install_omp() -> io::Result<Vec<OmpInstallPaths>> {
+    let dirs = omp_extension_dirs()?;
     let pi_dir = pi_extension_dir()?;
-    if dir == pi_dir {
+    // A named OMP profile exports its own agent dir as PI_CODING_AGENT_DIR; that is not a Pi dir.
+    if dirs.contains(&pi_dir) && !pi_dir.parent().is_some_and(is_omp_profile_agent_dir) {
         return Err(io::Error::other(format!(
             "Pi and OMP resolve to the same extension directory at {}; configure separate agent directories before installing OMP",
-            dir.display()
+            pi_dir.display()
         )));
     }
-    ensure_extension_dir(&dir, "omp")?;
 
-    let removed_legacy_pi_extension = remove_legacy_pi_extension_from_omp_dir(&dir)?;
-    let extension_path = dir.join(OMP_EXTENSION_INSTALL_NAME);
-    fs::write(&extension_path, OMP_EXTENSION_ASSET)?;
-    Ok(OmpInstallPaths {
-        extension_path,
-        removed_legacy_pi_extension,
+    for_each_omp_extension_dir(dirs, |dir| {
+        ensure_extension_dir(dir, "omp")?;
+        let removed_legacy_pi_extension = remove_legacy_pi_extension_from_omp_dir(dir)?;
+        let extension_path = dir.join(OMP_EXTENSION_INSTALL_NAME);
+        fs::write(&extension_path, OMP_EXTENSION_ASSET)?;
+        Ok(OmpInstallPaths {
+            extension_path,
+            removed_legacy_pi_extension,
+        })
     })
+}
+
+/// Runs `action` in every OMP profile extension dir. A failing dir does not stop the others;
+/// the error then lists the result for every dir.
+fn for_each_omp_extension_dir<T>(
+    dirs: Vec<PathBuf>,
+    action: impl Fn(&Path) -> io::Result<T>,
+) -> io::Result<Vec<T>> {
+    let mut done = Vec::new();
+    let mut results = Vec::new();
+    let mut failed = 0;
+    for dir in &dirs {
+        match action(dir) {
+            Ok(value) => {
+                done.push(value);
+                results.push(format!("{}: ok", dir.display()));
+            }
+            Err(err) => {
+                failed += 1;
+                results.push(format!("{}: {err}", dir.display()));
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(io::Error::other(format!(
+            "omp integration failed in {failed} of {} profile extension directories: {}",
+            dirs.len(),
+            results.join("; ")
+        )));
+    }
+    Ok(done)
 }
 
 pub(crate) fn remove_legacy_pi_extension_from_omp_dir(dir: &Path) -> io::Result<bool> {
@@ -561,13 +596,14 @@ pub(crate) fn uninstall_pi() -> io::Result<PiUninstallResult> {
     })
 }
 
-pub(crate) fn uninstall_omp() -> io::Result<OmpUninstallResult> {
-    let extension_path = omp_extension_dir()?.join(OMP_EXTENSION_INSTALL_NAME);
-    let removed_extension = remove_file_if_exists(&extension_path)?;
-
-    Ok(OmpUninstallResult {
-        extension_path,
-        removed_extension,
+pub(crate) fn uninstall_omp() -> io::Result<Vec<OmpUninstallResult>> {
+    for_each_omp_extension_dir(omp_extension_dirs()?, |dir| {
+        let extension_path = dir.join(OMP_EXTENSION_INSTALL_NAME);
+        let removed_extension = remove_file_if_exists(&extension_path)?;
+        Ok(OmpUninstallResult {
+            extension_path,
+            removed_extension,
+        })
     })
 }
 

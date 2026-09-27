@@ -42,6 +42,7 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
             status.state,
             status.installed_version,
             status.expected_version,
+            status.path.is_file(),
         );
         println!("{target}: {state} ({})", status.path.display());
     }
@@ -51,6 +52,7 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
             status.state,
             status.installed_version,
             status.expected_version,
+            status.path.is_file(),
         );
         println!(
             "{} (experimental): {state} ({})",
@@ -66,6 +68,7 @@ fn describe_integration_state(
     state: crate::integration::IntegrationStatusKind,
     installed_version: Option<u32>,
     expected_version: u32,
+    installed: bool,
 ) -> String {
     let version = match installed_version {
         Some(version) => format!("v{version}"),
@@ -74,6 +77,10 @@ fn describe_integration_state(
     match state {
         crate::integration::IntegrationStatusKind::NotInstalled => "not installed".to_string(),
         crate::integration::IntegrationStatusKind::Current => format!("current ({version})"),
+        // An OMP profile without the file counts as outdated once another profile has it.
+        crate::integration::IntegrationStatusKind::Outdated if !installed => {
+            "outdated (missing)".to_string()
+        }
         crate::integration::IntegrationStatusKind::Outdated
             if installed_version.is_some_and(|installed| installed >= expected_version) =>
         {

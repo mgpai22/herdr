@@ -1741,6 +1741,10 @@ impl TerminalState {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
             }
         }
+        if recovery.is_some() {
+            // A verified OMP registration settles any recovery problem shown for this pane.
+            self.restore_error = None;
+        }
         let retained_recovery = self
             .persisted_agent_session
             .as_ref()
@@ -3263,6 +3267,56 @@ mod tests {
             .is_some());
         assert_eq!(terminal.state, AgentState::Working);
         assert_eq!(terminal.persisted_agent_session.as_ref(), Some(&restored));
+    }
+
+    #[test]
+    fn only_a_verified_omp_registration_clears_the_recovery_notice() {
+        let mut terminal = test_terminal();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("omp-blocked.jsonl"))
+                .unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: session_ref.clone(),
+            launch_profile: Some("default".into()),
+            owner_process: None,
+        });
+        terminal.restore_error = Some("Automatic OMP recovery is blocked".into());
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+
+        assert!(terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(session_ref.clone()),
+                Some(5),
+                Some("resume".into()),
+            )
+            .is_some());
+        assert!(
+            terminal.restore_error.is_some(),
+            "an unverified report does not settle recovery"
+        );
+
+        assert!(terminal
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(session_ref),
+                Some(6),
+                Some("resume".into()),
+                Some((
+                    "default".into(),
+                    crate::platform::OwnerProcessIncarnation {
+                        pid: 42,
+                        boot_id: "boot-a".into(),
+                        start_time_ticks: 99,
+                    },
+                )),
+            )
+            .is_some());
+        assert_eq!(terminal.restore_error, None);
     }
 
     #[test]

@@ -616,7 +616,7 @@ fn install_omp_writes_embedded_asset_to_omp_extensions_dir() {
     fs::create_dir_all(&ext_dir).unwrap();
     std::env::set_var("HOME", &home);
 
-    let installed = install_omp().unwrap();
+    let installed = only(install_omp().unwrap());
     let content = fs::read_to_string(&installed.extension_path).unwrap();
 
     assert_eq!(
@@ -641,7 +641,7 @@ fn install_omp_removes_legacy_pi_integration_from_omp_extensions_dir() {
     fs::write(&legacy_path, PI_EXTENSION_ASSET).unwrap();
     std::env::set_var("HOME", &home);
 
-    let installed = install_omp().unwrap();
+    let installed = only(install_omp().unwrap());
 
     assert_eq!(
         installed.extension_path,
@@ -665,7 +665,7 @@ fn install_omp_preserves_non_herdr_file_with_pi_install_name() {
     fs::write(&user_path, "// user extension\n").unwrap();
     std::env::set_var("HOME", &home);
 
-    let installed = install_omp().unwrap();
+    let installed = only(install_omp().unwrap());
 
     assert_eq!(
         installed.extension_path,
@@ -691,7 +691,7 @@ fn install_omp_uses_pi_config_dir_env() {
     std::env::set_var("HOME", &home);
     std::env::set_var(OMP_CONFIG_DIR_ENV_VAR, "custom-omp");
 
-    let installed = install_omp().unwrap();
+    let installed = only(install_omp().unwrap());
 
     assert_eq!(
         installed.extension_path,
@@ -737,7 +737,7 @@ fn install_omp_creates_extensions_dir_when_agent_dir_exists() {
     fs::create_dir_all(&agent_dir).unwrap();
     std::env::set_var("HOME", &home);
 
-    let installed = install_omp().unwrap();
+    let installed = only(install_omp().unwrap());
 
     assert_eq!(
         installed.extension_path,
@@ -764,7 +764,7 @@ fn uninstall_omp_removes_embedded_extension_when_present() {
     .unwrap();
     std::env::set_var("HOME", &home);
 
-    let result = uninstall_omp().unwrap();
+    let result = only(uninstall_omp().unwrap());
 
     assert_eq!(
         result.extension_path,
@@ -790,6 +790,195 @@ fn install_omp_errors_when_extension_dir_missing() {
     assert!(err.contains("omp extension directory not found"));
 
     std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+fn only<T: std::fmt::Debug>(items: Vec<T>) -> T {
+    let [item] = <[T; 1]>::try_from(items).unwrap();
+    item
+}
+
+fn omp_statuses() -> Vec<IntegrationStatus> {
+    installed_integration_statuses()
+        .into_iter()
+        .filter(|status| status.target == crate::api::schema::IntegrationTarget::Omp)
+        .collect()
+}
+
+#[test]
+fn omp_integration_covers_every_valid_profile_agent_dir() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let default_ext = home.join(".omp/agent/extensions");
+    let work_ext = home.join(".omp/profiles/work/agent/extensions");
+    let invalid_ext = home.join(".omp/profiles/Bad_Name/agent/extensions");
+    for dir in [&default_ext, &work_ext, &invalid_ext] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let user_extension = work_ext.join("herdr-projects.ts");
+    fs::write(&user_extension, "// user extension\n").unwrap();
+    std::env::set_var("HOME", &home);
+
+    let installed = install_omp()
+        .unwrap()
+        .into_iter()
+        .map(|installed| installed.extension_path)
+        .collect::<Vec<_>>();
+    let expected = vec![
+        default_ext.join(OMP_EXTENSION_INSTALL_NAME),
+        work_ext.join(OMP_EXTENSION_INSTALL_NAME),
+    ];
+    assert_eq!(installed, expected);
+    for path in &expected {
+        assert_eq!(fs::read_to_string(path).unwrap(), OMP_EXTENSION_ASSET);
+    }
+    assert!(!invalid_ext.join(OMP_EXTENSION_INSTALL_NAME).exists());
+
+    let statuses = omp_statuses();
+    assert_eq!(
+        statuses
+            .iter()
+            .map(|status| (status.path.clone(), status.state))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|path| (path.clone(), IntegrationStatusKind::Current))
+            .collect::<Vec<_>>()
+    );
+
+    fs::write(
+        invalid_ext.join(OMP_EXTENSION_INSTALL_NAME),
+        OMP_EXTENSION_ASSET,
+    )
+    .unwrap();
+    let removed = uninstall_omp().unwrap();
+    assert_eq!(
+        removed
+            .iter()
+            .map(|result| (result.extension_path.clone(), result.removed_extension))
+            .collect::<Vec<_>>(),
+        expected
+            .iter()
+            .map(|path| (path.clone(), true))
+            .collect::<Vec<_>>()
+    );
+    assert!(expected.iter().all(|path| !path.exists()));
+    assert!(user_extension.is_file());
+    assert!(invalid_ext.join(OMP_EXTENSION_INSTALL_NAME).is_file());
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn omp_profile_missing_integration_is_outdated() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let default_ext = home.join(".omp/agent/extensions");
+    fs::create_dir_all(&default_ext).unwrap();
+    let profile_agent = home.join(".omp/profiles/work/agent");
+    fs::create_dir_all(&profile_agent).unwrap();
+    std::env::set_var("HOME", &home);
+
+    assert!(omp_statuses()
+        .iter()
+        .all(|status| status.state == IntegrationStatusKind::NotInstalled));
+    assert!(outdated_installed_integrations().is_empty());
+
+    fs::write(
+        default_ext.join(OMP_EXTENSION_INSTALL_NAME),
+        OMP_EXTENSION_ASSET,
+    )
+    .unwrap();
+
+    let outdated = only(outdated_installed_integrations());
+    assert_eq!(outdated.target, crate::api::schema::IntegrationTarget::Omp);
+    assert_eq!(
+        outdated.path,
+        profile_agent
+            .join("extensions")
+            .join(OMP_EXTENSION_INSTALL_NAME)
+    );
+    let omp = integration_recommendations()
+        .into_iter()
+        .find(|recommendation| recommendation.target == crate::api::schema::IntegrationTarget::Omp)
+        .unwrap();
+    assert_eq!(omp.state, IntegrationStatusKind::Outdated);
+
+    install_omp().unwrap();
+    assert!(outdated_installed_integrations().is_empty());
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[cfg(unix)]
+#[test]
+fn install_omp_continues_past_a_profile_it_cannot_write() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let default_ext = home.join(".omp/agent/extensions");
+    let locked_ext = home.join(".omp/profiles/a/agent/extensions");
+    let later_ext = home.join(".omp/profiles/b/agent/extensions");
+    for dir in [&default_ext, &locked_ext, &later_ext] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::set_permissions(&locked_ext, fs::Permissions::from_mode(0o555)).unwrap();
+    std::env::set_var("HOME", &home);
+
+    let err = install_omp().unwrap_err().to_string();
+
+    fs::set_permissions(&locked_ext, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(err.contains(&locked_ext.display().to_string()), "{err}");
+    for dir in [&default_ext, &later_ext] {
+        assert!(err.contains(&format!("{}: ok", dir.display())), "{err}");
+        assert_eq!(
+            fs::read_to_string(dir.join(OMP_EXTENSION_INSTALL_NAME)).unwrap(),
+            OMP_EXTENSION_ASSET
+        );
+    }
+    assert!(!locked_ext.join(OMP_EXTENSION_INSTALL_NAME).exists());
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn omp_integration_inside_a_named_profile_session_still_covers_the_default_profile() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let default_ext = home.join(".omp/agent/extensions");
+    let profile_agent = home.join(".omp/profiles/neurable/agent");
+    fs::create_dir_all(&default_ext).unwrap();
+    fs::create_dir_all(profile_agent.join("extensions")).unwrap();
+    std::env::set_var("HOME", &home);
+    // What a neurable OMP session exports to the commands it runs.
+    std::env::set_var(PI_CODING_AGENT_DIR_ENV_VAR, &profile_agent);
+
+    let installed = install_omp()
+        .unwrap()
+        .into_iter()
+        .map(|installed| installed.extension_path)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        installed,
+        vec![
+            default_ext.join(OMP_EXTENSION_INSTALL_NAME),
+            profile_agent
+                .join("extensions")
+                .join(OMP_EXTENSION_INSTALL_NAME),
+        ]
+    );
+
+    std::env::remove_var("HOME");
+    clear_integration_path_env();
     let _ = fs::remove_dir_all(base);
 }
 
