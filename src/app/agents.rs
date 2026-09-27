@@ -214,8 +214,16 @@ impl App {
 
         let mut argv = vec![executable];
         argv.extend(params.args);
-        let command = crate::platform::interactive_shell_command(&argv, &shell_name)
-            .ok_or(AgentStartError::InvalidArgument)?;
+        let command = match omp_launch_profile.as_deref() {
+            Some(profile) => crate::platform::interactive_shell_command_with_env(
+                &argv,
+                crate::agent_resume::OMP_PROFILE_ENV,
+                profile,
+                &shell_name,
+            ),
+            None => crate::platform::interactive_shell_command(&argv, &shell_name),
+        }
+        .ok_or(AgentStartError::InvalidArgument)?;
         let bytes = crate::app::api_helpers::encode_api_submission(runtime, &command);
         let timeout = Duration::from_millis(
             params

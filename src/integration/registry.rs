@@ -225,11 +225,15 @@ pub(crate) fn hermes_install_layout_available() -> bool {
 pub(crate) fn installed_integration_statuses() -> Vec<super::IntegrationStatus> {
     integration_specs()
         .into_iter()
-        .filter_map(|(target, path, expected_version)| {
+        .flat_map(|(target, path, expected_version)| {
             if !integration_target_supported(target) {
-                return None;
+                return Vec::new();
             }
-            Some(integration_status_at(target, path.ok()?, expected_version))
+            if target == crate::api::schema::IntegrationTarget::Omp {
+                return omp_integration_statuses();
+            }
+            path.map(|path| vec![integration_status_at(target, path, expected_version)])
+                .unwrap_or_default()
         })
         .collect()
 }
@@ -242,18 +246,60 @@ pub(crate) fn integration_recommendations() -> Vec<super::IntegrationRecommendat
                 return None;
             }
             let path = path.ok()?;
-            let status = integration_status_at(target, path.clone(), expected_version);
+            let state = if target == crate::api::schema::IntegrationTarget::Omp {
+                let statuses = omp_integration_statuses();
+                if statuses
+                    .iter()
+                    .any(|status| status.state == super::IntegrationStatusKind::Outdated)
+                {
+                    super::IntegrationStatusKind::Outdated
+                } else {
+                    statuses.first()?.state
+                }
+            } else {
+                integration_status_at(target, path.clone(), expected_version).state
+            };
             Some(super::IntegrationRecommendation {
                 target,
                 label: integration_target_label(target),
                 command: integration_target_command(target),
                 available: integration_target_available(target)
-                    || status.state != super::IntegrationStatusKind::NotInstalled,
+                    || state != super::IntegrationStatusKind::NotInstalled,
                 path,
-                state: status.state,
+                state,
             })
         })
         .collect()
+}
+
+/// One status per OMP profile agent dir. Once any profile has the
+/// integration, a profile without it counts as outdated, so the update notice
+/// asks for `herdr integration install omp` until every profile has it.
+fn omp_integration_statuses() -> Vec<super::IntegrationStatus> {
+    let Ok(dirs) = omp_extension_dirs() else {
+        return Vec::new();
+    };
+    let mut statuses = dirs
+        .into_iter()
+        .map(|dir| {
+            integration_status_at(
+                crate::api::schema::IntegrationTarget::Omp,
+                dir.join(super::OMP_EXTENSION_INSTALL_NAME),
+                super::OMP_INTEGRATION_VERSION,
+            )
+        })
+        .collect::<Vec<_>>();
+    if statuses
+        .iter()
+        .any(|status| status.state != super::IntegrationStatusKind::NotInstalled)
+    {
+        for status in &mut statuses {
+            if status.state == super::IntegrationStatusKind::NotInstalled {
+                status.state = super::IntegrationStatusKind::Outdated;
+            }
+        }
+    }
+    statuses
 }
 
 pub(crate) fn outdated_installed_integrations() -> Vec<super::IntegrationStatus> {
@@ -389,10 +435,12 @@ pub(crate) fn print_outdated_update_notice() -> bool {
         return false;
     }
 
-    let targets = outdated
+    let mut targets = outdated
         .iter()
         .map(|integration| integration.target)
         .collect::<Vec<_>>();
+    // OMP reports one status per profile, next to each other.
+    targets.dedup();
     eprintln!(
         "installed herdr integrations need updating; {}.",
         integration_update_instructions(&targets).replace('`', "")

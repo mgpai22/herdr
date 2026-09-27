@@ -1652,27 +1652,6 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
-        if self
-            .state
-            .terminals
-            .get(&terminal_id)
-            .and_then(|terminal| terminal.persisted_agent_session.as_ref())
-            .is_some_and(|saved| {
-                saved.source == params.source
-                    && saved.agent == agent_label
-                    && saved.session_ref == session_ref
-                    && saved
-                        .launch_profile
-                        .as_deref()
-                        .is_some_and(|expected| expected != profile)
-            })
-        {
-            return encode_error(
-                id,
-                "launch_profile_mismatch",
-                "OMP reported a different launch profile",
-            );
-        }
         if params.peer_pid != Some(params.agent_pid) {
             return encode_error(
                 id,
@@ -1741,6 +1720,33 @@ impl App {
                 )
             }
         };
+        // Checked only for a verified OMP process, so the error cannot reveal a saved profile to
+        // any other caller.
+        if let Some(saved_profile) = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+            .filter(|saved| {
+                saved.source == params.source
+                    && saved.agent == agent_label
+                    && saved.session_ref == session_ref
+            })
+            .and_then(|saved| saved.launch_profile.as_deref())
+            .filter(|saved_profile| *saved_profile != profile)
+        {
+            let message = format!(
+                "OMP reported launch profile {profile:?} for a session saved under {saved_profile:?}; the [session.omp_launchers] entry {saved_profile:?} must not override the OMP_PROFILE that Herdr sets"
+            );
+            tracing::warn!(
+                pane = pane_id.raw(),
+                terminal = %terminal_id,
+                saved = saved_profile,
+                reported = %profile,
+                "OMP reported another launch profile for its saved session; automatic recovery stays blocked until the session registers under its saved profile"
+            );
+            return encode_error(id, "launch_profile_mismatch", message);
+        }
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             source: params.source.clone(),

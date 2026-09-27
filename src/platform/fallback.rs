@@ -179,6 +179,15 @@ pub(crate) fn interactive_shell_command(_argv: &[String], _shell_name: &str) -> 
     None
 }
 
+pub(crate) fn interactive_shell_command_with_env(
+    _argv: &[String],
+    _name: &str,
+    _value: &str,
+    _shell_name: &str,
+) -> Option<String> {
+    None
+}
+
 /// Unsupported platform stub.
 pub(crate) fn scrollback_editor_argv(_path: &std::path::Path) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(

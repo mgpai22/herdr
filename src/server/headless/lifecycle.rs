@@ -89,6 +89,12 @@ impl HeadlessServer {
                 .terminals
                 .get(terminal_id)
                 .and_then(|terminal| terminal.handoff_agent_state());
+            handoff_runtime.restore_error = self
+                .app
+                .state
+                .terminals
+                .get(terminal_id)
+                .and_then(|terminal| terminal.restore_error.clone());
             let has_agent_session = self
                 .app
                 .state

@@ -81,9 +81,11 @@ Native agent session restore is enabled by default. Disable it with:
 resume_agents_on_restore = false
 ```
 
-Herdr only resumes panes that reported a native session reference through a current official Herdr integration. OMP also reports its launch profile and verified process owner. Herdr blocks automatic OMP recovery when the owner is live or unknown, the saved profile is unregistered, or the platform cannot verify the saved Linux process incarnation. The pane and session reference remain available for manual recovery.
+Herdr only resumes panes that reported a native session reference through a current official Herdr integration. OMP also reports its launch profile and verified process owner. Herdr blocks automatic OMP recovery when the owner is live or unknown, the saved profile is unregistered, or the platform cannot verify the saved Linux process incarnation. An unknown owner means that no verified OMP report reached Herdr after the last resume: Herdr stopped before the report, the launcher started OMP under another profile, or OMP integration 11 is not installed in that profile (run `herdr integration install omp`).
 
-Before Herdr starts a recovered OMP process, it saves an owner-unknown barrier to private durable storage. A failed save prevents the process from starting. The resumed OMP process uses the saved foreground OMP directory, including directory changes made after launch.
+A blocked pane restores as a shell with its saved screen, followed by a `herdr:` line that names the reason and the fix, for example `add "neurable" = "<launcher executable>" to [session.omp_launchers]`. The line appears once, however often the pane restores. When Herdr finds the block only when the resume would start (for example after a configuration reload, or when the recovery barrier cannot be saved), the shell shows only that line. `herdr pane current` in that pane shows the same text as `restore_error`, and the saved session reference as `agent_session`. To resume the session by hand, run `herdr agent start NAME --kind omp --pane PANE --profile PROFILE -- --resume=REF` in that pane. The start replaces the saved session, and the resumed OMP registers it again under `PROFILE`, so later restarts resume it automatically.
+
+Herdr starts a recovered OMP process with `OMP_PROFILE` set to the saved profile. Before it starts the process, it saves an owner-unknown barrier to private durable storage. A failed save prevents the process from starting. The resumed OMP process uses the saved foreground OMP directory, including directory changes made after launch.
 
 :::caution[Back up before downgrade]
 An older Herdr binary can replace a version 4 snapshot and erase saved layout and OMP recovery data. Downgrade is unsupported. Back up the session directory and use an isolated data path before you run an older binary.
@@ -97,7 +99,7 @@ Native session restore requires these Herdr integration versions or newer:
 | --- | --- | --- |
 | Pi | `2` | `pi --session <path-or-id>` |
 | Antigravity CLI | `1` | `agy --conversation <id>` |
-| OMP | `11` | `<configured-profile-executable> --resume=<path-or-id>` |
+| OMP | `11` | `OMP_PROFILE=<profile> <configured-profile-executable> --resume=<path-or-id>` |
 | Claude Code | `6` | `claude --resume <id>` |
 | Codex | `5` | `codex resume <id>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |
