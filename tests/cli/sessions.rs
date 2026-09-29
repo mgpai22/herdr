@@ -500,7 +500,7 @@ fn status_reports_not_running_when_server_socket_is_missing() {
     let socket_path = runtime_dir.join("missing.sock");
 
     let status = run_cli(&socket_path, &["status"]);
-    assert!(status.status.success());
+    assert_eq!(status.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(stdout.contains("  status: not running"), "stdout: {stdout}");
     assert!(stdout.contains("  restart_needed: no"), "stdout: {stdout}");
@@ -513,7 +513,9 @@ fn status_reports_not_running_when_server_socket_is_missing() {
         "stdout: {stdout}"
     );
 
-    let status_json = run_cli_json(&socket_path, &["status", "--json"]);
+    let json_output = run_cli(&socket_path, &["status", "--json"]);
+    assert_eq!(json_output.status.code(), Some(1));
+    let status_json: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
     assert_eq!(status_json["server"]["status"], "not_running");
     assert_eq!(status_json["server"]["running"], false);
     assert_eq!(
@@ -525,6 +527,11 @@ fn status_reports_not_running_when_server_socket_is_missing() {
     assert_eq!(status_json["update"]["restart_needed"], false);
     assert_eq!(status_json["update"]["server_binary_stale"], false);
 
+    let server = run_cli(&socket_path, &["status", "server"]);
+    assert_eq!(server.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&server.stdout).contains("status: not running"));
+    let client = run_cli(&socket_path, &["status", "client"]);
+    assert!(client.status.success());
     cleanup_test_base(&base);
 }
 

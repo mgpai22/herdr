@@ -88,7 +88,7 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
             server: server_status_json(&server),
             update: update_status_json(&server),
         })?;
-        return Ok(0);
+        return Ok(server_exit_code(&server));
     }
 
     println!("client:");
@@ -113,17 +113,25 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
         server_binary_stale_label(&server)
     );
 
-    Ok(0)
+    Ok(server_exit_code(&server))
 }
 
 fn print_server_status(json: bool) -> std::io::Result<i32> {
     let server = read_server_runtime_status()?;
     if json {
         print_json(&server_status_json(&server))?;
-        return Ok(0);
+        return Ok(server_exit_code(&server));
     }
     print_server_status_body(&server, "");
-    Ok(0)
+    Ok(server_exit_code(&server))
+}
+
+fn server_exit_code(server: &ServerRuntimeStatus) -> i32 {
+    if matches!(server, ServerRuntimeStatus::NotRunning) {
+        1
+    } else {
+        0
+    }
 }
 
 fn print_client_status(json: bool) -> std::io::Result<()> {
@@ -407,6 +415,8 @@ fn print_status_help() {
     eprintln!("  herdr status [--json]         show local client and running server status");
     eprintln!("  herdr status server [--json]  show running server status");
     eprintln!("  herdr status client [--json]  show local client binary status");
+    eprintln!("  full/server exit: 0 when running; 1 when not running; 2 for invalid arguments");
+    eprintln!("  client exit: 0 even when no server is running");
 }
 
 #[cfg(test)]

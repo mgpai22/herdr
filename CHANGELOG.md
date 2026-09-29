@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+- A live server keeps ownership of its session when its sockets disappear, so local startup and SSH bridges refuse to start a second server.
+- The status command exits 1 when its server is not running, while preserving the printed status.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added

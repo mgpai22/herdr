@@ -166,19 +166,78 @@ pub(crate) struct StartupLock {
 }
 
 pub(crate) fn acquire_startup_lock() -> std::io::Result<StartupLock> {
-    StartupLock::acquire_at(&data_dir().join("startup.lock"))
+    StartupLock::acquire_at(&server_lock_path())
+}
+
+// The runtime filesystem stays mounted when a FUSE-served home is replaced.
+fn server_lock_path() -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return data_dir().join("startup.lock");
+    };
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    data_dir().hash(&mut hash);
+    PathBuf::from(runtime_dir)
+        .join("herdr-locks")
+        .join(format!("{:016x}.lock", hash.finish()))
+}
+
+pub(crate) fn running_server_pid() -> std::io::Result<Option<String>> {
+    let path = server_lock_path();
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(None),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Some(
+            std::fs::read_to_string(path)?
+                .trim()
+                .parse::<u32>()
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|_| "unknown".to_owned()),
+        )),
+        Err(std::fs::TryLockError::Error(err)) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+impl StartupLock {
+    pub(crate) fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self._file.as_raw_fd()
+    }
+
+    pub(crate) unsafe fn from_raw_fd(fd: std::os::fd::RawFd) -> Self {
+        use std::os::fd::FromRawFd;
+        Self {
+            _file: unsafe { std::fs::File::from_raw_fd(fd) },
+        }
+    }
+    pub(crate) fn set_owner_pid(&mut self) -> std::io::Result<()> {
+        use std::io::Seek;
+        self._file.rewind()?;
+        write!(self._file, "{:010}", std::process::id())
+    }
 }
 
 impl StartupLock {
     fn acquire_at(path: &Path) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
         options.mode(0o600);
-        let file = options.open(path)?;
+        let mut file = options.open(path)?;
         #[cfg(unix)]
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.try_lock().map_err(|err| match err {
@@ -194,6 +253,8 @@ impl StartupLock {
                 ),
             ),
         })?;
+        write!(file, "{:010}", std::process::id())?;
+        file.set_len(10)?;
         Ok(Self { _file: file })
     }
 }

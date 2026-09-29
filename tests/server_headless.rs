@@ -236,6 +236,92 @@ fn server_api_responds_to_ping() {
 }
 
 #[test]
+fn remote_bridge_refuses_unreachable_live_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    fs::remove_file(&api_socket).unwrap();
+    fs::remove_file(&client_socket).unwrap();
+    fs::rename(&config_home, base.join("old-config")).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("remote-client-bridge")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &api_socket)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(error.contains("running but its socket"), "{error}");
+    assert!(
+        error.contains(&client_socket.display().to_string()),
+        "{error}"
+    );
+    let direct = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("server")
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("HERDR_SOCKET_PATH", &api_socket)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .output()
+        .unwrap();
+    assert!(!direct.status.success());
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    cmd.env("XDG_CONFIG_HOME", &config_home);
+    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    cmd.env("HERDR_SOCKET_PATH", &api_socket);
+    cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env_remove("HERDR_ENV");
+    let mut local = pair.slave.spawn_command(cmd).unwrap();
+    drop(pair.slave);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exit = loop {
+        if let Some(exit) = local.try_wait().unwrap() {
+            break exit;
+        }
+        if Instant::now() >= deadline {
+            local.kill().unwrap();
+            panic!("local autodetect did not report the unreachable server");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!exit.success());
+    let mut output = String::new();
+    pair.master
+        .try_clone_reader()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert!(output.contains("running but its socket"), "{output}");
+    assert!(UnixStream::connect(&client_socket).is_err());
+    assert!(UnixStream::connect(&api_socket).is_err());
+    assert_eq!(
+        unsafe { libc::kill(spawned.child.process_id().unwrap() as i32, 0) },
+        0
+    );
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
 fn server_removes_client_socket_on_exit() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -266,7 +352,9 @@ fn server_removes_client_socket_on_exit() {
     }
 
     drop(spawned);
-    cleanup_test_base(&base);
+    let restarted = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    cleanup_spawned_herdr(restarted, base);
 }
 
 #[test]

@@ -79,8 +79,13 @@ pub fn run_server() -> io::Result<()> {
             }
             Err(err) => return Err(err),
         };
-        // A later contender now observes both bound sockets and exits before loading state.
-        drop(startup_lock);
+        // Hold the session lock for the lifetime of the server, even if sockets disappear.
+        #[cfg(unix)]
+        {
+            server.server_lock = Some(startup_lock);
+        }
+        #[cfg(not(unix))]
+        let _startup_lock = startup_lock;
 
         info!(
             api_socket = %api::socket_path().display(),
@@ -130,9 +135,10 @@ fn take_startup_cwd() -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
-    let startup_lock = crate::session::acquire_startup_lock()?;
+    // The old server transfers its locked file descriptor with the pane descriptors.
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    let server_lock = received.server_lock;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -191,8 +197,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
         server.app.assume_handoff_ownership();
-        // Keep contenders out until the old server commits ownership to this importer.
-        drop(startup_lock);
+        server.server_lock = Some(server_lock);
+        if let Err(err) = server.server_lock.as_mut().unwrap().set_owner_pid() {
+            warn!(%err, "could not update handoff server pid in lock file");
+        }
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
