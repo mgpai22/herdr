@@ -181,6 +181,8 @@ enum AltScreenReadConflict {
 pub struct HeadlessServer {
     app: app::App,
     #[cfg(unix)]
+    server_lock: Option<crate::session::StartupLock>,
+    #[cfg(unix)]
     api_tx: Option<api::ApiRequestSender>,
     // Kept on every platform so dropping HeadlessServer owns API server shutdown.
     #[cfg_attr(windows, allow(dead_code))]
@@ -328,6 +330,8 @@ impl HeadlessServer {
         let _ = api_tx;
         Ok(Self {
             app,
+            #[cfg(unix)]
+            server_lock: None,
             #[cfg(unix)]
             api_tx,
             api_server,

@@ -168,7 +168,14 @@ impl HeadlessServer {
             }
         };
 
+        fds.push(
+            self.server_lock
+                .as_ref()
+                .expect("server holds its lock")
+                .as_raw_fd(),
+        );
         let send_result = crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
+        fds.pop();
         for fd in fds {
             let _ = unsafe { libc::close(fd) };
         }

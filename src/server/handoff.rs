@@ -52,6 +52,7 @@ pub(crate) struct HandoffManifest {
 #[cfg(unix)]
 pub(crate) struct ReceivedHandoff {
     pub manifest: HandoffManifest,
+    pub server_lock: crate::session::StartupLock,
     pub fds: Vec<RawFd>,
     pub stream: UnixStream,
 }
@@ -264,10 +265,12 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
+    let mut fds = recv_fds(&stream, manifest.panes.len() + 1)?;
+    let server_lock = unsafe { crate::session::StartupLock::from_raw_fd(fds.pop().unwrap()) };
     Ok(ReceivedHandoff {
         manifest,
         fds,
+        server_lock,
         stream,
     })
 }

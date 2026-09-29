@@ -35,11 +35,8 @@ pub(crate) const STARTUP_CWD_ENV_VAR: &str = "HERDR_STARTUP_CWD";
 
 /// Checks whether a herdr server is currently listening on the client socket.
 ///
-/// This works by attempting to connect to the client socket. If the connection
-/// succeeds, a server is running. If the socket file doesn't exist or the
-/// connection is refused, no server is running. Stale sockets (from a crashed
-/// server) are detected because connect returns `ConnectionRefused`
-/// when nobody is listening.
+/// Connects to the client socket. A missing or refused socket is not proof
+/// that the server exited: the session lock is checked before auto-spawning.
 #[allow(dead_code)] // Public API for external use and testing
 pub fn is_server_listening() -> bool {
     is_server_listening_at(&client_socket_path())
@@ -192,6 +189,16 @@ fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<(
 ///
 /// Returns the PID of the spawned server process.
 pub fn spawn_server_daemon() -> io::Result<u32> {
+    if let Some(pid) = crate::session::running_server_pid()? {
+        let socket = client_socket_path();
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "herdr server (pid {pid}) is running but its socket at {} is not reachable; restart it",
+                socket.display()
+            ),
+        ));
+    }
     let exe = std::env::current_exe().map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -317,7 +324,7 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
             .and_then(|_| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
     };
     if let Err(error) = startup {
-        if !saved_federation {
+        if !saved_federation || error.kind() == io::ErrorKind::AddrInUse {
             return Err(error);
         }
         tracing::warn!(%error, "Local startup failed; keeping saved machines available");
