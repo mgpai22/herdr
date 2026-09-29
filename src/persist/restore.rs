@@ -35,6 +35,8 @@ struct PaneRestoreStartup<'a> {
     initial_history_ansi: Option<&'a str>,
     duplicate_agent_session: bool,
     reserved_agent_session: Option<String>,
+    /// The pane restores as a plain shell because automatic OMP recovery refused its session.
+    omp_recovery_block: Option<crate::agent_resume::OmpRecoveryBlock>,
 }
 
 struct RestoreRuntimeContext<'a> {
@@ -573,6 +575,13 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        // An imported pane skips the recovery gate, so it keeps the notice it had before.
+        #[cfg(unix)]
+        let handoff_restore_error = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.state.restore_error.clone());
+        #[cfg(not(unix))]
+        let handoff_restore_error = None;
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -617,6 +626,18 @@ fn restore_tab(
             continue;
         }
 
+        let recovery_notice = startup
+            .omp_recovery_block
+            .as_ref()
+            .map(crate::agent_resume::omp_recovery_blocked_notice);
+        let noticed_history = recovery_notice.as_deref().map(|notice| {
+            crate::agent_resume::screen_history_with_omp_recovery_notice(
+                startup.initial_history_ansi,
+                notice,
+            )
+        });
+        let initial_history_ansi = noticed_history.as_deref().or(startup.initial_history_ansi);
+
         let runtime_result = {
             #[cfg(unix)]
             if let Some(imported) = imported_runtime {
@@ -643,7 +664,7 @@ fn restore_tab(
                     None,
                     runtime_context.shell_config,
                     &launch_env,
-                    startup.initial_history_ansi,
+                    initial_history_ansi,
                     runtime_context.events.clone(),
                     runtime_context.render_notify.clone(),
                     runtime_context.render_dirty.clone(),
@@ -662,7 +683,7 @@ fn restore_tab(
                     None,
                     runtime_context.shell_config,
                     &launch_env,
-                    startup.initial_history_ansi,
+                    initial_history_ansi,
                     runtime_context.events.clone(),
                     runtime_context.render_notify.clone(),
                     runtime_context.render_dirty.clone(),
@@ -685,6 +706,7 @@ fn restore_tab(
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
+                terminal.restore_error = recovery_notice.or(handoff_restore_error);
                 match (saved_agent_name, saved_managed_agent) {
                     (Some(agent_name), Some(agent)) if was_imported => {
                         terminal.restore_managed_agent(agent_name, agent)
@@ -802,14 +824,18 @@ fn pane_restore_startup<'a>(
     // resumable agent session and resume is enabled, do not replay saved pane
     // presentation history into that terminal, even when this pane is a
     // duplicate suppressed by session de-duplication.
-    let restore_plan = session.and_then(|session| {
+    let (restore_plan, omp_recovery_block) = match session.map(|session| {
         restore_plan_for_snapshot_with_launchers(
             session,
             agent_restore.enabled,
             agent_restore.omp_launchers,
             agent_restore.imported,
         )
-    });
+    }) {
+        Some(Ok(plan)) => (plan, None),
+        Some(Err(block)) => (None, Some(block)),
+        None => (None, None),
+    };
     let has_native_agent_restore = restore_plan.is_some();
     // Reserve before spawning so later panes in the same restore pass cannot
     // launch the same native agent session. The caller rolls this reservation
@@ -841,6 +867,7 @@ fn pane_restore_startup<'a>(
         },
         duplicate_agent_session,
         reserved_agent_session,
+        omp_recovery_block,
     }
 }
 
@@ -849,28 +876,33 @@ fn restore_plan_for_snapshot_with_launchers(
     resume_agents_on_restore: bool,
     omp_launchers: &std::collections::BTreeMap<String, String>,
     imported: bool,
-) -> Option<crate::agent_resume::AgentResumePlan> {
+) -> Result<Option<crate::agent_resume::AgentResumePlan>, crate::agent_resume::OmpRecoveryBlock> {
     if !resume_agents_on_restore {
-        return None;
+        return Ok(None);
     }
-    let persisted = persisted_agent_session_from_snapshot(session)?;
-    let mut plan =
-        crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)?;
+    let Some(persisted) = persisted_agent_session_from_snapshot(session) else {
+        return Ok(None);
+    };
+    let Some(mut plan) =
+        crate::agent_resume::plan(&session.source, &session.agent, &persisted.session_ref)
+    else {
+        return Ok(None);
+    };
     // An imported pane keeps its live runtime and never spawns the plan; it only
     // seeds detection and session dedupe, so the owner gate does not apply.
     if session.agent == "omp" && !imported {
         match crate::agent_resume::omp_recovery_executable(&persisted, omp_launchers) {
             Ok(executable) => plan.argv[0] = executable,
-            Err(reason) => {
+            Err(block) => {
                 tracing::warn!(
-                    reason,
+                    reason = %block,
                     "automatic OMP recovery blocked; recover the saved session manually"
                 );
-                return None;
+                return Err(block);
             }
         }
     }
-    Some(plan)
+    Ok(Some(plan))
 }
 
 #[cfg(test)]
@@ -880,6 +912,8 @@ fn restore_plan_for_snapshot(
 ) -> Option<crate::agent_resume::AgentResumePlan> {
     let launchers = std::collections::BTreeMap::new();
     restore_plan_for_snapshot_with_launchers(session, resume_agents_on_restore, &launchers, false)
+        .ok()
+        .flatten()
 }
 
 fn persisted_agent_session_from_snapshot(
@@ -2180,6 +2214,183 @@ mod tests {
             for (_, runtime) in runtimes {
                 runtime.shutdown();
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_omp_recovery_restores_a_shell_that_shows_why() {
+        let mut config = crate::config::Config::default();
+        config.terminal.default_shell = test_restore_shell().into();
+        config.session.omp_launchers = std::collections::BTreeMap::from([
+            ("default".into(), "/opt/omp-default".into()),
+            ("restricted".into(), "/opt/omp-restricted".into()),
+        ]);
+        let session =
+            |launch_profile: Option<&str>| super::super::snapshot::PaneAgentSessionSnapshot {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                value: "/tmp/omp-blocked-session.jsonl".into(),
+                launch_profile: launch_profile.map(str::to_string),
+                // The state a launcher-profile mismatch or a crash after the barrier leaves behind.
+                owner_process: None,
+            };
+        for (saved, block) in [
+            (
+                session(None),
+                crate::agent_resume::OmpRecoveryBlock::UnknownProfile,
+            ),
+            (
+                session(Some("neurable")),
+                crate::agent_resume::OmpRecoveryBlock::UnregisteredProfile("neurable".into()),
+            ),
+            (
+                session(Some("restricted")),
+                crate::agent_resume::OmpRecoveryBlock::UnknownOwner("restricted".into()),
+            ),
+        ] {
+            let (mut snapshot, mut history) = snapshot_with_saved_pane_history();
+            snapshot.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&0)
+                .unwrap()
+                .agent_session = Some(saved.clone());
+            history.layout_fingerprint = super::super::snapshot::layout_fingerprint(&snapshot);
+            let (events, _rx) = mpsc::channel(8);
+            let (_, terminals, runtimes) = restore_with_omp_launchers(
+                &snapshot,
+                Some(&history),
+                &config,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+
+            let terminal = terminals.values().next().unwrap();
+            assert!(terminal.pending_agent_resume_plan.is_none());
+            let notice = crate::agent_resume::omp_recovery_blocked_notice(&block);
+            assert_eq!(terminal.restore_error.as_deref(), Some(notice.as_str()));
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .map(|session| session.launch_profile.clone()),
+                Some(saved.launch_profile.clone()),
+                "the saved session stays for manual recovery"
+            );
+            let runtime = runtimes
+                .get(&terminal.id)
+                .expect("a blocked pane keeps a usable shell");
+            let screen = runtime.recent_unwrapped_text(20);
+            assert!(screen.contains("RESTORED_HISTORY"), "{screen}");
+            assert!(screen.contains(&notice), "{block:?}: {screen}");
+            for (_, runtime) in runtimes {
+                runtime.shutdown();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_omp_pane_keeps_one_notice_across_restarts_and_handoff() {
+        let mut config = crate::config::Config::default();
+        config.terminal.default_shell = test_restore_shell().into();
+        config.session.omp_launchers = std::collections::BTreeMap::from([
+            ("default".into(), "/opt/omp-default".into()),
+            ("restricted".into(), "/opt/omp-restricted".into()),
+        ]);
+        let (mut snapshot, mut history) = snapshot_with_saved_pane_history();
+        snapshot.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&0)
+            .unwrap()
+            .agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Path,
+            value: "/tmp/omp-blocked-session.jsonl".into(),
+            launch_profile: Some("restricted".into()),
+            owner_process: None,
+        });
+        history.layout_fingerprint = super::super::snapshot::layout_fingerprint(&snapshot);
+        let notice = crate::agent_resume::omp_recovery_blocked_notice(
+            crate::agent_resume::OmpRecoveryBlock::UnknownOwner("restricted".into()),
+        );
+        let (events, _rx) = mpsc::channel(8);
+
+        // Each cold restart restores from the screen the previous restore left.
+        let mut runtimes = HashMap::new();
+        let mut terminals = HashMap::new();
+        for _ in 0..3 {
+            if let Some(screen) = runtimes
+                .values()
+                .next()
+                .and_then(TerminalRuntime::snapshot_history)
+            {
+                history.workspaces[0].tabs[0]
+                    .panes
+                    .get_mut(&0)
+                    .unwrap()
+                    .ansi = screen;
+            }
+            for (_, runtime) in runtimes.drain() {
+                runtime.shutdown();
+            }
+            (_, terminals, runtimes) = restore_with_omp_launchers(
+                &snapshot,
+                Some(&history),
+                &config,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+        }
+        let terminal = terminals.values().next().unwrap();
+        let runtime = runtimes.get(&terminal.id).unwrap();
+        let screen = runtime.recent_unwrapped_text(100);
+        assert!(screen.contains("RESTORED_HISTORY"), "{screen}");
+        assert_eq!(screen.matches(&notice).count(), 1, "{screen}");
+
+        // A live handoff keeps the pane's shell and its notice.
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mut state = runtime.handoff_runtime_state(0);
+        state.restore_error = terminal.restore_error.clone();
+        let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let mut imports = HashMap::from([(
+            0,
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                state,
+            },
+        )]);
+        let (_, handed_over, handed_over_runtimes) = restore_handoff(
+            &snapshot,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &config.session.omp_launchers,
+            &mut imports,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        assert_eq!(handed_over_runtimes.len(), 1);
+        assert_eq!(
+            handed_over
+                .values()
+                .next()
+                .unwrap()
+                .restore_error
+                .as_deref(),
+            Some(notice.as_str())
+        );
+        drop(handed_over_runtimes);
+        for (_, runtime) in runtimes {
+            runtime.shutdown();
         }
     }
 

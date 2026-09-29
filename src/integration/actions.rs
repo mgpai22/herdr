@@ -94,21 +94,22 @@ fn install_target_inner(target: crate::api::schema::IntegrationTarget) -> io::Re
             vec![format!("installed pi integration to {}", path.display())]
         }
         crate::api::schema::IntegrationTarget::Omp => {
-            let installed = install_omp()?;
             let mut messages = Vec::new();
-            if installed.removed_legacy_pi_extension {
+            for installed in install_omp()? {
+                if installed.removed_legacy_pi_extension {
+                    messages.push(format!(
+                        "removed legacy pi integration from omp extension directory at {}",
+                        installed
+                            .extension_path
+                            .with_file_name(PI_EXTENSION_INSTALL_NAME)
+                            .display()
+                    ));
+                }
                 messages.push(format!(
-                    "removed legacy pi integration from omp extension directory at {}",
-                    installed
-                        .extension_path
-                        .with_file_name(PI_EXTENSION_INSTALL_NAME)
-                        .display()
+                    "installed omp integration to {}",
+                    installed.extension_path.display()
                 ));
             }
-            messages.push(format!(
-                "installed omp integration to {}",
-                installed.extension_path.display()
-            ));
             messages
         }
         crate::api::schema::IntegrationTarget::Claude => {
@@ -341,20 +342,22 @@ pub(crate) fn uninstall_target(
                 )]
             }
         }
-        crate::api::schema::IntegrationTarget::Omp => {
-            let result = uninstall_omp()?;
-            if result.removed_extension {
-                vec![format!(
-                    "removed omp integration extension at {}",
-                    result.extension_path.display()
-                )]
-            } else {
-                vec![format!(
-                    "no omp integration extension found at {}",
-                    result.extension_path.display()
-                )]
-            }
-        }
+        crate::api::schema::IntegrationTarget::Omp => uninstall_omp()?
+            .into_iter()
+            .map(|result| {
+                if result.removed_extension {
+                    format!(
+                        "removed omp integration extension at {}",
+                        result.extension_path.display()
+                    )
+                } else {
+                    format!(
+                        "no omp integration extension found at {}",
+                        result.extension_path.display()
+                    )
+                }
+            })
+            .collect(),
         crate::api::schema::IntegrationTarget::Claude => {
             let result = uninstall_claude()?;
             let mut messages = Vec::new();

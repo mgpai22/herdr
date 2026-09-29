@@ -421,6 +421,55 @@ pub(crate) fn interactive_unix_shell_command(
     Some(command)
 }
 
+/// Shell text that runs `argv` with `name=value` in that command's environment only, so the
+/// pane shell keeps its own value.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn interactive_unix_shell_command_with_env(
+    argv: &[String],
+    name: &str,
+    value: &str,
+    shell_name: &str,
+    quote_posix_arg: fn(&str) -> String,
+) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    if matches!(
+        normalized_process_name(shell_name).as_str(),
+        "sh" | "bash" | "dash" | "ash" | "zsh" | "ksh" | "mksh" | "fish"
+    ) {
+        // The shell's own `NAME=value command` prefix keeps its command lookup. A quoted
+        // program word is never read as another assignment.
+        let program = if program.contains('=') {
+            format!("'{}'", program.replace('\'', "'\\''"))
+        } else {
+            quote_posix_arg(program)
+        };
+        let mut command = format!("{name}={} {program}", quote_posix_arg(value));
+        for arg in args {
+            command.push(' ');
+            command.push_str(&quote_posix_arg(arg));
+        }
+        return Some(command);
+    }
+    // Other shells have no such prefix. `env` reads every leading word that contains `=` as
+    // another assignment, so it cannot run such a program.
+    if program.contains('=') {
+        return None;
+    }
+    let mut command = vec!["env".to_string(), format!("{name}={value}")];
+    command.extend_from_slice(argv);
+    interactive_unix_shell_command(&command, shell_name, quote_posix_arg)
+}
+
+/// Runs `script` with `name` set to `value`, then restores the previous value, so a PowerShell
+/// pane session does not keep the variable.
+#[cfg(any(windows, test))]
+pub(crate) fn powershell_script_with_env(script: &str, name: &str, value: &str) -> String {
+    format!(
+        "& {{$herdrPrevious=$env:{name};$env:{name}='{}';try{{{script}}}finally{{$env:{name}=$herdrPrevious}}}}",
+        escape_powershell_single_quoted(value)
+    )
+}
+
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
     if !value.is_empty()
         && !value.starts_with('-')
@@ -431,7 +480,20 @@ pub(crate) fn quote_powershell_arg(value: &str) -> String {
     {
         return value.to_string();
     }
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", escape_powershell_single_quoted(value))
+}
+
+/// PowerShell ends a single-quoted string at `'` and at the typographic quotes U+2018 to
+/// U+201B; a doubled quote of any of them stands for itself.
+fn escape_powershell_single_quoted(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        escaped.push(ch);
+        if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            escaped.push(ch);
+        }
+    }
+    escaped
 }
 
 pub(crate) fn quote_windows_command_line_arg(value: &str) -> String {
@@ -658,6 +720,93 @@ mod tests {
             interactive_shell_command(&argv, "pwsh").as_deref(),
             Some("pi '' 'two words' 'a''b' '$HOME' 'semi;colon' '@options'")
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn command_with_env_sets_the_variable_for_the_launcher_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-command-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let seen = dir.join("seen");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s|%s' \"$OMP_PROFILE\" \"$1\" > '{}'\n",
+            seen.display()
+        );
+        // A path with a space, and a bare name found on PATH that looks like an assignment.
+        let spaced = dir.join("omp launcher");
+        let assignment_like = dir.join("omp=launcher");
+        for launcher in [&spaced, &assignment_like] {
+            std::fs::write(launcher, &script).unwrap();
+            std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        for program in [spaced.display().to_string(), "omp=launcher".to_string()] {
+            let argv = vec![program.clone(), "--resume=/tmp/a b.jsonl".to_string()];
+            for shell in ["/bin/sh", "/bin/bash", "/bin/dash", "/usr/bin/zsh"] {
+                if !std::path::Path::new(shell).exists() {
+                    continue;
+                }
+                let shell_name = shell.rsplit('/').next().unwrap();
+                let command = interactive_shell_command_with_env(
+                    &argv,
+                    "OMP_PROFILE",
+                    "neurable",
+                    shell_name,
+                )
+                .unwrap();
+                let output = std::process::Command::new(shell)
+                    .arg("-c")
+                    .arg(format!("{command}; printf %s \"$OMP_PROFILE\""))
+                    .env("OMP_PROFILE", "pane")
+                    .env("PATH", &path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{shell} {program}: {output:?}");
+                assert_eq!(
+                    std::fs::read_to_string(&seen).unwrap_or_default(),
+                    "neurable|--resume=/tmp/a b.jsonl",
+                    "{shell} {program}"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    "pane",
+                    "{shell} must keep its own value"
+                );
+                std::fs::remove_file(&seen).unwrap();
+            }
+        }
+        // `env` would read such a program as an assignment, so shells that need it refuse.
+        let argv = vec!["omp=launcher".to_string()];
+        for shell_name in ["tcsh", "nu", "pwsh"] {
+            assert_eq!(
+                interactive_shell_command_with_env(&argv, "OMP_PROFILE", "neurable", shell_name),
+                None,
+                "{shell_name}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn powershell_env_script_quotes_the_value_and_restores_the_previous_one() {
+        assert_eq!(
+            powershell_script_with_env("& omp", "OMP_PROFILE", "it's \u{2019}"),
+            "& {$herdrPrevious=$env:OMP_PROFILE;$env:OMP_PROFILE='it''s \u{2019}\u{2019}';try{& omp}finally{$env:OMP_PROFILE=$herdrPrevious}}"
+        );
+        assert_eq!(quote_powershell_arg("a\u{2018}b"), "'a\u{2018}\u{2018}b'");
     }
 
     #[test]

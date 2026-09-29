@@ -89,6 +89,12 @@ impl HeadlessServer {
                 .terminals
                 .get(terminal_id)
                 .and_then(|terminal| terminal.handoff_agent_state());
+            handoff_runtime.restore_error = self
+                .app
+                .state
+                .terminals
+                .get(terminal_id)
+                .and_then(|terminal| terminal.restore_error.clone());
             let has_agent_session = self
                 .app
                 .state
@@ -162,7 +168,14 @@ impl HeadlessServer {
             }
         };
 
+        fds.push(
+            self.server_lock
+                .as_ref()
+                .expect("server holds its lock")
+                .as_raw_fd(),
+        );
         let send_result = crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
+        fds.pop();
         for fd in fds {
             let _ = unsafe { libc::close(fd) };
         }

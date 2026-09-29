@@ -29,6 +29,9 @@ pub(crate) struct HandoffRuntimeState {
     pub initial_history_ansi: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<crate::terminal::state::HandoffAgentState>,
+    /// Why the pane runs a plain shell instead of its saved agent, shown until it is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
 }
 
 #[cfg(unix)]

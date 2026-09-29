@@ -47,11 +47,16 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// The sender appends its lifetime server lock after the pane descriptors.
+    /// Servers from before the lock handoff send no lock and leave this false.
+    #[serde(default)]
+    pub carries_server_lock: bool,
 }
 
 #[cfg(unix)]
 pub(crate) struct ReceivedHandoff {
     pub manifest: HandoffManifest,
+    pub server_lock: crate::session::StartupLock,
     pub fds: Vec<RawFd>,
     pub stream: UnixStream,
 }
@@ -264,10 +269,24 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
+    let lock_fds = usize::from(manifest.carries_server_lock);
+    let mut fds = recv_fds(&stream, manifest.panes.len() + lock_fds)?;
+    let server_lock = if manifest.carries_server_lock {
+        unsafe { crate::session::StartupLock::from_raw_fd(fds.pop().unwrap()) }
+    } else {
+        // An older server holds no lifetime lock, so the importer takes it now.
+        match crate::session::acquire_startup_lock() {
+            Ok(lock) => lock,
+            Err(err) => {
+                close_raw_fds(&fds);
+                return Err(err);
+            }
+        }
+    };
     Ok(ReceivedHandoff {
         manifest,
         fds,
+        server_lock,
         stream,
     })
 }
@@ -317,6 +336,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        carries_server_lock: true,
     }
 }
 
@@ -573,5 +593,22 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    #[test]
+    fn only_manifests_from_lock_handoff_servers_claim_a_lock_descriptor() {
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None);
+        assert!(manifest.carries_server_lock);
+
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .remove("carries_server_lock");
+        let older: HandoffManifest =
+            serde_json::from_value(value).expect("an older manifest should still load");
+
+        // An older server sends only pane descriptors; counting a lock would wait forever.
+        assert!(!older.carries_server_lock);
     }
 }

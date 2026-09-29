@@ -1092,13 +1092,29 @@ fn raw_command_shell(comspec: Option<std::ffi::OsString>) -> std::ffi::OsString 
 }
 
 pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Option<String> {
+    Some(shell_command_for_powershell_script(
+        powershell_agent_script(argv)?,
+        shell_name,
+    ))
+}
+
+pub(crate) fn interactive_shell_command_with_env(
+    argv: &[String],
+    name: &str,
+    value: &str,
+    shell_name: &str,
+) -> Option<String> {
+    let script = super::powershell_script_with_env(&powershell_agent_script(argv)?, name, value);
+    Some(shell_command_for_powershell_script(script, shell_name))
+}
+
+/// PowerShell panes run the script directly; cmd panes run it in a child PowerShell.
+fn shell_command_for_powershell_script(script: String, shell_name: &str) -> String {
     let shell_name = shell_name.to_ascii_lowercase();
-    let powershell = shell_name.contains("powershell") || shell_name.contains("pwsh");
-    let script = powershell_agent_script(argv)?;
-    if powershell {
-        Some(script)
+    if shell_name.contains("powershell") || shell_name.contains("pwsh") {
+        script
     } else {
-        Some(cmd_encoded_powershell_command(&script))
+        cmd_encoded_powershell_command(&script)
     }
 }
 
@@ -3445,6 +3461,69 @@ mod tests {
                 fs::read_to_string(capture).unwrap().replace("\r\n", "\n"),
                 "\ntwo words\n100%\nwow!\na'b\n@options\n--model\n"
             );
+        }
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn windows_shells_run_the_launcher_under_the_requested_omp_profile() {
+        let _lock = crate::integration::integration_env_lock();
+        let base = std::env::temp_dir().join(format!(
+            "herdr-omp-profile-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("omp-launcher.cmd"),
+            "@echo off\r\n>\"%HERDR_ARGV_CAPTURE%\" echo(%OMP_PROFILE% %~1\r\n",
+        )
+        .unwrap();
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = format!("{};{}", base.display(), inherited_path.to_string_lossy());
+        let argv = vec!["omp-launcher".to_string(), "--resume=session".to_string()];
+
+        for shell in ["powershell.exe", "cmd.exe"] {
+            let capture = base.join(format!("{shell}.txt"));
+            let command =
+                super::interactive_shell_command_with_env(&argv, "OMP_PROFILE", "neurable", shell)
+                    .unwrap();
+            // The PowerShell pane prints its own value afterwards; it must not keep the launcher's.
+            let powershell_command = format!("{command}; [Console]::Out.Write($env:OMP_PROFILE)");
+            let mut process = if shell == "cmd.exe" {
+                let mut process = Command::new("cmd.exe");
+                process.args(["/d", "/c", command.as_str()]);
+                process
+            } else {
+                let mut process = Command::new("powershell.exe");
+                process.args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-Command",
+                    powershell_command.as_str(),
+                ]);
+                process
+            };
+            let output = process
+                .env("PATH", &path)
+                .env("HERDR_ARGV_CAPTURE", &capture)
+                .env("OMP_PROFILE", "pane")
+                .env("PSExecutionPolicyPreference", "Bypass")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{shell}: {output:?}");
+            assert_eq!(
+                fs::read_to_string(&capture).unwrap().trim_end(),
+                "neurable --resume=session",
+                "{shell}"
+            );
+            if shell == "powershell.exe" {
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "pane");
+            }
         }
 
         let _ = fs::remove_dir_all(base);

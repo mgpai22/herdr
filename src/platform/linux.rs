@@ -328,6 +328,15 @@ pub(crate) fn interactive_shell_command(argv: &[String], shell_name: &str) -> Op
     super::interactive_unix_shell_command(argv, shell_name, shell_quote)
 }
 
+pub(crate) fn interactive_shell_command_with_env(
+    argv: &[String],
+    name: &str,
+    value: &str,
+    shell_name: &str,
+) -> Option<String> {
+    super::interactive_unix_shell_command_with_env(argv, name, value, shell_name, shell_quote)
+}
+
 fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.chars().all(|ch| {

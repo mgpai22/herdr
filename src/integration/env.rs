@@ -1,5 +1,6 @@
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -39,20 +40,93 @@ pub(crate) fn pi_extension_dir() -> io::Result<PathBuf> {
     )
 }
 
+/// Extension dir of the default OMP profile.
 pub(crate) fn omp_extension_dir() -> io::Result<PathBuf> {
     if let Some(value) =
         std::env::var_os(PI_CODING_AGENT_DIR_ENV_VAR).filter(|value| !value.is_empty())
     {
-        return expand_tilde_path(PathBuf::from(value)).map(|path| path.join("extensions"));
+        let agent_dir = expand_tilde_path(PathBuf::from(value))?;
+        // A named OMP profile exports its own agent dir to child processes. Like OMP, do not
+        // take that as the default profile's dir; the profile scan lists it anyway.
+        if !is_omp_profile_agent_dir(&agent_dir) {
+            return Ok(agent_dir.join("extensions"));
+        }
     }
 
+    Ok(omp_config_root()?.join("agent").join("extensions"))
+}
+
+/// True for `<OMP config root>/profiles/<name>/agent`, the agent dir OMP derives for a named
+/// profile.
+pub(crate) fn is_omp_profile_agent_dir(dir: &Path) -> bool {
+    let Ok(profiles) = omp_config_root().map(|root| root.join("profiles")) else {
+        return false;
+    };
+    let Ok(rest) = dir.strip_prefix(profiles) else {
+        return false;
+    };
+    let mut parts = rest.components();
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(Component::Normal(_)), Some(Component::Normal(agent)), None) if agent == "agent"
+    )
+}
+
+/// Extension dirs of every OMP profile: the default agent dir first, then the
+/// existing agent dir of each named profile. OMP loads extensions only from
+/// the active profile's agent dir, so each profile needs its own copy.
+pub(crate) fn omp_extension_dirs() -> io::Result<Vec<PathBuf>> {
+    let mut dirs = vec![omp_extension_dir()?];
+    // No home or no profiles dir means no named profiles; the default dir
+    // may still come from PI_CODING_AGENT_DIR.
+    let Some(entries) = omp_config_root()
+        .and_then(|root| fs::read_dir(root.join("profiles")))
+        .ok()
+    else {
+        return Ok(dirs);
+    };
+    let mut profile_dirs = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            is_omp_profile_name(entry.file_name().to_str()?).then(|| entry.path().join("agent"))
+        })
+        .filter(|agent_dir| agent_dir.is_dir())
+        .map(|agent_dir| agent_dir.join("extensions"))
+        .filter(|dir| *dir != dirs[0])
+        .collect::<Vec<_>>();
+    profile_dirs.sort();
+    dirs.append(&mut profile_dirs);
+    Ok(dirs)
+}
+
+fn omp_config_root() -> io::Result<PathBuf> {
     let config_dir = std::env::var_os(OMP_CONFIG_DIR_ENV_VAR)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".omp".into());
-    Ok(home_dir()?
-        .join(config_dir)
-        .join("agent")
-        .join("extensions"))
+    Ok(home_dir()?.join(config_dir))
+}
+
+/// OMP's `normalizeProfileName` rule. OMP never activates a profile it would
+/// reject (or `default`, which means the default profile), so herdr skips it.
+fn is_omp_profile_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let windows_reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    matches!(bytes.first(), Some(b'a'..=b'z' | b'0'..=b'9'))
+        && bytes.len() <= 64
+        && bytes
+            .iter()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+        && !name.ends_with('.')
+        && name != "default"
+        && !windows_reserved
 }
 
 pub(crate) fn claude_dir() -> io::Result<PathBuf> {
@@ -264,6 +338,36 @@ pub(crate) fn integration_env_lock() -> IntegrationEnvLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omp_profile_names_follow_omp_rule() {
+        for name in [
+            "work",
+            "0",
+            "a.b_c-d",
+            "a".repeat(64).as_str(),
+            "console",
+            "com10",
+        ] {
+            assert!(is_omp_profile_name(name), "{name} should be valid");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "work.",
+            "-work",
+            "Work",
+            "default",
+            "a".repeat(65).as_str(),
+            "con",
+            "nul.txt",
+            "com1",
+            "lpt9.x",
+        ] {
+            assert!(!is_omp_profile_name(name), "{name} should be invalid");
+        }
+    }
 
     #[test]
     fn opencode_state_dir_defaults_to_local_state() {

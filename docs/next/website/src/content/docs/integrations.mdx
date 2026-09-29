@@ -121,15 +121,18 @@ Install the OMP integration:
 herdr integration install omp
 ```
 
-Herdr writes the bundled extension to:
+Herdr writes the bundled extension to every OMP profile, because OMP loads extensions only from the active profile's agent directory:
 
 ```text
 ~/.omp/agent/extensions/herdr-omp-agent-state.ts
+~/.omp/profiles/<name>/agent/extensions/herdr-omp-agent-state.ts
 ```
 
-Herdr uses `PI_CODING_AGENT_DIR` as the complete agent directory when set. Otherwise, it uses `$HOME/$PI_CONFIG_DIR/agent` when `PI_CONFIG_DIR` is set, falling back to `~/.omp/agent`. If Pi and OMP resolve to the same extension directory, Herdr refuses the OMP install so the OMP extension cannot be loaded by Pi. Configure separate agent directories before installing both integrations. Herdr creates the extensions directory when the resolved OMP agent directory already exists. Uninstall removes only that extension file.
+For the default profile, Herdr uses `PI_CODING_AGENT_DIR` as the complete agent directory when set. Otherwise, it uses `$HOME/$PI_CONFIG_DIR/agent` when `PI_CONFIG_DIR` is set, falling back to `~/.omp/agent`. Named profiles live under `$HOME/$PI_CONFIG_DIR/profiles` (default `~/.omp/profiles`). Herdr includes each profile whose `agent` directory exists and whose name OMP accepts: lowercase letters, digits, `.`, `_`, and `-`, starting with a letter or digit, at most 64 characters, not ending with `.`, and not `default` or a Windows reserved device name. If Pi and OMP resolve to the same extension directory, Herdr refuses the OMP install so the OMP extension cannot be loaded by Pi. Configure separate agent directories before installing both integrations. Herdr creates the extensions directory when an OMP agent directory already exists; the default agent directory must exist. Uninstall removes only the Herdr extension file from each of these directories.
 
-The OMP integration reports `omp` as the agent label, lifecycle state, native session identity, resolved launch profile, and its live process ID through Herdr's socket API. Integration version `11` is required for profile-safe recovery. Herdr verifies that PID as the socket peer and a live member of the pane's foreground job, so wrappers may execute an OMP binary with another basename or place it inside `systemd --scope`. Automatic OMP recovery is Linux-only and uses the exact executable registered for the saved profile under `session.omp_launchers`. The wrapper must select that profile itself and must accept `--resume=<session>`; Herdr does not append `--profile`.
+`herdr integration status` lists one `omp` line per profile. Once any profile has the integration, a profile without it is reported as outdated, and the update notice asks you to run `herdr integration install omp` again. Rerun it after creating a new OMP profile.
+
+The OMP integration reports `omp` as the agent label, lifecycle state, native session identity, resolved launch profile, and its live process ID through Herdr's socket API. Integration version `11` is required for profile-safe recovery. Herdr verifies that PID as the socket peer and a live member of the pane's foreground job, so wrappers may execute an OMP binary with another basename or place it inside `systemd --scope`. Automatic OMP recovery is Linux-only and uses the exact executable registered for the saved profile under `session.omp_launchers`. Herdr runs the wrapper with `OMP_PROFILE` set to the profile name and appends only `--resume=<session>`; it does not append `--profile`. A wrapper may select the profile itself, but it must not change or clear `OMP_PROFILE`.
 
 ## Claude Code
 

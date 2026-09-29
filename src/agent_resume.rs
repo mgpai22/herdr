@@ -34,36 +34,106 @@ pub struct PersistedAgentSession {
     pub owner_process: Option<crate::platform::OwnerProcessIncarnation>,
 }
 
+/// Environment variable that selects the OMP profile. Herdr sets it to the profile name for the
+/// commands that run a `[session.omp_launchers]` entry, so a launcher that does not choose a
+/// profile itself still runs, and reports, the profile it is registered under.
+pub const OMP_PROFILE_ENV: &str = "OMP_PROFILE";
+
+/// Why automatic OMP recovery refuses a saved session. `Display` names the cause and the fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OmpRecoveryBlock {
+    Untrusted,
+    MissingDefaultLauncher,
+    UnknownProfile,
+    UnregisteredProfile(String),
+    UnknownOwner(String),
+    LiveOwner(u32),
+    UnverifiableOwner,
+}
+
+impl std::fmt::Display for OmpRecoveryBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Untrusted => f.write_str("the saved OMP session has no trusted recovery metadata"),
+            Self::MissingDefaultLauncher => f.write_str(
+                "session.omp_launchers.default is not set; add default = \"<omp executable>\" to [session.omp_launchers]",
+            ),
+            Self::UnknownProfile => f.write_str(
+                "the saved OMP session has no launch profile because an older Herdr or OMP integration saved it; resume it by hand once so OMP integration 11 reports its profile",
+            ),
+            Self::UnregisteredProfile(profile) => write!(
+                f,
+                "launch profile {profile:?} is not in [session.omp_launchers]; add {profile:?} = \"<launcher executable>\" there"
+            ),
+            Self::UnknownOwner(profile) => write!(
+                f,
+                "no verified OMP report reached Herdr after the last resume, because Herdr stopped first, the launcher for profile {profile:?} started OMP under another profile, or OMP integration 11 is not installed in profile {profile:?} (run `herdr integration install omp`); fix the cause, then resume the session by hand once"
+            ),
+            Self::LiveOwner(pid) => write!(
+                f,
+                "OMP process {pid} still owns this session; stop it or use the pane where it runs"
+            ),
+            Self::UnverifiableOwner => {
+                f.write_str("Herdr cannot verify the saved OMP process on this platform")
+            }
+        }
+    }
+}
+
+const OMP_RECOVERY_NOTICE_PREFIX: &str = "Automatic OMP recovery is blocked: ";
+
+/// Text shown in a pane whose saved OMP session Herdr did not resume.
+pub fn omp_recovery_blocked_notice(reason: impl std::fmt::Display) -> String {
+    format!("{OMP_RECOVERY_NOTICE_PREFIX}{reason}. Recover this session manually.")
+}
+
+/// Screen history for a pane that restores as a shell because OMP recovery is blocked: the saved
+/// history, then `notice` as the last line. Notice lines from earlier restores are dropped, so a
+/// pane that stays blocked across restarts shows one notice.
+pub fn screen_history_with_omp_recovery_notice(history: Option<&str>, notice: &str) -> String {
+    let marker = format!("herdr: {OMP_RECOVERY_NOTICE_PREFIX}");
+    let mut screen = history
+        .unwrap_or_default()
+        .split_inclusive('\n')
+        .filter(|line| !line.contains(&marker))
+        .collect::<String>();
+    if !screen.is_empty() && !screen.ends_with('\n') {
+        screen.push_str("\r\n");
+    }
+    screen.push_str(&format!("\x1b[0;1;33mherdr: {notice}\x1b[0m\r\n"));
+    screen
+}
+
 pub fn omp_recovery_executable(
     session: &PersistedAgentSession,
     launchers: &std::collections::BTreeMap<String, String>,
-) -> Result<String, &'static str> {
+) -> Result<String, OmpRecoveryBlock> {
     if session.source != "herdr:omp" || session.agent != "omp" {
-        return Err("saved OMP session has no trusted recovery metadata");
+        return Err(OmpRecoveryBlock::Untrusted);
     }
     if !launchers.contains_key("default") {
-        return Err("session.omp_launchers.default is required");
+        return Err(OmpRecoveryBlock::MissingDefaultLauncher);
     }
     let profile = session
         .launch_profile
         .as_deref()
         .filter(|profile| !profile.is_empty())
-        .ok_or("saved OMP launch profile is unknown")?;
+        .ok_or(OmpRecoveryBlock::UnknownProfile)?;
     let executable = launchers
         .get(profile)
         .filter(|executable| !executable.is_empty())
-        .ok_or("saved OMP launch profile is not registered")?;
+        .ok_or_else(|| OmpRecoveryBlock::UnregisteredProfile(profile.to_string()))?;
     let owner = session
         .owner_process
         .as_ref()
         .filter(|owner| {
             owner.pid != 0 && owner.start_time_ticks != 0 && !owner.boot_id.trim().is_empty()
         })
-        .ok_or("saved OMP owner is unknown")?;
+        .ok_or_else(|| OmpRecoveryBlock::UnknownOwner(profile.to_string()))?;
     match crate::platform::observe_process(owner.pid) {
-        Ok(Some(live)) if live == *owner => Err("saved OMP owner is still live"),
+        Ok(Some(live)) if live == *owner => Err(OmpRecoveryBlock::LiveOwner(owner.pid)),
         Ok(_) => Ok(executable.clone()),
-        Err(_) => Err("saved OMP owner cannot be verified"),
+        Err(_) => Err(OmpRecoveryBlock::UnverifiableOwner),
     }
 }
 
@@ -378,13 +448,15 @@ mod tests {
             "/opt/omp restricted/wrapper".into(),
         )]);
         let unknown = omp_session(None);
-        assert!(omp_recovery_executable(&unknown, &launchers)
-            .unwrap_err()
-            .contains("default"));
+        assert_eq!(
+            omp_recovery_executable(&unknown, &launchers),
+            Err(OmpRecoveryBlock::MissingDefaultLauncher)
+        );
         launchers.insert("default".into(), "/opt/omp-default".into());
-        assert!(omp_recovery_executable(&unknown, &launchers)
-            .unwrap_err()
-            .contains("owner is unknown"));
+        assert_eq!(
+            omp_recovery_executable(&unknown, &launchers),
+            Err(OmpRecoveryBlock::UnknownOwner("restricted".into()))
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -411,10 +483,9 @@ mod tests {
                 start_time_ticks: 0,
             },
         ] {
-            assert!(
-                omp_recovery_executable(&omp_session(Some(owner)), &launchers)
-                    .unwrap_err()
-                    .contains("owner is unknown")
+            assert_eq!(
+                omp_recovery_executable(&omp_session(Some(owner)), &launchers),
+                Err(OmpRecoveryBlock::UnknownOwner("restricted".into()))
             );
         }
     }
@@ -429,10 +500,9 @@ mod tests {
         let live = crate::platform::observe_process(std::process::id())
             .unwrap()
             .unwrap();
-        assert!(
-            omp_recovery_executable(&omp_session(Some(live.clone())), &launchers)
-                .unwrap_err()
-                .contains("still live")
+        assert_eq!(
+            omp_recovery_executable(&omp_session(Some(live.clone())), &launchers),
+            Err(OmpRecoveryBlock::LiveOwner(live.pid))
         );
         let mut stale = live;
         stale.start_time_ticks = stale.start_time_ticks.saturating_add(1);
