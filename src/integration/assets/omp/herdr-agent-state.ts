@@ -733,7 +733,7 @@ export default function (pi) {
     scheduleIdle();
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     if (!rootSession) {
       return;
     }
@@ -743,5 +743,14 @@ export default function (pi) {
     instructionListener = false;
     stopAdmissionWatch();
     compacting = false;
+    // Tell herdr the listener is gone before OMP goes on (it awaits this handler): `/restart`
+    // execs a new image, which reads the terminal before it registers its own listener, and a
+    // reload binds a new instance. herdr refuses instructions until the next registration
+    // instead of writing a block nobody can confirm. The same runtime id keeps a reload's
+    // in-flight deliveries followed.
+    await reportSession();
+    // No retry after shutdown: a later report is the next binding's to send.
+    clearTimeout(sessionRetryTimer);
+    sessionRetryTimer = undefined;
   });
 }

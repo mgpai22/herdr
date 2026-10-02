@@ -1452,6 +1452,69 @@ mod tests {
         sent_instruction_id(&mut rx, "Report current status");
     }
 
+    /// At shutdown (`/restart` or a reload) the integration reports its listener gone. herdr then
+    /// refuses instead of writing a block into the restart gap, and the report from the same
+    /// runtime keeps a reload's taken delivery followed; only a new runtime settles it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_shutdown_report_withdraws_the_listener_and_keeps_its_runtime_deliveries() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let reported = report_session_from(&mut app, &target, 10, true, Some("first"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        let _response = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        let acked = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionOutcome::Pending,
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
+            "{acked}"
+        );
+
+        let reported = report_session_from(&mut app, &target, 11, false, Some("first"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert!(
+            !app.agent_info_for_target(&target)
+                .unwrap()
+                .accepts_instructions
+        );
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Pending
+        );
+        assert_eq!(
+            instruct_error(&mut app, p.clone()),
+            "agent_instruction_unsupported"
+        );
+        assert!(rx.try_recv().is_err(), "nothing is written into the gap");
+
+        // The restarted image registers from a new runtime: the old delivery ends, and the new
+        // listener takes instructions.
+        let reported = report_session_from(&mut app, &target, 12, true, Some("after-exec"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Unconfirmed
+        );
+        let _second = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+    }
+
     /// A later delivery does not hide an earlier one's outcome from a caller that follows it.
     #[cfg(target_os = "linux")]
     #[tokio::test]

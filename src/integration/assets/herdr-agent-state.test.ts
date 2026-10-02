@@ -1260,6 +1260,31 @@ test("Oh My Pi reports an idle instruction that OMP drops without a turn", async
   expect(outcomes(afterSpeculation)).toEqual(["pending", "dropped"]);
 });
 
+test("Oh My Pi tells herdr its listener is gone before shutdown finishes", async () => {
+  let unsubscribed = 0;
+  const harness = await installOmpWithTerminalInput("omp-instruct-shutdown", {
+    onTerminalInput() {
+      return () => {
+        unsubscribed += 1;
+      };
+    },
+  });
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  await waitFor(() => harness.reports().length === 1);
+  expect(harness.reports()[0].params.accepts_instructions).toBe(true);
+
+  // OMP awaits this handler before `/restart` execs the new image: the report is in herdr's
+  // hands when it returns, so herdr writes nothing into the gap.
+  await harness.handlers.get("session_shutdown")?.({}, harness.context);
+  expect(unsubscribed).toBe(1);
+  expect(harness.reports()).toHaveLength(2);
+  expect(harness.reports()[1].params.accepts_instructions).toBe(false);
+  // The same runtime id: a reload's in-flight deliveries stay followed.
+  expect(harness.reports()[1].params.runtime_instance).toBe(
+    harness.reports()[0].params.runtime_instance,
+  );
+});
+
 test("Oh My Pi task subagents bound to the same module never touch the root's instructions", async () => {
   const requests = await startRecordingServer("omp-subagent");
   process.env.HERDR_OMP_INSTRUCTION_POLL_MS = "5";
