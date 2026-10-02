@@ -1669,7 +1669,7 @@ impl App {
                 "OMP session report sequence is stale or missing",
             );
         }
-        let Some(runtime) = self.terminal_runtimes.get(&terminal_id) else {
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return encode_error(id, "process_unavailable", "pane runtime is unavailable");
         };
         let owner_before = match crate::platform::observe_process(params.agent_pid) {
@@ -1760,9 +1760,16 @@ impl App {
         if !applied {
             return encode_error(id, "report_rejected", "OMP session report was rejected");
         }
-        // A report without the listener flag (integration v11 or no UI) withdraws it.
+        // A report without the listener flag (integration v11 or no UI) withdraws it. A report
+        // after a delivery proves the listener outlived it, so that delivery cannot withdraw it
+        // when it expires unconfirmed.
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.instruction_listener = params.accepts_instructions.then_some(owner_after);
+        }
+        for pending in self.pending_instruction_acks.values_mut() {
+            if pending.terminal_id == terminal_id {
+                pending.withdraws_listener = false;
+            }
         }
         if let Some(requested) = self
             .state

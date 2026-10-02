@@ -2450,6 +2450,40 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn live_handoff_keeps_the_instruction_listener() {
+        let mut terminal = test_terminal();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("omp-handoff.jsonl"))
+                .unwrap();
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Omp,
+            "herdr:omp",
+            "omp",
+            session_ref.clone(),
+        );
+        let _ = terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Idle,
+            None,
+            Some(session_ref),
+            Some(1),
+        );
+        let listener = crate::platform::OwnerProcessIncarnation {
+            pid: 42,
+            boot_id: "boot".into(),
+            start_time_ticks: 7,
+        };
+        terminal.instruction_listener = Some(listener.clone());
+        let wire = serde_json::to_value(terminal.handoff_agent_state().unwrap()).unwrap();
+        let mut imported = test_terminal();
+        imported.restore_handoff_agent_state(serde_json::from_value(wire).unwrap());
+        assert_eq!(imported.instruction_listener, Some(listener));
+    }
+
     #[test]
     fn managed_agent_readiness_tracks_detection_state() {
         let mut terminal = test_terminal();

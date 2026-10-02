@@ -544,8 +544,10 @@ test("Oh My Pi ignores non-UI agent sessions after root activation", async () =>
     },
   };
   await handlers.get("session_start")?.({ reason: "startup" }, rootContext);
+  // The startup state report follows the session report; count from after both.
   await waitFor(() => requests.some((request) =>
-    isRecord(request) && request.method === "pane.report_agent_session_v2"));
+    isRecord(request) && request.method === "pane.report_agent_session_v2")
+    && requestStates(requests).includes("idle"));
   const before = requests.length;
 
   await handlers.get("agent_start")?.({}, {
@@ -1067,7 +1069,21 @@ async function installOmpWithTerminalInput(name: string, ui: Record<string, unkn
   return { requests, handlers, sent, context, reports, setIdle: (value: boolean) => (idle = value) };
 }
 
-test("Oh My Pi consumes a herdr instruction paste and acks it from the agent process", async () => {
+function instructionBlock(
+  id: string,
+  text: string,
+  { expiresMs = Date.now() + 60_000, byteLength = Buffer.byteLength(text, "utf8") } = {},
+) {
+  return `\x1b[200~herdr-instruction:v2:${id}:${expiresMs}:${byteLength}\n${text}\x1b[201~`;
+}
+
+function instructionAcks(requests: unknown[]) {
+  return requests.filter((request) => isRecord(request) && request.method === "pane.ack_instruction") as {
+    params: Record<string, unknown>;
+  }[];
+}
+
+test("Oh My Pi hands a herdr instruction to OMP and acks it once OMP takes it", async () => {
   let listener: TerminalInputHandler | undefined;
   const harness = await installOmpWithTerminalInput("omp-instruct", {
     onTerminalInput(handler: TerminalInputHandler) {
@@ -1080,13 +1096,18 @@ test("Oh My Pi consumes a herdr instruction paste and acks it from the agent pro
   expect(harness.reports()[0].params.accepts_instructions).toBe(true);
 
   const id = "0123456789abcdef0123456789abcdef";
-  const block = `\x1b[200~herdr-instruction:v1:${id}\nReport status\nthen stop\x1b[201~`;
-  const acks = () =>
-    harness.requests.filter((request) => isRecord(request) && request.method === "pane.ack_instruction") as {
-      params: Record<string, unknown>;
-    }[];
-  expect(listener?.(block)).toEqual({ consume: true });
-  expect(harness.sent).toEqual([["Report status\nthen stop", undefined]]);
+  const text = "Report état\nthen stop";
+  const acks = () => instructionAcks(harness.requests);
+  // Idle: always an aside, so a turn that starts meanwhile is not cut by a steer.
+  expect(listener?.(instructionBlock(id, text))).toEqual({ consume: true });
+  expect(harness.sent).toEqual([[text, { deliverAs: "aside" }]]);
+  // The listener is reported again at once; the ack waits until OMP starts the turn.
+  await waitFor(() => harness.reports().length === 2);
+  expect(acks()).toHaveLength(0);
+  const messageStart = harness.handlers.get("message_start");
+  messageStart?.({ message: { role: "assistant", content: [{ type: "text", text }] } }, harness.context);
+  messageStart?.({ message: { role: "user", content: "another prompt" } }, harness.context);
+  messageStart?.({ message: { role: "user", content: [{ type: "text", text }] } }, harness.context);
   await waitFor(() => acks().length === 1);
   expect(acks()[0].params).toEqual({
     pane_id: "test:p1",
@@ -1096,20 +1117,54 @@ test("Oh My Pi consumes a herdr instruction paste and acks it from the agent pro
   });
 
   harness.setIdle(false);
-  // A person's Enter that arrived in the same read must still reach the editor.
-  expect(listener?.(`${block}\r`)).toEqual({ data: "\r" });
-  expect(harness.sent[1]).toEqual(["Report status\nthen stop", { deliverAs: "aside" }]);
+  // Busy: the aside is queued, so the ack goes at once. A person's Enter that arrived in the
+  // same read still reaches the editor.
+  const busyId = "fedcba9876543210fedcba9876543210";
+  expect(listener?.(`${instructionBlock(busyId, text)}\r`)).toEqual({ data: "\r" });
+  expect(harness.sent[1]).toEqual([text, { deliverAs: "aside" }]);
   await waitFor(() => acks().length === 2);
-  expect(acks()[1].params.delivered_as).toBe("aside");
+  expect(acks()[1].params).toMatchObject({ instruction_id: busyId, delivered_as: "aside" });
 
-  for (const ordinary of ["\x1b[200~herdr-instruction:v1:short\nx\x1b[201~", "\x1b[200~pasted\x1b[201~", "a", "\r"]) {
+  for (const ordinary of [
+    `\x1b[200~herdr-instruction:v1:${id}\nx\x1b[201~`,
+    "\x1b[200~herdr-instruction:v2:short:1:1\nx\x1b[201~",
+    "\x1b[200~pasted\x1b[201~",
+    "a",
+    "\r",
+  ]) {
     expect(listener?.(ordinary)).toBeUndefined();
   }
   expect(harness.sent).toHaveLength(2);
+  expect(harness.reports()).toHaveLength(2);
   expect(acks()).toHaveLength(2);
 });
 
-test("Oh My Pi registers a fresh instruction listener on every session switch", async () => {
+test("Oh My Pi drops a late or cut-short instruction unsent and keeps its listener reported", async () => {
+  let listener: TerminalInputHandler | undefined;
+  const harness = await installOmpWithTerminalInput("omp-instruct-drop", {
+    onTerminalInput(handler: TerminalInputHandler) {
+      listener = handler;
+      return () => {};
+    },
+  });
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  await waitFor(() => harness.reports().length === 1);
+
+  const id = "0123456789abcdef0123456789abcdef";
+  const late = instructionBlock(id, "too late", { expiresMs: Date.now() - 1 });
+  expect(listener?.(late)).toEqual({ consume: true });
+  await waitFor(() => harness.reports().length === 2);
+  // OMP ended the paste early: the header names more bytes than arrived.
+  const cut = instructionBlock(id, "first half", { byteLength: Buffer.byteLength("first half") + 40 });
+  expect(listener?.(`${cut}\r`)).toEqual({ data: "\r" });
+  await waitFor(() => harness.reports().length === 3);
+
+  expect(harness.sent).toEqual([]);
+  expect(instructionAcks(harness.requests)).toHaveLength(0);
+  expect(harness.reports().every((report) => report.params.accepts_instructions === true)).toBe(true);
+});
+
+test("Oh My Pi registers a fresh instruction listener on every session change and turn", async () => {
   const registered: TerminalInputHandler[] = [];
   let unsubscribed = 0;
   const harness = await installOmpWithTerminalInput("omp-instruct-switch", {
@@ -1121,13 +1176,23 @@ test("Oh My Pi registers a fresh instruction listener on every session switch", 
     },
   });
   await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
-  // OMP clears extension input listeners before /new or /resume emits session_switch.
+  // OMP clears extension input listeners before /new, /resume and branch changes, and some
+  // of those end without session_switch, so branch, tree and every turn start re-register.
   await harness.handlers.get("session_switch")?.({ reason: "new" }, harness.context);
-  await waitFor(() => harness.reports().length === 2);
+  await harness.handlers.get("session_branch")?.({}, harness.context);
+  await harness.handlers.get("session_tree")?.({}, harness.context);
+  await harness.handlers.get("agent_start")?.({}, harness.context);
+  await waitFor(() => harness.reports().length === 5);
 
-  expect(registered).toHaveLength(2);
-  expect(unsubscribed).toBe(1);
-  expect(harness.reports().map((report) => report.params.accepts_instructions)).toEqual([true, true]);
+  expect(registered).toHaveLength(5);
+  expect(unsubscribed).toBe(4);
+  expect(harness.reports().map((report) => report.params.accepts_instructions)).toEqual([
+    true,
+    true,
+    true,
+    true,
+    true,
+  ]);
 });
 
 test("Oh My Pi without terminal input support reports no instruction listener", async () => {

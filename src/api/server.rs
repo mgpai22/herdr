@@ -74,7 +74,9 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         agent_start_profile: true,
-        agent_instruct: true,
+        // Instructions need a live process incarnation (`observe_process`), which macOS and the
+        // fallback platforms lack; callers then keep using `agent.prompt`.
+        agent_instruct: cfg!(any(target_os = "linux", windows)),
     })
 }
 
@@ -1469,9 +1471,14 @@ mod tests {
     }
 
     #[test]
-    fn server_advertises_agent_start_profile() {
+    fn server_advertises_agent_start_profile_and_instruct_where_supported() {
         // `agent start --profile` refuses to run against a server without this flag.
-        assert!(default_capabilities().unwrap().agent_start_profile);
+        let capabilities = default_capabilities().unwrap();
+        assert!(capabilities.agent_start_profile);
+        assert_eq!(
+            capabilities.agent_instruct,
+            crate::platform::observe_process(std::process::id()).is_ok()
+        );
     }
 
     #[test]

@@ -13,10 +13,16 @@ use crate::app::App;
 use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+/// How long a written instruction waits for the OMP integration to confirm it.
 #[cfg(not(test))]
 pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(test)]
 pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_millis(200);
+/// The integration discards a block that reaches it later than this after it was written, so an
+/// unconfirmed instruction cannot arrive after the caller gave up on it. The rest of the ack
+/// timeout leaves time for OMP to start the turn and for the ack to come back.
+const INSTRUCTION_EXPIRY: Duration =
+    Duration::from_millis(INSTRUCTION_ACK_TIMEOUT.as_millis() as u64 / 2);
 
 /// An `agent.instruct` delivery written to the PTY and waiting for the OMP integration ack.
 pub(crate) struct PendingInstructionAck {
@@ -24,6 +30,20 @@ pub(crate) struct PendingInstructionAck {
     pub(super) owner: crate::platform::OwnerProcessIncarnation,
     pub(super) tx: std::sync::mpsc::Sender<InstructionDelivery>,
     pub(super) deadline: Instant,
+    /// Cleared when the integration reports its listener after this delivery was written: the
+    /// listener then exists, even if this one delivery was never confirmed.
+    pub(super) withdraws_listener: bool,
+}
+
+/// The marked paste the OMP integration consumes: `v2:<id>:<expires unix ms>:<text bytes>`.
+fn instruction_block(instruction_id: &str, text: &str) -> String {
+    let expires_ms = (std::time::SystemTime::now() + INSTRUCTION_EXPIRY)
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    format!(
+        "\x1b[200~herdr-instruction:v2:{instruction_id}:{expires_ms}:{}\n{text}\x1b[201~",
+        text.len()
+    )
 }
 
 fn new_instruction_id(request_id: &str, terminal_id: &str) -> String {
@@ -153,6 +173,7 @@ impl App {
         params: AgentInstructParams,
         respond_to: &std::sync::mpsc::Sender<String>,
     ) -> Result<(), String> {
+        self.expire_instruction_acks();
         self.reconcile_managed_agent_target(&params.target);
         let agent = self
             .agent_info_for_target(&params.target)
@@ -197,18 +218,22 @@ impl App {
         if launch_pending || !runtime.bracketed_paste_enabled() {
             return Err(agent_not_ready(id, &params.target));
         }
+        if super::super::agents::owner_child_reads_tty(runtime, owner.pid) {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!(
+                    "agent {} has handed the terminal to another program, such as an external editor",
+                    params.target
+                ),
+            ));
+        }
         let instruction_id = new_instruction_id(&id, terminal_id.as_str());
-        let block = format!(
-            "\x1b[200~herdr-instruction:v1:{instruction_id}\n{}\x1b[201~",
-            params.text
-        );
+        let block = instruction_block(&instruction_id, &params.text);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(block)) {
             return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
         }
         // Acks are handled by this app loop after this step, so registering now misses none.
-        let now = Instant::now();
-        self.pending_instruction_acks
-            .retain(|_, pending| pending.deadline > now);
         let (tx, rx) = std::sync::mpsc::channel();
         self.pending_instruction_acks.insert(
             instruction_id.clone(),
@@ -216,7 +241,8 @@ impl App {
                 terminal_id,
                 owner,
                 tx,
-                deadline: now + INSTRUCTION_ACK_TIMEOUT,
+                deadline: Instant::now() + INSTRUCTION_ACK_TIMEOUT,
+                withdraws_listener: true,
             },
         );
         let respond_to = respond_to.clone();
@@ -234,13 +260,35 @@ impl App {
                     id,
                     "instruction_unconfirmed",
                     format!(
-                        "instruction {instruction_id} was written but OMP did not confirm it; do not resend before reading the transcript"
+                        "instruction {instruction_id} was not confirmed; OMP discards it if it reaches OMP after {} ms, read the transcript before sending it again",
+                        INSTRUCTION_EXPIRY.as_millis()
                     ),
                 ),
             };
             let _ = respond_to.send(response);
         });
         Ok(())
+    }
+
+    /// Drops deliveries whose ack time has passed. An unconfirmed delivery may mean the listener
+    /// is gone (OMP dropped it on a session change or an exec restart), so the agent stops
+    /// accepting instructions until the integration reports its listener again. At most one
+    /// block can then reach the editor.
+    fn expire_instruction_acks(&mut self) {
+        let now = Instant::now();
+        let terminals = &mut self.state.terminals;
+        self.pending_instruction_acks.retain(|_, pending| {
+            if pending.deadline > now {
+                return true;
+            }
+            if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
+                pending.withdraws_listener
+                    && terminal.instruction_listener.as_ref() == Some(&pending.owner)
+            }) {
+                terminal.instruction_listener = None;
+            }
+            false
+        });
     }
 
     fn queue_agent_prompt(
@@ -588,12 +636,28 @@ mod tests {
     fn guarded_fixture(
         state: AgentState,
     ) -> (App, AgentInstructParams, tokio::sync::mpsc::Receiver<Bytes>) {
-        let mut app = app_with_agent();
-        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
-        let terminal_id = fixture_terminal_id(&app);
         let owner = crate::platform::observe_process(std::process::id())
             .unwrap()
             .unwrap();
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        let (app, params) = guarded_app(state, owner, runtime);
+        (app, params, rx)
+    }
+
+    /// An OMP pane whose registered owner and instruction listener is `owner`, on `runtime`.
+    #[cfg(any(target_os = "linux", windows))]
+    fn guarded_app(
+        state: AgentState,
+        owner: crate::platform::OwnerProcessIncarnation,
+        runtime: crate::terminal::TerminalRuntime,
+    ) -> (App, AgentInstructParams) {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = fixture_terminal_id(&app);
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         terminal.cwd = "/fixture/project".into();
         terminal.set_agent_name("director".into());
@@ -603,14 +667,8 @@ mod tests {
                 "herdr:omp".into(),
                 "omp".into(),
                 Some(
-                    crate::agent_resume::AgentSessionRef::path(
-                        std::env::current_dir()
-                            .unwrap()
-                            .join("omp-native.jsonl")
-                            .display()
-                            .to_string(),
-                    )
-                    .expect("fixture session path is absolute on the host platform"),
+                    crate::agent_resume::AgentSessionRef::path(fixture_session_path())
+                        .expect("fixture session path is absolute on the host platform"),
                 ),
                 Some(1),
                 Some("startup".into()),
@@ -618,11 +676,6 @@ mod tests {
             )
             .is_some());
         terminal.instruction_listener = Some(owner);
-        let (runtime, rx) =
-            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                80, 24, 0, b"", 4,
-            );
-        runtime.test_process_pty_bytes(b"\x1b[?2004h");
         app.state.insert_test_runtime(pane_id, runtime);
         let public_pane = app.public_pane_id(0, pane_id).unwrap();
         let info = app.agent_info_for_target(&public_pane).unwrap();
@@ -636,9 +689,41 @@ mod tests {
             expected_session: info.agent_session.unwrap().value,
             expected_runtime_id: info.runtime_id.unwrap(),
             expected_workspace_id: info.workspace_id,
-            expected_cwd: info.cwd.unwrap(),
+            // The foreground cwd of a real pane is its process cwd, not the fixture cwd.
+            expected_cwd: info.foreground_cwd.or(info.cwd).unwrap(),
         };
-        (app, params, rx)
+        (app, params)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn fixture_session_path() -> String {
+        std::env::current_dir()
+            .unwrap()
+            .join("omp-native.jsonl")
+            .display()
+            .to_string()
+    }
+
+    /// A v2 session report from this test process, as the OMP integration sends it.
+    #[cfg(any(target_os = "linux", windows))]
+    fn report_session(app: &mut App, target: &str, seq: u64, accepts_instructions: bool) -> String {
+        let pid = std::process::id();
+        app.handle_pane_report_agent_session_v2(
+            "v2".into(),
+            crate::api::schema::PaneReportAgentSessionV2Params {
+                pane_id: target.into(),
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                seq: Some(seq),
+                agent_session_id: None,
+                agent_session_path: Some(fixture_session_path()),
+                session_start_source: Some("startup".into()),
+                launch_profile: "default".into(),
+                agent_pid: pid,
+                accepts_instructions,
+                peer_pid: Some(pid),
+            },
+        )
     }
 
     #[cfg(any(target_os = "linux", windows))]
@@ -673,19 +758,37 @@ mod tests {
     fn sent_instruction_id(rx: &mut tokio::sync::mpsc::Receiver<Bytes>, text: &str) -> String {
         let bytes = rx.try_recv().expect("the instruction was written");
         let written = std::str::from_utf8(&bytes).unwrap();
-        let id = written
-            .strip_prefix("\x1b[200~herdr-instruction:v1:")
-            .expect("marked paste")[..32]
-            .to_string();
-        assert!(id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        let header = written
+            .strip_prefix("\x1b[200~herdr-instruction:v2:")
+            .and_then(|rest| rest.split_once('\n'))
+            .expect("marked paste")
+            .0;
+        let [id, expires_ms, length] = header.split(':').collect::<Vec<_>>()[..] else {
+            panic!("header {header:?}");
+        };
+        assert!(
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        // Expires within the ack timeout, so a block OMP reads late is discarded unanswered.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let expires_ms: u128 = expires_ms.parse().unwrap();
+        assert!(
+            expires_ms > now_ms - 1000
+                && expires_ms <= now_ms + INSTRUCTION_ACK_TIMEOUT.as_millis()
+        );
+        assert_eq!(length, text.len().to_string());
         assert_eq!(
             written,
-            format!("\x1b[200~herdr-instruction:v1:{id}\n{text}\x1b[201~")
+            format!("\x1b[200~herdr-instruction:v2:{header}\n{text}\x1b[201~")
         );
         assert!(rx.try_recv().is_err(), "nothing follows the paste");
-        id
+        id.to_string()
     }
 
     #[cfg(any(target_os = "linux", windows))]
@@ -725,10 +828,12 @@ mod tests {
             (AgentState::Idle, InstructionDelivery::Prompt),
             (AgentState::Blocked, InstructionDelivery::Aside),
         ] {
-            let (mut app, p, mut rx) = guarded_fixture(state);
+            let (mut app, mut p, mut rx) = guarded_fixture(state);
+            // The header counts UTF-8 bytes, which the integration compares with what arrived.
+            p.text = "Report état".into();
             let target = p.target.clone();
             let response = start_instruct(&mut app, p);
-            let id = sent_instruction_id(&mut rx, "Report current status");
+            let id = sent_instruction_id(&mut rx, "Report état");
             assert!(response.try_recv().is_err(), "answered before the ack");
             let acked = ack(&mut app, &target, &id, (pid, pid), delivered_as);
             assert!(serde_json::from_str::<SuccessResponse>(&acked).is_ok());
@@ -941,6 +1046,195 @@ mod tests {
         );
         assert!(serde_json::from_str::<SuccessResponse>(&acked).is_ok());
         assert!(response.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn wait_unconfirmed(response: std::sync::mpsc::Receiver<String>) {
+        let response = response
+            .recv_timeout(INSTRUCTION_ACK_TIMEOUT + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(error_code(&response), "instruction_unconfirmed");
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn unconfirmed_delivery_withdraws_the_listener_until_the_integration_reports_again() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        // OMP dropped its listener without telling herdr: the block is never acked.
+        wait_unconfirmed(start_instruct(&mut app, p.clone()));
+        sent_instruction_id(&mut rx, "Report current status");
+        assert_eq!(
+            instruct_error(&mut app, p.clone()),
+            "agent_instruction_unsupported"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "at most one block reaches the editor"
+        );
+        assert!(
+            !app.agent_info_for_target(&target)
+                .unwrap()
+                .accepts_instructions
+        );
+
+        let reported = report_session(&mut app, &target, 10, true);
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert!(
+            app.agent_info_for_target(&target)
+                .unwrap()
+                .accepts_instructions
+        );
+        let _response = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn a_listener_reported_after_a_delivery_outlives_that_delivery() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let response = start_instruct(&mut app, p.clone());
+        sent_instruction_id(&mut rx, "Report current status");
+        // The integration dropped this block (late or cut short) and reported its listener.
+        let reported = report_session(&mut app, &target, 10, true);
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        wait_unconfirmed(response);
+        let _response = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn session_reports_grant_and_withdraw_the_instruction_listener() {
+        let (mut app, p, _rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target;
+        let accepts = |app: &App| {
+            app.agent_info_for_target(&target)
+                .unwrap()
+                .accepts_instructions
+        };
+        // An integration without a listener (v11, or no terminal input) withdraws it.
+        let reported = report_session(&mut app, &target, 10, false);
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert!(!accepts(&app));
+        let reported = report_session(&mut app, &target, 11, true);
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert!(accepts(&app));
+        // A rejected report changes nothing.
+        assert_eq!(
+            error_code(&report_session(&mut app, &target, 11, false)),
+            "stale_report"
+        );
+        assert!(accepts(&app));
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn late_or_misdirected_instruction_acks_are_not_found() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let response = start_instruct(&mut app, p);
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        let pending = app.pending_instruction_acks.get_mut(&id).unwrap();
+        let terminal_id = std::mem::replace(
+            &mut pending.terminal_id,
+            crate::terminal::TerminalId::alloc(),
+        );
+        let misdirected = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionDelivery::Prompt,
+        );
+        assert_eq!(error_code(&misdirected), "instruction_not_found");
+        let pending = app.pending_instruction_acks.get_mut(&id).unwrap();
+        pending.terminal_id = terminal_id;
+        pending.deadline = Instant::now() - Duration::from_millis(1);
+        let late = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionDelivery::Prompt,
+        );
+        assert_eq!(error_code(&late), "instruction_not_found");
+        wait_unconfirmed(response);
+    }
+
+    /// OMP's external editor (Ctrl+G) is a child of OMP in its foreground job that reads the
+    /// pane; a paste would land in the person's file. `cat` plays the editor here.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_instruct_refuses_while_a_child_of_the_agent_reads_the_terminal() {
+        let pane_id = app_with_agent().state.workspaces[0].tabs[0].root_pane;
+        let (events, _events_rx) = tokio::sync::mpsc::channel(32);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            0,
+            Default::default(),
+            None,
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        let owner_pid = runtime.child_pid().unwrap();
+        // The pane shell becomes the "agent"; its child `cat` reads the terminal, then the agent
+        // replaces itself with `sleep` (same process incarnation) once `cat` ends.
+        runtime
+            .try_send_bytes(Bytes::from_static(
+                b"printf '\\033[?2004h'; exec sh -c 'cat; exec sleep 30'\n",
+            ))
+            .unwrap();
+        let job_size =
+            || crate::detect::foreground_job(owner_pid).map_or(0, |job| job.processes.len());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (job_size() != 2 || !runtime.bracketed_paste_enabled()) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(job_size(), 2, "the agent and its tty-reading child");
+        let owner = crate::platform::observe_process(owner_pid)
+            .unwrap()
+            .unwrap();
+        let (mut app, p) = guarded_app(AgentState::Idle, owner, runtime);
+        let response = instruct_error(&mut app, p.clone());
+        assert_eq!(response, "agent_not_ready");
+
+        let editor = crate::detect::foreground_job(owner_pid)
+            .unwrap()
+            .processes
+            .into_iter()
+            .find(|process| process.pid != owner_pid)
+            .unwrap()
+            .pid;
+        unsafe { libc::kill(editor as i32, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job_size() != 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // With the terminal back, the same agent gets the paste (and no ack: unconfirmed).
+        wait_unconfirmed(start_instruct(&mut app, p));
+        unsafe { libc::kill(owner_pid as i32, libc::SIGKILL) };
     }
 
     #[test]

@@ -100,11 +100,32 @@ let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
 let registeredSessionKey: string | undefined;
 const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() || "default";
-// A herdr `agent.instruct` delivery: one bracketed paste with a marker line and no Enter.
-// OMP hands a paste to input listeners as one string, plus an Enter typed in the same read.
-const INSTRUCTION = /^\x1b\[200~herdr-instruction:v1:([0-9a-f]{32})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+// A herdr `agent.instruct` delivery: one bracketed paste with no Enter. The header carries the
+// instruction id, the unix ms after which the block must be discarded, and the text's UTF-8
+// byte length. OMP hands a paste to input listeners as one string, plus an Enter typed in the
+// same read.
+const INSTRUCTION =
+  /^\x1b\[200~herdr-instruction:v2:([0-9a-f]{32}):(\d+):(\d+)\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+// How long an idle delivery waits for OMP to start its turn. herdr stops waiting much earlier;
+// a later ack only gets instruction_not_found.
+const admissionWaitMs = 30_000;
 let instructionListener = false;
 let unsubscribeInstructions: (() => void) | undefined;
+// Idle deliveries handed to OMP, acked once OMP starts a turn with their text.
+let awaitingAdmission: { instructionId: string; text: string; until: number }[] = [];
+
+function ackInstruction(instructionId: string, deliveredAs: "prompt" | "aside"): void {
+  void sendRequest(() => ({
+    id: `${source}:instruction:${instructionId}:${Date.now()}`,
+    method: "pane.ack_instruction",
+    params: {
+      pane_id: paneId,
+      instruction_id: instructionId,
+      agent_pid: process.pid,
+      delivered_as: deliveredAs,
+    },
+  }));
+}
 
 function nextReportSeq(): number {
   reportSeq += 1;
@@ -385,27 +406,50 @@ export default function (pi) {
     if (!match) {
       return undefined;
     }
-    const [, instructionId, text, enter] = match;
+    const [, instructionId, expiresMs, byteLength, text, enter] = match;
     const rest = enter ? { data: enter } : { consume: true };
+    // herdr has given up on a late block, and a paste OMP cut short is not the whole text: drop
+    // both, unsent and unacked. The report tells herdr that the listener still exists.
+    if (Date.now() > Number(expiresMs) || Buffer.byteLength(text, "utf8") !== Number(byteLength)) {
+      void reportSession();
+      return rest;
+    }
     const idle = ctx?.isIdle?.() === true;
     try {
-      // Not awaited: an idle send resolves only after the whole turn.
-      pi.sendUserMessage(text, idle ? undefined : { deliverAs: "aside" })?.catch?.(() => {});
+      // Always an aside: if a turn starts before OMP dispatches the text, it waits for the next
+      // step instead of becoming a steer that aborts the running tool batch; on an idle session
+      // an aside starts a turn. Not awaited: an idle send resolves only after the whole turn.
+      pi.sendUserMessage(text, { deliverAs: "aside" })?.catch?.(() => {});
     } catch {
       // No ack: the caller reports the delivery as unconfirmed.
       return rest;
     }
-    void sendRequest(() => ({
-      id: `${source}:instruction:${instructionId}:${Date.now()}`,
-      method: "pane.ack_instruction",
-      params: {
-        pane_id: paneId,
-        instruction_id: instructionId,
-        agent_pid: process.pid,
-        delivered_as: idle ? "prompt" : "aside",
-      },
-    }));
+    if (!idle) {
+      ackInstruction(instructionId, "aside");
+      return rest;
+    }
+    // OMP shows a failed idle send (no model, no API key, an abort) only on screen, so the ack
+    // waits until a turn starts with this text. Reporting now keeps herdr from withdrawing the
+    // listener if that never happens.
+    const now = Date.now();
+    awaitingAdmission = awaitingAdmission.filter((entry) => entry.until > now);
+    awaitingAdmission.push({ instructionId, text, until: now + admissionWaitMs });
+    void reportSession();
     return rest;
+  }
+
+  function registerInstructionListener(ctx: {
+    isIdle?: () => boolean;
+    ui?: { onTerminalInput?: (handler: (data: string) => unknown) => unknown };
+  }) {
+    // OMP drops extension input listeners on every session change (/new, /resume, branch,
+    // reload), sometimes without a session event, so each activation and each turn start
+    // registers a fresh one.
+    unsubscribeInstructions?.();
+    unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) =>
+      takeInstruction(ctx, data),
+    );
+    instructionListener = typeof unsubscribeInstructions === "function";
   }
 
   function activateRootSession(ctx: any, sessionStartSource = "startup"): boolean {
@@ -413,13 +457,7 @@ export default function (pi) {
       return false;
     }
     rootSession = true;
-    // OMP drops extension input listeners on every session switch (/new, /resume, ...) and
-    // on reload, so each activation registers a fresh one before the report claims it.
-    unsubscribeInstructions?.();
-    unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) =>
-      takeInstruction(ctx, data),
-    );
-    instructionListener = typeof unsubscribeInstructions === "function";
+    registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
     return true;
@@ -469,6 +507,35 @@ export default function (pi) {
     publishState(true);
   });
 
+  // Branch and tree navigation end without session_switch, after OMP dropped the listener.
+  for (const event of ["session_branch", "session_tree"]) {
+    pi.on(event, (_event, ctx) => {
+      activateRootSession(ctx, "branch");
+    });
+  }
+
+  pi.on("message_start", (event) => {
+    const message = event?.message;
+    if (awaitingAdmission.length === 0 || message?.role !== "user") {
+      return;
+    }
+    const content = message.content;
+    const text =
+      typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content
+              .filter((part) => part?.type === "text")
+              .map((part) => part.text)
+              .join("\n")
+          : undefined;
+    const now = Date.now();
+    const index = awaitingAdmission.findIndex((entry) => entry.text === text && entry.until > now);
+    if (index >= 0) {
+      ackInstruction(awaitingAdmission.splice(index, 1)[0].instructionId, "prompt");
+    }
+  });
+
   pi.on("session_switch", (event, ctx) => {
     if (!activateRootSession(ctx, event?.reason || "resume")) {
       return;
@@ -484,6 +551,7 @@ export default function (pi) {
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
+    registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession();
     clearPendingTimers();
@@ -561,5 +629,6 @@ export default function (pi) {
     unsubscribeInstructions?.();
     unsubscribeInstructions = undefined;
     instructionListener = false;
+    awaitingAdmission = [];
   });
 }
