@@ -104,6 +104,11 @@ pub enum ResponseResult {
     AgentPrompted {
         agent: AgentInfo,
     },
+    AgentInstructed {
+        agent: AgentInfo,
+        instruction_id: String,
+        delivered_as: super::panes::InstructionDelivery,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

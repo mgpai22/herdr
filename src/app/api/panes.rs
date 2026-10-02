@@ -1683,20 +1683,7 @@ impl App {
                 )
             }
         };
-        #[cfg(not(windows))]
-        let is_foreground_member = runtime
-            .child_pid()
-            .and_then(crate::detect::foreground_job)
-            .is_some_and(|job| {
-                job.processes
-                    .iter()
-                    .any(|process| process.pid == params.agent_pid)
-            });
-        #[cfg(windows)]
-        let is_foreground_member = runtime.child_pid().is_some_and(|child_pid| {
-            crate::platform::foreground_job_includes_process(child_pid, params.agent_pid)
-        });
-        if !is_foreground_member {
+        if !super::super::agents::owner_in_foreground_job(runtime, params.agent_pid) {
             return encode_error(
                 id,
                 "process_mismatch",
@@ -1773,6 +1760,10 @@ impl App {
         if !applied {
             return encode_error(id, "report_rejected", "OMP session report was rejected");
         }
+        // A report without the listener flag (integration v11 or no UI) withdraws it.
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.instruction_listener = params.accepts_instructions.then_some(owner_after);
+        }
         if let Some(requested) = self
             .state
             .terminals
@@ -1787,6 +1778,56 @@ impl App {
                 reported = %profile,
                 "OMP reported a launch profile other than the one agent.start requested"
             );
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Accepts the OMP integration's confirmation for a pending `agent.instruct` delivery only
+    /// from the exact process incarnation the instruction was written to.
+    pub(super) fn handle_pane_ack_instruction(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneAckInstructionParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| &pane.attached_terminal_id);
+        let Some(pending) = self
+            .pending_instruction_acks
+            .get(&params.instruction_id)
+            .filter(|pending| {
+                pending.deadline > std::time::Instant::now()
+                    && Some(&pending.terminal_id) == terminal_id
+            })
+        else {
+            return encode_error(
+                id,
+                "instruction_not_found",
+                "no pending instruction with this id for this pane",
+            );
+        };
+        if params.peer_pid != Some(params.agent_pid)
+            || params.agent_pid != pending.owner.pid
+            || crate::platform::observe_process(params.agent_pid)
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(&pending.owner)
+        {
+            return encode_error(
+                id,
+                "process_mismatch",
+                "the acknowledging process is not the instructed OMP process",
+            );
+        }
+        if let Some(pending) = self.pending_instruction_acks.remove(&params.instruction_id) {
+            let _ = pending.tx.send(params.delivered_as);
         }
         encode_success(id, ResponseResult::Ok {})
     }

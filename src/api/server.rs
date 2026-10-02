@@ -74,6 +74,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         agent_start_profile: true,
+        agent_instruct: true,
     })
 }
 
@@ -274,8 +275,10 @@ fn handle_connection_with_stop(
             return Ok(());
         }
     };
-    if let Method::PaneReportAgentSessionV2(params) = &mut request.method {
-        params.peer_pid = peer_pid;
+    match &mut request.method {
+        Method::PaneReportAgentSessionV2(params) => params.peer_pid = peer_pid,
+        Method::PaneAckInstruction(params) => params.peer_pid = peer_pid,
+        _ => {}
     }
 
     let request_id = request.id.clone();
@@ -545,6 +548,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentInstruct(_) => "agent.instruct",
+        Method::PaneAckInstruction(_) => "pane.ack_instruction",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -1453,6 +1457,7 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 agent_start_profile: true,
+                agent_instruct: true,
             }),
             None,
             None,

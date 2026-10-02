@@ -1,16 +1,45 @@
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentInstructParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
+    AgentStartParams, AgentTarget, InstructionDelivery, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
+#[cfg(not(test))]
+pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(test)]
+pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// An `agent.instruct` delivery written to the PTY and waiting for the OMP integration ack.
+pub(crate) struct PendingInstructionAck {
+    pub(super) terminal_id: crate::terminal::TerminalId,
+    pub(super) owner: crate::platform::OwnerProcessIncarnation,
+    pub(super) tx: std::sync::mpsc::Sender<InstructionDelivery>,
+    pub(super) deadline: Instant,
+}
+
+fn new_instruction_id(request_id: &str, terminal_id: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let digest = Sha256::digest(format!(
+        "{request_id}\0{terminal_id}\0{}\0{nanos}",
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
@@ -87,32 +116,10 @@ impl App {
         let params = match request.method {
             crate::api::schema::Method::AgentPrompt(params) => params,
             crate::api::schema::Method::AgentInstruct(params) => {
-                // This runs in the server-owned app loop immediately before queueing
-                // the submission. No read/submit socket round trip can retarget it.
-                self.reconcile_managed_agent_target(&params.target);
-                let agent = match self.agent_info_for_target(&params.target) {
-                    Ok(agent) => agent,
-                    Err(err) => {
-                        let _ = respond_to.send(encode_error_body(
-                            request.id,
-                            self.agent_target_error_body(err),
-                        ));
-                        return true;
-                    }
-                };
-                if let Err(code) = params.validate(&agent) {
-                    let _ = respond_to.send(encode_error(
-                        request.id,
-                        code,
-                        "instruction refused before submission",
-                    ));
-                    return true;
+                if let Err(response) = self.instruct_agent(request.id, params, &respond_to) {
+                    let _ = respond_to.send(response);
                 }
-                AgentPromptParams {
-                    target: params.target,
-                    text: params.text,
-                    wait: None,
-                }
+                return true;
             }
             _ => return false,
         };
@@ -135,6 +142,105 @@ impl App {
             }
         }
         true
+    }
+
+    /// Checks identity and writes the marked paste in one app-loop step, so no other request
+    /// can retarget the pane in between. The OMP integration consumes the paste before the
+    /// editor or any dialog sees it and acks over the socket; a waiter thread answers then.
+    fn instruct_agent(
+        &mut self,
+        id: String,
+        params: AgentInstructParams,
+        respond_to: &std::sync::mpsc::Sender<String>,
+    ) -> Result<(), String> {
+        self.reconcile_managed_agent_target(&params.target);
+        let agent = self
+            .agent_info_for_target(&params.target)
+            .map_err(|err| encode_error_body(id.clone(), self.agent_target_error_body(err)))?;
+        params
+            .validate(&agent)
+            .map_err(|code| encode_error(id.clone(), code, "instruction refused before sending"))?;
+        if !agent.accepts_instructions {
+            return Err(encode_error(
+                id,
+                "agent_instruction_unsupported",
+                "the agent process has no herdr instruction listener (OMP integration v12)",
+            ));
+        }
+        let resolved = self
+            .resolve_agent_target(&params.target)
+            .map_err(|err| encode_error_body(id.clone(), self.agent_target_error_body(err)))?;
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+        else {
+            return Err(agent_not_found(id, &params.target));
+        };
+        let Some(owner) = terminal.instruction_listener.clone() else {
+            return Err(agent_not_found(id, &params.target));
+        };
+        let terminal_id = terminal.id.clone();
+        let launch_pending = terminal.managed_agent_launch_pending();
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.target));
+        };
+        if !super::super::agents::owner_in_foreground_job(runtime, owner.pid) {
+            return Err(encode_error(
+                id,
+                "agent_identity_changed",
+                "the registered agent process is not the pane foreground job",
+            ));
+        }
+        if launch_pending || !runtime.bracketed_paste_enabled() {
+            return Err(agent_not_ready(id, &params.target));
+        }
+        let instruction_id = new_instruction_id(&id, terminal_id.as_str());
+        let block = format!(
+            "\x1b[200~herdr-instruction:v1:{instruction_id}\n{}\x1b[201~",
+            params.text
+        );
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(block)) {
+            return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
+        }
+        // Acks are handled by this app loop after this step, so registering now misses none.
+        let now = Instant::now();
+        self.pending_instruction_acks
+            .retain(|_, pending| pending.deadline > now);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending_instruction_acks.insert(
+            instruction_id.clone(),
+            PendingInstructionAck {
+                terminal_id,
+                owner,
+                tx,
+                deadline: now + INSTRUCTION_ACK_TIMEOUT,
+            },
+        );
+        let respond_to = respond_to.clone();
+        std::thread::spawn(move || {
+            let response = match rx.recv_timeout(INSTRUCTION_ACK_TIMEOUT) {
+                Ok(delivered_as) => encode_success(
+                    id,
+                    ResponseResult::AgentInstructed {
+                        agent,
+                        instruction_id,
+                        delivered_as,
+                    },
+                ),
+                Err(_) => encode_error(
+                    id,
+                    "instruction_unconfirmed",
+                    format!(
+                        "instruction {instruction_id} was written but OMP did not confirm it; do not resend before reading the transcript"
+                    ),
+                ),
+            };
+            let _ = respond_to.send(response);
+        });
+        Ok(())
     }
 
     fn queue_agent_prompt(
@@ -468,18 +574,26 @@ mod tests {
             .expect("agent prompt responds after submission")
     }
 
+    #[cfg(any(target_os = "linux", windows))]
+    fn fixture_terminal_id(app: &App) -> crate::terminal::TerminalId {
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone()
+    }
+
+    /// An OMP pane registered by this test process, which stands in for the live OMP owner
+    /// whose integration listens for instructions, with bracketed paste on.
+    #[cfg(any(target_os = "linux", windows))]
     fn guarded_fixture(
         state: AgentState,
-    ) -> (
-        App,
-        crate::api::schema::AgentInstructParams,
-        tokio::sync::mpsc::Receiver<Bytes>,
-    ) {
+    ) -> (App, AgentInstructParams, tokio::sync::mpsc::Receiver<Bytes>) {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
-        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
-            .attached_terminal_id
-            .clone();
+        let terminal_id = fixture_terminal_id(&app);
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         terminal.cwd = "/fixture/project".into();
         terminal.set_agent_name("director".into());
@@ -500,25 +614,24 @@ mod tests {
                 ),
                 Some(1),
                 Some("startup".into()),
-                Some((
-                    "default".into(),
-                    crate::platform::OwnerProcessIncarnation {
-                        pid: 100,
-                        boot_id: "fixture-boot".into(),
-                        start_time_ticks: 10,
-                    }
-                )),
+                Some(("default".into(), owner.clone())),
             )
             .is_some());
-        let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        terminal.instruction_listener = Some(owner);
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 4,
+            );
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
         app.state.insert_test_runtime(pane_id, runtime);
         let public_pane = app.public_pane_id(0, pane_id).unwrap();
         let info = app.agent_info_for_target(&public_pane).unwrap();
-        let params = crate::api::schema::AgentInstructParams {
+        assert!(info.accepts_instructions);
+        let params = AgentInstructParams {
             target: public_pane,
             text: "Report current status".into(),
             expected_terminal_id: info.terminal_id,
-            expected_name: info.name.unwrap(),
+            expected_name: info.name,
             expected_agent: info.agent.unwrap(),
             expected_session: info.agent_session.unwrap().value,
             expected_runtime_id: info.runtime_id.unwrap(),
@@ -528,7 +641,11 @@ mod tests {
         (app, params, rx)
     }
 
-    fn instruct(app: &mut App, params: crate::api::schema::AgentInstructParams) -> String {
+    #[cfg(any(target_os = "linux", windows))]
+    fn start_instruct(
+        app: &mut App,
+        params: AgentInstructParams,
+    ) -> std::sync::mpsc::Receiver<String> {
         let (tx, rx) = std::sync::mpsc::channel();
         assert!(app.handle_deferred_agent_api_request(
             crate::api::schema::Request {
@@ -537,79 +654,195 @@ mod tests {
             },
             tx
         ));
-        rx.recv_timeout(Duration::from_secs(1)).unwrap()
+        rx
     }
 
+    #[cfg(any(target_os = "linux", windows))]
+    fn instruct_error(app: &mut App, params: AgentInstructParams) -> String {
+        let response = start_instruct(app, params)
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            .unwrap()
+            .error
+            .code
+    }
+
+    /// The single write is the marked paste with no Enter; returns its instruction id.
+    #[cfg(any(target_os = "linux", windows))]
+    fn sent_instruction_id(rx: &mut tokio::sync::mpsc::Receiver<Bytes>, text: &str) -> String {
+        let bytes = rx.try_recv().expect("the instruction was written");
+        let written = std::str::from_utf8(&bytes).unwrap();
+        let id = written
+            .strip_prefix("\x1b[200~herdr-instruction:v1:")
+            .expect("marked paste")[..32]
+            .to_string();
+        assert!(id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert_eq!(
+            written,
+            format!("\x1b[200~herdr-instruction:v1:{id}\n{text}\x1b[201~")
+        );
+        assert!(rx.try_recv().is_err(), "nothing follows the paste");
+        id
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn ack(
+        app: &mut App,
+        target: &str,
+        instruction_id: &str,
+        (peer_pid, agent_pid): (u32, u32),
+        delivered_as: InstructionDelivery,
+    ) -> String {
+        app.handle_pane_ack_instruction(
+            "ack".into(),
+            crate::api::schema::PaneAckInstructionParams {
+                pane_id: target.into(),
+                instruction_id: instruction_id.into(),
+                agent_pid,
+                delivered_as,
+                peer_pid: Some(peer_pid),
+            },
+        )
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn error_code(response: &str) -> String {
+        serde_json::from_str::<crate::api::schema::ErrorResponse>(response)
+            .unwrap()
+            .error
+            .code
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
-    async fn agent_instruct_checks_every_identity_field_before_writing() {
-        for field in 0..7 {
-            let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
-            match field {
-                0 => p.expected_terminal_id = "other-terminal".into(),
-                1 => p.expected_name = "other-name".into(),
-                2 => p.expected_agent = "other-agent".into(),
-                3 => p.expected_session = "restarted-session".into(),
-                4 => p.expected_workspace_id = "other-workspace".into(),
-                5 => p.expected_cwd = "/other/project".into(),
-                _ => p.expected_runtime_id = "previous-process".into(),
-            }
-            let error: crate::api::schema::ErrorResponse =
-                serde_json::from_str(&instruct(&mut app, p)).unwrap();
-            assert_eq!(error.error.code, "agent_identity_changed");
-            assert!(rx.try_recv().is_err());
+    async fn agent_instruct_delivers_marked_paste_and_answers_after_owner_ack() {
+        let pid = std::process::id();
+        // A blocked agent is not refused: OMP queues the message behind its dialog.
+        for (state, delivered_as) in [
+            (AgentState::Idle, InstructionDelivery::Prompt),
+            (AgentState::Blocked, InstructionDelivery::Aside),
+        ] {
+            let (mut app, p, mut rx) = guarded_fixture(state);
+            let target = p.target.clone();
+            let response = start_instruct(&mut app, p);
+            let id = sent_instruction_id(&mut rx, "Report current status");
+            assert!(response.try_recv().is_err(), "answered before the ack");
+            let acked = ack(&mut app, &target, &id, (pid, pid), delivered_as);
+            assert!(serde_json::from_str::<SuccessResponse>(&acked).is_ok());
+            let success: SuccessResponse =
+                serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap())
+                    .unwrap();
+            let ResponseResult::AgentInstructed {
+                agent,
+                instruction_id,
+                delivered_as: answered,
+            } = success.result
+            else {
+                panic!("expected agent_instructed");
+            };
+            assert_eq!(instruction_id, id);
+            assert_eq!(answered, delivered_as);
+            assert_eq!(agent.name.as_deref(), Some("director"));
+            // The ack is consumed, so a replay cannot answer anything.
+            let replay = ack(&mut app, &target, &id, (pid, pid), delivered_as);
+            assert_eq!(error_code(&replay), "instruction_not_found");
         }
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
-    async fn agent_instruct_refuses_same_session_after_process_restart() {
-        let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
-        let terminal_id = app.state.workspaces[0].tabs[0]
-            .panes
-            .values()
-            .next()
+    async fn agent_instruct_without_ack_is_unconfirmed() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Working);
+        let response = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+        let response = response
+            .recv_timeout(INSTRUCTION_ACK_TIMEOUT + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(error_code(&response), "instruction_unconfirmed");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn agent_instruct_refuses_process_without_listener() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        // A v11 integration registers the process without the listener flag.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
             .unwrap()
-            .attached_terminal_id
-            .clone();
-        assert!(app
+            .instruction_listener = None;
+        let info = app.agent_info_for_target(&p.target).unwrap();
+        assert!(!info.accepts_instructions);
+        assert_eq!(info.runtime_id.as_ref(), Some(&p.expected_runtime_id));
+        assert_eq!(instruct_error(&mut app, p), "agent_instruction_unsupported");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn agent_instruct_refuses_stale_owner() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        // herdr missed the exit: the saved owner names a process incarnation that is gone.
+        let saved = app
             .state
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_agent_session_ref_for_session_start_with_recovery(
-                "herdr:omp".into(),
-                "omp".into(),
-                crate::agent_resume::AgentSessionRef::path(&p.expected_session),
-                Some(2),
-                Some("resume".into()),
-                Some((
-                    "default".into(),
-                    crate::platform::OwnerProcessIncarnation {
-                        pid: 100,
-                        boot_id: "fixture-boot".into(),
-                        start_time_ticks: 11,
-                    }
-                )),
-            )
-            .is_some());
-        let error: crate::api::schema::ErrorResponse =
-            serde_json::from_str(&instruct(&mut app, p.clone())).unwrap();
-        assert_eq!(error.error.code, "agent_identity_changed");
-        assert!(rx.try_recv().is_err());
-        // Fresh approval binds the new runtime while all resumable fields stay equal.
+            .persisted_agent_session
+            .as_mut()
+            .unwrap();
+        let owner = saved.owner_process.as_mut().unwrap();
+        owner.start_time_ticks = owner.start_time_ticks.saturating_add(1);
         let info = app.agent_info_for_target(&p.target).unwrap();
-        assert_eq!(
-            info.agent_session.as_ref().unwrap().value,
-            p.expected_session
-        );
-        p.expected_runtime_id = info.runtime_id.unwrap();
-        let response = instruct(&mut app, p);
-        assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok());
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Bytes::from_static(b"Report current status")
-        );
+        assert_eq!(info.runtime_id, None);
+        assert!(!info.accepts_instructions);
+        assert_eq!(instruct_error(&mut app, p), "agent_identity_changed");
+        assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn agent_instruct_checks_every_identity_field_before_writing() {
+        for field in 0..8 {
+            let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
+            match field {
+                0 => p.expected_terminal_id = "other-terminal".into(),
+                1 => p.expected_name = Some("other-name".into()),
+                2 => p.expected_name = None,
+                3 => p.expected_agent = "other-agent".into(),
+                4 => p.expected_session = "restarted-session".into(),
+                5 => p.expected_workspace_id = "other-workspace".into(),
+                6 => p.expected_cwd = "/other/project".into(),
+                _ => p.expected_runtime_id = "previous-process".into(),
+            }
+            assert_eq!(instruct_error(&mut app, p), "agent_identity_changed");
+            assert!(rx.try_recv().is_err());
+        }
+        // An OMP that a person started by typing `omp` has no herdr name.
+        let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_name = None;
+        assert_eq!(
+            instruct_error(&mut app, p.clone()),
+            "agent_identity_changed"
+        );
+        assert!(rx.try_recv().is_err());
+        p.expected_name = None;
+        let _response = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
     async fn agent_instruct_refuses_unregistered_process_and_uses_foreground_scope() {
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
@@ -625,13 +858,7 @@ mod tests {
         assert!(p.validate(&info).is_ok());
         info.foreground_cwd = Some(String::new());
         assert!(p.validate(&info).is_ok());
-        let terminal_id = app.state.workspaces[0].tabs[0]
-            .panes
-            .values()
-            .next()
-            .unwrap()
-            .attached_terminal_id
-            .clone();
+        let terminal_id = fixture_terminal_id(&app);
         app.state
             .terminals
             .get_mut(&terminal_id)
@@ -640,50 +867,80 @@ mod tests {
             .as_mut()
             .unwrap()
             .owner_process = None;
-        let error: crate::api::schema::ErrorResponse =
-            serde_json::from_str(&instruct(&mut app, p)).unwrap();
-        assert_eq!(error.error.code, "agent_identity_changed");
+        assert_eq!(instruct_error(&mut app, p), "agent_identity_changed");
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
-    async fn agent_instruct_rejects_unbounded_control_and_slash_text_without_writing() {
+    async fn agent_instruct_rejects_unbounded_control_and_command_text_without_writing() {
         for text in [
             String::new(),
             " \n".into(),
             "/new".into(),
             " \t/quit".into(),
+            "!ls".into(),
+            " !!rm -rf build".into(),
+            "$ print(1)".into(),
+            "$$ print(1)".into(),
+            "\n$\tprint(1)".into(),
+            "$".into(),
             "hello\x1b[201~".into(),
             "hello\rthere".into(),
             "é".repeat(4097),
         ] {
             let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
             p.text = text;
-            let error: crate::api::schema::ErrorResponse =
-                serde_json::from_str(&instruct(&mut app, p)).unwrap();
-            assert_eq!(error.error.code, "invalid_instruction");
+            assert_eq!(instruct_error(&mut app, p), "invalid_instruction");
             assert!(rx.try_recv().is_err());
+        }
+        // Shell-style variables are prose to OMP, as are `$` and `!` after the start.
+        let (app, mut p, _rx) = guarded_fixture(AgentState::Idle);
+        let info = app.agent_info_for_target(&p.target).unwrap();
+        for text in ["$HOME is unset", "${name}", "say ! and $ here"] {
+            p.text = text.into();
+            assert!(p.validate(&info).is_ok(), "{text:?}");
         }
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
-    async fn agent_instruct_preserves_harness_approval_gate_and_normal_submission() {
-        let (mut app, p, mut rx) = guarded_fixture(AgentState::Blocked);
-        let error: crate::api::schema::ErrorResponse =
-            serde_json::from_str(&instruct(&mut app, p)).unwrap();
-        assert_eq!(error.error.code, "agent_blocked");
-        assert!(rx.try_recv().is_err());
+    async fn instruction_ack_from_another_process_is_rejected() {
+        let pid = std::process::id();
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
-        let success: SuccessResponse = serde_json::from_str(&instruct(&mut app, p)).unwrap();
-        assert!(matches!(
-            success.result,
-            ResponseResult::AgentPrompted { .. }
-        ));
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Bytes::from_static(b"Report current status")
+        let target = p.target.clone();
+        let response = start_instruct(&mut app, p);
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        for pids in [(pid + 1, pid), (pid + 1, pid + 1)] {
+            let rejected = ack(&mut app, &target, &id, pids, InstructionDelivery::Prompt);
+            assert_eq!(error_code(&rejected), "process_mismatch");
+        }
+        // The socket peer is right, but the pid now names another incarnation.
+        let owner = app.pending_instruction_acks[&id].owner.clone();
+        app.pending_instruction_acks
+            .get_mut(&id)
+            .unwrap()
+            .owner
+            .start_time_ticks += 1;
+        let rejected = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionDelivery::Prompt,
         );
-        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert_eq!(error_code(&rejected), "process_mismatch");
+        app.pending_instruction_acks.get_mut(&id).unwrap().owner = owner;
+        assert!(response.try_recv().is_err(), "the waiter is still pending");
+        let acked = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionDelivery::Prompt,
+        );
+        assert!(serde_json::from_str::<SuccessResponse>(&acked).is_ok());
+        assert!(response.recv_timeout(Duration::from_secs(1)).is_ok());
     }
 
     #[test]
@@ -692,9 +949,18 @@ mod tests {
         let request = serde_json::json!({"id":"guarded","method":"agent.instruct","params":params});
         let parsed: crate::api::schema::Request = serde_json::from_value(request.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        let mut unnamed = request.clone();
+        unnamed["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_name");
+        let parsed: crate::api::schema::Request = serde_json::from_value(unnamed).unwrap();
+        let crate::api::schema::Method::AgentInstruct(parsed) = parsed.method else {
+            panic!("expected agent.instruct");
+        };
+        assert_eq!(parsed.expected_name, None);
         for field in [
             "expected_terminal_id",
-            "expected_name",
             "expected_agent",
             "expected_session",
             "expected_runtime_id",

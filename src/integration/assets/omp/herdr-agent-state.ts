@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=11
+// HERDR_INTEGRATION_VERSION=12
 // @ts-nocheck
 
 import net from "node:net";
@@ -100,6 +100,11 @@ let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
 let registeredSessionKey: string | undefined;
 const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() || "default";
+// A herdr `agent.instruct` delivery: one bracketed paste with a marker line and no Enter.
+// OMP hands a paste to input listeners as one string, plus an Enter typed in the same read.
+const INSTRUCTION = /^\x1b\[200~herdr-instruction:v1:([0-9a-f]{32})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+let instructionListener = false;
+let unsubscribeInstructions: (() => void) | undefined;
 
 function nextReportSeq(): number {
   reportSeq += 1;
@@ -190,6 +195,7 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
       session_start_source: sessionStartSource,
       launch_profile: launchProfile,
       agent_pid: process.pid,
+      accepts_instructions: instructionListener,
       ...sessionRef,
     },
   }));
@@ -372,11 +378,48 @@ export default function (pi) {
     retryTimer.unref?.();
   }
 
+  // Runs before OMP's editor and dialogs, so a delivery never mixes with a person's draft or
+  // picks a dialog item. sendUserMessage bypasses `/`, `!` and `$` command handling.
+  function takeInstruction(ctx: { isIdle?: () => boolean }, data: string) {
+    const match = INSTRUCTION.exec(data);
+    if (!match) {
+      return undefined;
+    }
+    const [, instructionId, text, enter] = match;
+    const rest = enter ? { data: enter } : { consume: true };
+    const idle = ctx?.isIdle?.() === true;
+    try {
+      // Not awaited: an idle send resolves only after the whole turn.
+      pi.sendUserMessage(text, idle ? undefined : { deliverAs: "aside" })?.catch?.(() => {});
+    } catch {
+      // No ack: the caller reports the delivery as unconfirmed.
+      return rest;
+    }
+    void sendRequest(() => ({
+      id: `${source}:instruction:${instructionId}:${Date.now()}`,
+      method: "pane.ack_instruction",
+      params: {
+        pane_id: paneId,
+        instruction_id: instructionId,
+        agent_pid: process.pid,
+        delivered_as: idle ? "prompt" : "aside",
+      },
+    }));
+    return rest;
+  }
+
   function activateRootSession(ctx: any, sessionStartSource = "startup"): boolean {
     if (ctx?.hasUI !== true) {
       return false;
     }
     rootSession = true;
+    // OMP drops extension input listeners on every session switch (/new, /resume, ...) and
+    // on reload, so each activation registers a fresh one before the report claims it.
+    unsubscribeInstructions?.();
+    unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) =>
+      takeInstruction(ctx, data),
+    );
+    instructionListener = typeof unsubscribeInstructions === "function";
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
     return true;
@@ -515,5 +558,8 @@ export default function (pi) {
     if (rootSession) {
       clearPendingTimers();
     }
+    unsubscribeInstructions?.();
+    unsubscribeInstructions = undefined;
+    instructionListener = false;
   });
 }

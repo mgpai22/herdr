@@ -404,6 +404,32 @@ pub struct PaneReportAgentSessionV2Params {
     pub session_start_source: Option<String>,
     pub launch_profile: String,
     pub agent_pid: u32,
+    /// The integration consumes `agent.instruct` deliveries (OMP integration v12+).
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub accepts_instructions: bool,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub peer_pid: Option<u32>,
+}
+
+/// How OMP accepted an `agent.instruct` delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionDelivery {
+    /// Started a new turn on an idle session.
+    Prompt,
+    /// Queued for the next step boundary of a running or blocked session.
+    Aside,
+}
+
+/// Sent by the OMP integration process that consumed an `agent.instruct` delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneAckInstructionParams {
+    pub pane_id: String,
+    pub instruction_id: String,
+    pub agent_pid: u32,
+    pub delivered_as: InstructionDelivery,
     #[serde(skip)]
     #[schemars(skip)]
     pub peer_pid: Option<u32>,

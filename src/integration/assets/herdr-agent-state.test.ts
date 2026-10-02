@@ -1040,3 +1040,100 @@ type ReportRequest = {
   method: string;
   params: { seq: number; state?: unknown };
 };
+
+type TerminalInputHandler = (data: string) => { consume?: boolean; data?: string } | undefined;
+
+async function installOmpWithTerminalInput(name: string, ui: Record<string, unknown> | undefined) {
+  const requests = await startRecordingServer(name);
+  const { handlers, pi } = createExtensionHarness();
+  const sent: unknown[][] = [];
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install({ ...pi, sendUserMessage: (...args: unknown[]) => sent.push(args) });
+  let idle = true;
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => idle,
+    ui,
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-instruct.jsonl",
+      getSessionId: () => "omp-instruct",
+    },
+  };
+  const reports = () =>
+    requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as {
+      params: Record<string, unknown>;
+    }[];
+  return { requests, handlers, sent, context, reports, setIdle: (value: boolean) => (idle = value) };
+}
+
+test("Oh My Pi consumes a herdr instruction paste and acks it from the agent process", async () => {
+  let listener: TerminalInputHandler | undefined;
+  const harness = await installOmpWithTerminalInput("omp-instruct", {
+    onTerminalInput(handler: TerminalInputHandler) {
+      listener = handler;
+      return () => {};
+    },
+  });
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  await waitFor(() => harness.reports().length === 1);
+  expect(harness.reports()[0].params.accepts_instructions).toBe(true);
+
+  const id = "0123456789abcdef0123456789abcdef";
+  const block = `\x1b[200~herdr-instruction:v1:${id}\nReport status\nthen stop\x1b[201~`;
+  const acks = () =>
+    harness.requests.filter((request) => isRecord(request) && request.method === "pane.ack_instruction") as {
+      params: Record<string, unknown>;
+    }[];
+  expect(listener?.(block)).toEqual({ consume: true });
+  expect(harness.sent).toEqual([["Report status\nthen stop", undefined]]);
+  await waitFor(() => acks().length === 1);
+  expect(acks()[0].params).toEqual({
+    pane_id: "test:p1",
+    instruction_id: id,
+    agent_pid: process.pid,
+    delivered_as: "prompt",
+  });
+
+  harness.setIdle(false);
+  // A person's Enter that arrived in the same read must still reach the editor.
+  expect(listener?.(`${block}\r`)).toEqual({ data: "\r" });
+  expect(harness.sent[1]).toEqual(["Report status\nthen stop", { deliverAs: "aside" }]);
+  await waitFor(() => acks().length === 2);
+  expect(acks()[1].params.delivered_as).toBe("aside");
+
+  for (const ordinary of ["\x1b[200~herdr-instruction:v1:short\nx\x1b[201~", "\x1b[200~pasted\x1b[201~", "a", "\r"]) {
+    expect(listener?.(ordinary)).toBeUndefined();
+  }
+  expect(harness.sent).toHaveLength(2);
+  expect(acks()).toHaveLength(2);
+});
+
+test("Oh My Pi registers a fresh instruction listener on every session switch", async () => {
+  const registered: TerminalInputHandler[] = [];
+  let unsubscribed = 0;
+  const harness = await installOmpWithTerminalInput("omp-instruct-switch", {
+    onTerminalInput(handler: TerminalInputHandler) {
+      registered.push(handler);
+      return () => {
+        unsubscribed += 1;
+      };
+    },
+  });
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  // OMP clears extension input listeners before /new or /resume emits session_switch.
+  await harness.handlers.get("session_switch")?.({ reason: "new" }, harness.context);
+  await waitFor(() => harness.reports().length === 2);
+
+  expect(registered).toHaveLength(2);
+  expect(unsubscribed).toBe(1);
+  expect(harness.reports().map((report) => report.params.accepts_instructions)).toEqual([true, true]);
+});
+
+test("Oh My Pi without terminal input support reports no instruction listener", async () => {
+  const harness = await installOmpWithTerminalInput("omp-instruct-none", undefined);
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  await waitFor(() => harness.reports().length === 1);
+
+  expect(harness.reports()[0].params.accepts_instructions).toBe(false);
+});

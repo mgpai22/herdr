@@ -1230,7 +1230,7 @@
       "$defs": {
         "AgentInstructParams": {
           "additionalProperties": false,
-          "description": "A bounded instruction bound to the exact agent incarnation reviewed by a caller.\nA separate method prevents older servers from silently ignoring the guards.",
+          "description": "A bounded instruction bound to the exact agent incarnation read by a caller.\nA separate method prevents older servers from silently ignoring the guards.",
           "properties": {
             "expected_agent": {
               "type": "string"
@@ -1239,7 +1239,11 @@
               "type": "string"
             },
             "expected_name": {
-              "type": "string"
+              "description": "Must equal the agent name; omit only for an agent that has no name.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "expected_runtime_id": {
               "type": "string"
@@ -1264,7 +1268,6 @@
             "target",
             "text",
             "expected_terminal_id",
-            "expected_name",
             "expected_agent",
             "expected_session",
             "expected_runtime_id",
@@ -2203,6 +2206,21 @@
           ],
           "type": "object"
         },
+        "InstructionDelivery": {
+          "description": "How OMP accepted an `agent.instruct` delivery.",
+          "oneOf": [
+            {
+              "const": "prompt",
+              "description": "Started a new turn on an idle session.",
+              "type": "string"
+            },
+            {
+              "const": "aside",
+              "description": "Queued for the next step boundary of a running or blocked session.",
+              "type": "string"
+            }
+          ]
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -2479,6 +2497,33 @@
               "type": "object"
             }
           ]
+        },
+        "PaneAckInstructionParams": {
+          "additionalProperties": false,
+          "description": "Sent by the OMP integration process that consumed an `agent.instruct` delivery.",
+          "properties": {
+            "agent_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "delivered_as": {
+              "$ref": "#/schemas/request/$defs/InstructionDelivery"
+            },
+            "instruction_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "instruction_id",
+            "agent_pid",
+            "delivered_as"
+          ],
+          "type": "object"
         },
         "PaneAgentState": {
           "enum": [
@@ -3031,6 +3076,10 @@
         },
         "PaneReportAgentSessionV2Params": {
           "properties": {
+            "accepts_instructions": {
+              "description": "The integration consumes `agent.instruct` deliveries (OMP integration v12+).",
+              "type": "boolean"
+            },
             "agent": {
               "type": "string"
             },
@@ -6083,6 +6132,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.ack_instruction",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneAckInstructionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.report_metadata",
               "type": "string"
             },
@@ -6661,6 +6726,10 @@
       "$defs": {
         "AgentInfo": {
           "properties": {
+            "accepts_instructions": {
+              "description": "The live `runtime_id` process registered the OMP integration listener that consumes\n`agent.instruct` deliveries.",
+              "type": "boolean"
+            },
             "agent": {
               "type": [
                 "string",
@@ -7721,6 +7790,21 @@
             "enabled"
           ],
           "type": "object"
+        },
+        "InstructionDelivery": {
+          "description": "How OMP accepted an `agent.instruct` delivery.",
+          "oneOf": [
+            {
+              "const": "prompt",
+              "description": "Started a new turn on an idle session.",
+              "type": "string"
+            },
+            {
+              "const": "aside",
+              "description": "Queued for the next step boundary of a running or blocked session.",
+              "type": "string"
+            }
+          ]
         },
         "IntegrationInfo": {
           "properties": {
@@ -9632,6 +9716,30 @@
             },
             {
               "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "delivered_as": {
+                  "$ref": "#/schemas/success_response/$defs/InstructionDelivery"
+                },
+                "instruction_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_instructed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "instruction_id",
+                "delivered_as"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agents": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/AgentInfo"
@@ -10558,6 +10666,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_instruct": {
+              "default": false,
+              "description": "Supports `agent.instruct` delivery acknowledged by the OMP integration.",
+              "type": "boolean"
+            },
             "agent_start_profile": {
               "default": false,
               "description": "Supports `agent.start` `profile` (OMP launch profiles).",

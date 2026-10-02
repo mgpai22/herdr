@@ -187,7 +187,7 @@ pub struct AgentPromptParams {
     pub wait: Option<AgentPromptWaitOptions>,
 }
 
-/// A bounded instruction bound to the exact agent incarnation reviewed by a caller.
+/// A bounded instruction bound to the exact agent incarnation read by a caller.
 /// A separate method prevents older servers from silently ignoring the guards.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -195,7 +195,9 @@ pub struct AgentInstructParams {
     pub target: String,
     pub text: String,
     pub expected_terminal_id: String,
-    pub expected_name: String,
+    /// Must equal the agent name; omit only for an agent that has no name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_name: Option<String>,
     pub expected_agent: String,
     pub expected_session: String,
     pub expected_runtime_id: String,
@@ -205,25 +207,32 @@ pub struct AgentInstructParams {
 
 impl AgentInstructParams {
     pub(crate) fn validate(&self, agent: &AgentInfo) -> Result<(), &'static str> {
-        if self.text.trim().is_empty()
+        let lead = self.text.trim_start();
+        // OMP runs `/` as a command, `!` as user bash, and `$`/`$$` before whitespace as
+        // Python. Refuse them so a fallback typed path can never execute the text.
+        let python = lead
+            .strip_prefix("$$")
+            .or_else(|| lead.strip_prefix('$'))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '\n']));
+        if lead.is_empty()
             || self.text.len() > 8192
             || self
                 .text
                 .chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
-            || self.text.trim_start().starts_with('/')
+            || lead.starts_with(['/', '!'])
+            || python
         {
             return Err("invalid_instruction");
         }
         if self.expected_terminal_id.is_empty()
-            || self.expected_name.is_empty()
             || self.expected_agent.is_empty()
             || self.expected_session.is_empty()
             || self.expected_runtime_id.is_empty()
             || self.expected_workspace_id.is_empty()
             || self.expected_cwd.is_empty()
             || agent.terminal_id != self.expected_terminal_id
-            || agent.name.as_deref() != Some(self.expected_name.as_str())
+            || agent.name != self.expected_name
             || agent.agent.as_deref() != Some(self.expected_agent.as_str())
             || agent.workspace_id != self.expected_workspace_id
             || agent
@@ -271,6 +280,10 @@ pub struct AgentInfo {
     /// Absent when the harness has no verified process-owner registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
+    /// The live `runtime_id` process registered the OMP integration listener that consumes
+    /// `agent.instruct` deliveries.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub accepts_instructions: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

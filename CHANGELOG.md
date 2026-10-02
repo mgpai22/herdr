@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+### Added
+- `agent.instruct` sends a bounded instruction to one exact OMP process. Herdr checks the agent's identity, then writes one marked bracketed paste with no Enter; the OMP integration takes it before the editor and any open dialog, passes it to OMP as a message (a new turn when idle, an aside otherwise) and confirms it with the new `pane.ack_instruction` method. The result is `agent_instructed`, or `instruction_unconfirmed` when OMP does not confirm within 8 seconds. Text that starts with `/`, `!`, or `$`/`$$` and a space is refused. Servers advertise `capabilities.agent_instruct`.
+- `AgentInfo.runtime_id` identifies the live registered OMP process, and `AgentInfo.accepts_instructions` shows that this process can receive `agent.instruct`. `expected_name` is optional, so an OMP started without a Herdr name can be instructed.
+- The OMP integration (version 12) registers an instruction listener and reports `accepts_instructions` with its session.
+
 ### Fixed
+- Descriptors received in a live handoff are close-on-exec, so processes started later can no longer keep the server lock after the server exits.
 - A live server keeps ownership of its session when its sockets disappear, so local startup and SSH bridges refuse to start a second server.
 - The status command exits 1 when its server is not running, while preserving the printed status.
 

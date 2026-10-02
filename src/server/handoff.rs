@@ -488,7 +488,13 @@ fn recv_fd_batch(stream: &UnixStream, wanted: usize) -> io::Result<Vec<RawFd>> {
     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = control.len() as _;
 
-    let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+    // Received descriptors must not leak into children spawned later: the server lock would
+    // outlive this server and block the next startup.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let flags = 0;
+    let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, flags) };
     if read < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -536,6 +542,14 @@ fn recv_fd_batch(stream: &UnixStream, wanted: usize) -> io::Result<Vec<RawFd>> {
     }
     if out.is_empty() {
         return Err(io::Error::other("handoff fd message missing SCM_RIGHTS"));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    if let Err(err) = out
+        .iter()
+        .try_for_each(|fd| crate::pty::fd::set_cloexec(*fd))
+    {
+        close_raw_fds(&out);
+        return Err(err);
     }
     Ok(out)
 }
@@ -610,5 +624,22 @@ mod tests {
 
         // An older server sends only pane descriptors; counting a lock would wait forever.
         assert!(!older.carries_server_lock);
+    }
+
+    #[test]
+    fn received_handoff_descriptors_are_close_on_exec() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        send_fd_batch(&sender, &pipe[..1]).unwrap();
+        let received = recv_fd_batch(&receiver, 1).unwrap();
+        assert_eq!(received.len(), 1);
+        let flags = unsafe { libc::fcntl(received[0], libc::F_GETFD) };
+        close_raw_fds(&received);
+        close_raw_fds(&pipe);
+        assert!(
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+            "flags {flags:#x}"
+        );
     }
 }

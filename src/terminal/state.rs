@@ -31,6 +31,8 @@ pub(crate) struct HandoffAgentState {
     authority: HookAuthority,
     sequence: Option<u64>,
     acquisition_pending: bool,
+    #[serde(default)]
+    instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +139,8 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    /// OMP process incarnation whose integration registered an `agent.instruct` listener.
+    pub(crate) instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -177,6 +181,7 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            instruction_listener: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -238,6 +243,7 @@ impl TerminalState {
             authority: authority.clone(),
             sequence: self.hook_report_sequences.get(&authority.source).copied(),
             acquisition_pending: self.agent_process_acquisition_pending,
+            instruction_listener: self.instruction_listener.clone(),
         })
     }
 
@@ -251,6 +257,7 @@ impl TerminalState {
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
+        self.instruction_listener = snapshot.instruction_listener;
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {

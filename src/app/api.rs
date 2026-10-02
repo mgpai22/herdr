@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 mod agent_view;
-mod agents;
+pub(super) mod agents;
 mod env;
 mod integrations;
 mod layouts;
@@ -1159,6 +1159,9 @@ impl App {
             }
             Method::PaneReportAgentSessionV2(params) => {
                 return self.handle_pane_report_agent_session_v2(request.id, params);
+            }
+            Method::PaneAckInstruction(params) => {
+                return self.handle_pane_ack_instruction(request.id, params);
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);

@@ -429,10 +429,11 @@ impl App {
             .and_then(|profile| self.omp_launchers.get(profile))
             .filter(|executable| !executable.is_empty())
             .cloned();
-        // OMP registration already verifies the process against its socket peer
-        // and foreground job. A resumed native session has a different owner.
-        // An unregistered/restored session cannot supply an incarnation guard.
-        let runtime_id = terminal.persisted_agent_session.as_ref().and_then(|saved| {
+        // OMP registration verifies the process against its socket peer and foreground job.
+        // A resumed native session has a different owner, an unregistered/restored session
+        // cannot supply an incarnation guard, and a missed exit leaves a dead owner behind,
+        // so the saved owner must still be the live incarnation.
+        let live_owner = terminal.persisted_agent_session.as_ref().and_then(|saved| {
             let session = pane.agent_session.as_ref()?;
             let owner = saved.owner_process.as_ref()?;
             (saved.source == session.source
@@ -443,16 +444,22 @@ impl App {
                 && crate::agent_resume::is_official_agent_source(&saved.source, &saved.agent)
                 && owner.pid != 0
                 && !owner.boot_id.is_empty()
-                && owner.start_time_ticks != 0)
-                .then(|| {
-                    format!(
-                        "{:x}",
-                        Sha256::digest(
-                            serde_json::to_vec(owner).expect("process identity serializes")
-                        )
-                    )
-                })
+                && owner.start_time_ticks != 0
+                && crate::platform::observe_process(owner.pid)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    == Some(owner))
+            .then_some(owner)
         });
+        let runtime_id = live_owner.map(|owner| {
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(owner).expect("process identity serializes"))
+            )
+        });
+        let accepts_instructions =
+            live_owner.is_some() && terminal.instruction_listener.as_ref() == live_owner;
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -467,6 +474,7 @@ impl App {
             tokens: pane.tokens,
             agent_session: pane.agent_session,
             runtime_id,
+            accepts_instructions,
             launch_profile,
             launch_executable,
             workspace_id: pane.workspace_id,
@@ -514,6 +522,27 @@ pub(super) fn runtime_hosts_agent(
         return true;
     }
     live_runtime_agent(runtime) == Some(expected)
+}
+
+/// Whether `pid` belongs to the pane's foreground job, so it owns the terminal input.
+pub(super) fn owner_in_foreground_job(
+    runtime: &crate::terminal::TerminalRuntime,
+    pid: u32,
+) -> bool {
+    #[cfg(test)]
+    if runtime.child_pid().is_none() {
+        return true;
+    }
+    #[cfg(not(windows))]
+    let member = runtime
+        .child_pid()
+        .and_then(crate::detect::foreground_job)
+        .is_some_and(|job| job.processes.iter().any(|process| process.pid == pid));
+    #[cfg(windows)]
+    let member = runtime
+        .child_pid()
+        .is_some_and(|child_pid| crate::platform::foreground_job_includes_process(child_pid, pid));
+    member
 }
 
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
