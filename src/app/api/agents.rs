@@ -488,7 +488,16 @@ mod tests {
             .set_agent_session_ref_for_session_start_with_recovery(
                 "herdr:omp".into(),
                 "omp".into(),
-                crate::agent_resume::AgentSessionRef::path("/fixture/omp-native.jsonl"),
+                Some(
+                    crate::agent_resume::AgentSessionRef::path(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("omp-native.jsonl")
+                            .display()
+                            .to_string(),
+                    )
+                    .expect("fixture session path is absolute on the host platform"),
+                ),
                 Some(1),
                 Some("startup".into()),
                 Some((
