@@ -306,7 +306,7 @@ impl App {
                 id,
                 "agent_instruction_unsupported",
                 format!(
-                    "agent {} has no instruction listener registered now: OMP is restarting, exiting or reloading its extensions, or its herdr integration is older than v12; nothing was written; retry when agent.get shows accepts_instructions",
+                    "agent {} has no instruction listener registered now: OMP is restarting, exiting or reloading its extensions, or its herdr integration is older than v13; nothing was written; retry when agent.get shows accepts_instructions",
                     params.target
                 ),
             ));

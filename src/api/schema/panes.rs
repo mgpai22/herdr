@@ -404,7 +404,7 @@ pub struct PaneReportAgentSessionV2Params {
     pub session_start_source: Option<String>,
     pub launch_profile: String,
     pub agent_pid: u32,
-    /// The integration consumes `agent.instruct` deliveries (OMP integration v12+).
+    /// The integration consumes `agent.instruct` deliveries (OMP integration v13+).
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub accepts_instructions: bool,
     /// Opaque id of the integration's JS runtime: the same across an extension reload, new after

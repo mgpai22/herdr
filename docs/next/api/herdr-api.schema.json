@@ -3098,7 +3098,7 @@
         "PaneReportAgentSessionV2Params": {
           "properties": {
             "accepts_instructions": {
-              "description": "The integration consumes `agent.instruct` deliveries (OMP integration v12+).",
+              "description": "The integration consumes `agent.instruct` deliveries (OMP integration v13+).",
               "type": "boolean"
             },
             "agent": {
