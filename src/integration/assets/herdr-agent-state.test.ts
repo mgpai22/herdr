@@ -1285,6 +1285,59 @@ test("Oh My Pi tells herdr its listener is gone before shutdown finishes", async
   );
 });
 
+test("Oh My Pi shutdown report does not wait behind queued reports or a silent herdr", async () => {
+  // A herdr that reads every request and never answers (busy or stopped).
+  const recordingSocketPath = join(tmpdir(), `herdr-omp-silent-${process.pid}.sock`);
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+  const received: { method: string; params: Record<string, unknown> }[] = [];
+  const silentServer = createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline >= 0) {
+        received.push(JSON.parse(input.slice(0, newline)));
+      }
+    });
+  });
+  server = silentServer;
+  await new Promise<void>((resolve, reject) => {
+    silentServer.once("error", reject);
+    silentServer.listen(recordingSocketPath, resolve);
+  });
+  configureIntegrationEnvironment(recordingSocketPath);
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    ui: { onTerminalInput: () => () => {} },
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-silent.jsonl",
+      getSessionId: () => "omp-silent",
+    },
+  };
+  // The startup session and state reports are queued, each waiting out its attempts.
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+
+  // Real time on purpose: the bound is OMP's 2 s cap on shutdown handlers.
+  const started = Date.now();
+  await handlers.get("session_shutdown")?.({}, context);
+  const elapsed = Date.now() - started;
+  expect(elapsed).toBeLessThan(1500);
+  expect(
+    received.some(
+      (request) =>
+        request.method === "pane.report_agent_session_v2" &&
+        request.params.accepts_instructions === false,
+    ),
+  ).toBe(true);
+});
+
 test("Oh My Pi task subagents bound to the same module never touch the root's instructions", async () => {
   const requests = await startRecordingServer("omp-subagent");
   process.env.HERDR_OMP_INSTRUCTION_POLL_MS = "5";

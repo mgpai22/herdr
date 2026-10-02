@@ -294,7 +294,10 @@ impl App {
             return Err(encode_error(
                 id,
                 "agent_instruction_unsupported",
-                "the agent process has no herdr instruction listener (OMP integration v12)",
+                format!(
+                    "agent {} has no instruction listener registered now: OMP is restarting, exiting or reloading its extensions, or its herdr integration is older than v12; nothing was written; retry when agent.get shows accepts_instructions",
+                    params.target
+                ),
             ));
         }
         let resolved = self
@@ -1494,10 +1497,17 @@ mod tests {
             last_outcome(&app, &target, &id),
             InstructionOutcome::Pending
         );
-        assert_eq!(
-            instruct_error(&mut app, p.clone()),
-            "agent_instruction_unsupported"
-        );
+        let refused = start_instruct(&mut app, p.clone())
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(error_code(&refused), "agent_instruction_unsupported");
+        // The caller learns that this is a passing state and that nothing was written.
+        let message = serde_json::from_str::<crate::api::schema::ErrorResponse>(&refused)
+            .unwrap()
+            .error
+            .message;
+        assert!(message.contains("restarting"), "{message}");
+        assert!(message.contains("nothing was written"), "{message}");
         assert!(rx.try_recv().is_err(), "nothing is written into the gap");
 
         // The restarted image registers from a new runtime: the old delivery ends, and the new

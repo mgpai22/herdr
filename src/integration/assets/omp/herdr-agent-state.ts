@@ -92,6 +92,8 @@ const retryGraceMs = parseDurationEnv("HERDR_OMP_RETRY_GRACE_MS", 2500);
 // with doubling delays, so a resumed session registers without waiting for the next prompt.
 const sessionRetryBaseMs = parseDurationEnv("HERDR_OMP_SESSION_RETRY_MS", 1000);
 const sessionRetryLimit = 8;
+// The shutdown report's single attempt; OMP gives a shutdown handler at most 2 s.
+const shutdownReportTimeoutMs = 1000;
 let sessionRetryTimer: ReturnType<typeof setTimeout> | undefined;
 const retryableErrorPattern =
   /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
@@ -237,20 +239,9 @@ function currentSessionRef(): Record<string, unknown> | undefined {
   return undefined;
 }
 
-async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
-  const sessionRef = currentSessionRef();
-  const sessionKey = currentSessionKey();
-  registeredSessionKey = undefined;
-  clearTimeout(sessionRetryTimer);
-  sessionRetryTimer = undefined;
-  if (!sessionRef || !sessionKey) return;
-
-  // Each retry attempt mints a fresh id and sequence number. If the server
-  // applied the first attempt but its reply was lost, an identical retry
-  // would be rejected as stale and leave the session unregistered with no
-  // later session event to recover it. A fresh retry replays the same
-  // profile, PID, and session through every server check and converges.
-  const delivered = await sendRequest(() => ({
+// A session report with a fresh id and sequence number, built when it is sent.
+function sessionReport(sessionStartSource: string, sessionRef: Record<string, unknown>) {
+  return {
     id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent_session_v2",
     params: {
@@ -265,7 +256,23 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
       runtime_instance: runtimeInstance,
       ...sessionRef,
     },
-  }));
+  };
+}
+
+async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
+  const sessionRef = currentSessionRef();
+  const sessionKey = currentSessionKey();
+  registeredSessionKey = undefined;
+  clearTimeout(sessionRetryTimer);
+  sessionRetryTimer = undefined;
+  if (!sessionRef || !sessionKey) return;
+
+  // Each retry attempt mints a fresh id and sequence number. If the server
+  // applied the first attempt but its reply was lost, an identical retry
+  // would be rejected as stale and leave the session unregistered with no
+  // later session event to recover it. A fresh retry replays the same
+  // profile, PID, and session through every server check and converges.
+  const delivered = await sendRequest(() => sessionReport(sessionStartSource, sessionRef));
   if (delivered && currentSessionKey() === sessionKey) {
     registeredSessionKey = sessionKey;
   } else if (!delivered && currentSessionKey() === sessionKey && attempt < sessionRetryLimit) {
@@ -744,13 +751,17 @@ export default function (pi) {
     stopAdmissionWatch();
     compacting = false;
     // Tell herdr the listener is gone before OMP goes on (it awaits this handler): `/restart`
-    // execs a new image, which reads the terminal before it registers its own listener, and a
-    // reload binds a new instance. herdr refuses instructions until the next registration
-    // instead of writing a block nobody can confirm. The same runtime id keeps a reload's
-    // in-flight deliveries followed.
-    await reportSession();
-    // No retry after shutdown: a later report is the next binding's to send.
+    // execs a new image, which reads the terminal before it registers its own listener. herdr
+    // then refuses instructions until the next registration instead of writing a block nobody
+    // can confirm; the same runtime id keeps in-flight deliveries followed. One attempt outside
+    // the report queue, well under OMP's 2 s cap for shutdown handlers, so a slow herdr never
+    // stalls the exit. Sending it ahead of queued state reports is safe: each carries the seq
+    // minted when it is built. No retry: a later report is the next image's to send.
     clearTimeout(sessionRetryTimer);
     sessionRetryTimer = undefined;
+    const sessionRef = currentSessionRef();
+    if (sessionRef) {
+      await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
+    }
   });
 }
