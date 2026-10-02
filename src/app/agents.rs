@@ -425,7 +425,7 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let pane = self.pane_info(ws_idx, pane_id)?;
+        let pane = self.pane_metadata(ws_idx, pane_id)?;
         let launch_profile = terminal.omp_launch_profile().map(str::to_string);
         let launch_executable = launch_profile
             .as_ref()
