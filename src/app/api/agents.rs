@@ -485,12 +485,20 @@ mod tests {
         terminal.set_agent_name("director".into());
         terminal.set_detected_state(Some(Agent::Omp), state);
         assert!(terminal
-            .set_agent_session_ref_for_session_start(
+            .set_agent_session_ref_for_session_start_with_recovery(
                 "herdr:omp".into(),
                 "omp".into(),
                 crate::agent_resume::AgentSessionRef::path("/fixture/omp-native.jsonl"),
                 Some(1),
                 Some("startup".into()),
+                Some((
+                    "default".into(),
+                    crate::platform::OwnerProcessIncarnation {
+                        pid: 100,
+                        boot_id: "fixture-boot".into(),
+                        start_time_ticks: 10,
+                    }
+                )),
             )
             .is_some());
         let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
@@ -504,6 +512,7 @@ mod tests {
             expected_name: info.name.unwrap(),
             expected_agent: info.agent.unwrap(),
             expected_session: info.agent_session.unwrap().value,
+            expected_runtime_id: info.runtime_id.unwrap(),
             expected_workspace_id: info.workspace_id,
             expected_cwd: info.cwd.unwrap(),
         };
@@ -524,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_instruct_checks_every_identity_field_before_writing() {
-        for field in 0..6 {
+        for field in 0..7 {
             let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
             match field {
                 0 => p.expected_terminal_id = "other-terminal".into(),
@@ -532,13 +541,100 @@ mod tests {
                 2 => p.expected_agent = "other-agent".into(),
                 3 => p.expected_session = "restarted-session".into(),
                 4 => p.expected_workspace_id = "other-workspace".into(),
-                _ => p.expected_cwd = "/other/project".into(),
+                5 => p.expected_cwd = "/other/project".into(),
+                _ => p.expected_runtime_id = "previous-process".into(),
             }
             let error: crate::api::schema::ErrorResponse =
                 serde_json::from_str(&instruct(&mut app, p)).unwrap();
             assert_eq!(error.error.code, "agent_identity_changed");
             assert!(rx.try_recv().is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn agent_instruct_refuses_same_session_after_process_restart() {
+        let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        assert!(app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::agent_resume::AgentSessionRef::path(&p.expected_session),
+                Some(2),
+                Some("resume".into()),
+                Some((
+                    "default".into(),
+                    crate::platform::OwnerProcessIncarnation {
+                        pid: 100,
+                        boot_id: "fixture-boot".into(),
+                        start_time_ticks: 11,
+                    }
+                )),
+            )
+            .is_some());
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&instruct(&mut app, p.clone())).unwrap();
+        assert_eq!(error.error.code, "agent_identity_changed");
+        assert!(rx.try_recv().is_err());
+        // Fresh approval binds the new runtime while all resumable fields stay equal.
+        let info = app.agent_info_for_target(&p.target).unwrap();
+        assert_eq!(
+            info.agent_session.as_ref().unwrap().value,
+            p.expected_session
+        );
+        p.expected_runtime_id = info.runtime_id.unwrap();
+        let response = instruct(&mut app, p);
+        assert!(serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"Report current status")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_instruct_refuses_unregistered_process_and_uses_foreground_scope() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let mut info = app.agent_info_for_target(&p.target).unwrap();
+        info.foreground_cwd = Some("/other/project".into());
+        assert_eq!(p.validate(&info), Err("agent_identity_changed"));
+        info.foreground_cwd = Some(p.expected_cwd.clone());
+        info.cwd = Some("/shell/elsewhere".into());
+        assert!(p.validate(&info).is_ok());
+        info.foreground_cwd = None;
+        assert_eq!(p.validate(&info), Err("agent_identity_changed"));
+        info.cwd = Some(p.expected_cwd.clone());
+        assert!(p.validate(&info).is_ok());
+        info.foreground_cwd = Some(String::new());
+        assert!(p.validate(&info).is_ok());
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .persisted_agent_session
+            .as_mut()
+            .unwrap()
+            .owner_process = None;
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&instruct(&mut app, p)).unwrap();
+        assert_eq!(error.error.code, "agent_identity_changed");
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -583,7 +679,7 @@ mod tests {
 
     #[test]
     fn agent_instruct_wire_requires_guards_and_refuses_unknown_parameters() {
-        let params = serde_json::json!({"target":"w1:p1","text":"Report status","expected_terminal_id":"term1","expected_name":"director","expected_agent":"omp","expected_session":"native1","expected_workspace_id":"w1","expected_cwd":"/project"});
+        let params = serde_json::json!({"target":"w1:p1","text":"Report status","expected_terminal_id":"term1","expected_name":"director","expected_agent":"omp","expected_session":"native1","expected_runtime_id":"process1","expected_workspace_id":"w1","expected_cwd":"/project"});
         let request = serde_json::json!({"id":"guarded","method":"agent.instruct","params":params});
         let parsed: crate::api::schema::Request = serde_json::from_value(request.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), request);
@@ -592,6 +688,7 @@ mod tests {
             "expected_name",
             "expected_agent",
             "expected_session",
+            "expected_runtime_id",
             "expected_workspace_id",
             "expected_cwd",
         ] {

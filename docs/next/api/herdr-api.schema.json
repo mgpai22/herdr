@@ -1241,6 +1241,9 @@
             "expected_name": {
               "type": "string"
             },
+            "expected_runtime_id": {
+              "type": "string"
+            },
             "expected_session": {
               "type": "string"
             },
@@ -1264,6 +1267,7 @@
             "expected_name",
             "expected_agent",
             "expected_session",
+            "expected_runtime_id",
             "expected_workspace_id",
             "expected_cwd"
           ],
@@ -6737,6 +6741,13 @@
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "runtime_id": {
+              "description": "Opaque identity of a verified registered process, independent of resumable session.\nAbsent when the harness has no verified process-owner registration.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "screen_detection_skipped": {
               "type": "boolean"

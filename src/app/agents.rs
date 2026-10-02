@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use super::{terminal_targets::TerminalTargetError, App};
 use crate::api::schema::AgentStartParams;
@@ -428,6 +429,30 @@ impl App {
             .and_then(|profile| self.omp_launchers.get(profile))
             .filter(|executable| !executable.is_empty())
             .cloned();
+        // OMP registration already verifies the process against its socket peer
+        // and foreground job. A resumed native session has a different owner.
+        // An unregistered/restored session cannot supply an incarnation guard.
+        let runtime_id = terminal.persisted_agent_session.as_ref().and_then(|saved| {
+            let session = pane.agent_session.as_ref()?;
+            let owner = saved.owner_process.as_ref()?;
+            (saved.source == session.source
+                && saved.agent == session.agent
+                && pane.agent.as_deref() == Some(saved.agent.as_str())
+                && saved.session_ref.kind == session.kind
+                && saved.session_ref.value == session.value
+                && crate::agent_resume::is_official_agent_source(&saved.source, &saved.agent)
+                && owner.pid != 0
+                && !owner.boot_id.is_empty()
+                && owner.start_time_ticks != 0)
+                .then(|| {
+                    format!(
+                        "{:x}",
+                        Sha256::digest(
+                            serde_json::to_vec(owner).expect("process identity serializes")
+                        )
+                    )
+                })
+        });
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -441,6 +466,7 @@ impl App {
             state_labels: pane.state_labels,
             tokens: pane.tokens,
             agent_session: pane.agent_session,
+            runtime_id,
             launch_profile,
             launch_executable,
             workspace_id: pane.workspace_id,

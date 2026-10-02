@@ -109,7 +109,9 @@ herdr pane read w1:p2 --source recent --lines 50
 
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
 
-`agent.instruct` は、対象の実行セッションを確認してから制限付きの指示を送信します。必須パラメーターは `target`、`text`、`expected_terminal_id`、`expected_name`、`expected_agent`、`expected_session`、`expected_workspace_id`、`expected_cwd` です。テキストの上限は UTF-8 で 8192 バイトです。空白のみの入力、改行とタブ以外の制御文字、先頭のスラッシュコマンドは拒否されます。サーバーは現在のターミナル、ハーネス、ネイティブセッション、名前、ワークスペース、作業ディレクトリを確認し、通常のプロンプト送信を行います。不一致は `agent_identity_changed`、無効なテキストは `invalid_instruction`、承認待ちは `agent_blocked` を返します。成功時の `agent_prompted` は送信を示し、作業完了を示しません。確認項目は必須で、未知のパラメーターは拒否されます。別メソッドにより `agent.prompt` の互換性を維持し、古いサーバーでは安全に拒否します。認証、権限、リモートアクセス、CLI ショートカットは追加しません。
+`agent.instruct` は、対象の実行セッションを確認してから制限付きの指示を送信します。必須パラメーターは `target`、`text`、`expected_terminal_id`、`expected_name`、`expected_agent`、`expected_session`、`expected_runtime_id`、`expected_workspace_id`、`expected_cwd` です。テキストの上限は UTF-8 で 8192 バイトです。空白のみの入力、改行とタブ以外の制御文字、先頭のスラッシュコマンドは拒否されます。サーバーは現在のターミナル、ハーネス、ネイティブセッション、名前、ワークスペース、作業ディレクトリを確認し、通常のプロンプト送信を行います。不一致は `agent_identity_changed`、無効なテキストは `invalid_instruction`、承認待ちは `agent_blocked` を返します。成功時の `agent_prompted` は送信を示し、作業完了を示しません。確認項目は必須で、未知のパラメーターは拒否されます。別メソッドにより `agent.prompt` の互換性を維持し、古いサーバーでは安全に拒否します。認証、権限、リモートアクセス、CLI ショートカットは追加しません。
+
+`expected_runtime_id` には `agent.get` または `agent.list` の不透明な `runtime_id` を使います。これは検証済みのネイティブプロセス所有者から取得され、現在は公式 OMP 登録が提供します。登録がなければガード付き書き込みは拒否され、再開可能なセッションだけでは不十分です。同じネイティブセッションを再開しても、プロセスを再起動するとこの識別子は変わります。プロジェクトの範囲はフォアグラウンドの作業ディレクトリを優先し、不明な場合だけシェルのディレクトリを使います。
 
 `workspace.move_block` は、順序付きの `workspace_ids` を `before_workspace_id` の前へアトミックに移動します。アンカーを省略するとブロックを末尾へ移動します。id は一意である必要があり、アンカーをブロックに含めることはできません。レスポンスにはサーバーが確定した順序付きワークスペース一覧が含まれます。
 

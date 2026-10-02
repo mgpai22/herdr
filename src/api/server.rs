@@ -1539,7 +1539,7 @@ mod tests {
         let request: Request = serde_json::from_value(serde_json::json!({
             "id":"guarded-dispatch", "method":"agent.instruct", "params":{
                 "target":"w1:p1", "text":"Report status", "expected_terminal_id":"term-1", "expected_name":"director",
-                "expected_agent":"omp", "expected_session":"/fixture/session.jsonl", "expected_workspace_id":"w1", "expected_cwd":"/fixture/project"
+                "expected_agent":"omp", "expected_session":"/fixture/session.jsonl", "expected_runtime_id":"process-1", "expected_workspace_id":"w1", "expected_cwd":"/fixture/project"
             }
         })).unwrap();
         assert!(crate::api::request_changes_ui(&request));

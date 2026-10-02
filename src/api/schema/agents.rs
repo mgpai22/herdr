@@ -198,6 +198,7 @@ pub struct AgentInstructParams {
     pub expected_name: String,
     pub expected_agent: String,
     pub expected_session: String,
+    pub expected_runtime_id: String,
     pub expected_workspace_id: String,
     pub expected_cwd: String,
 }
@@ -218,14 +219,20 @@ impl AgentInstructParams {
             || self.expected_name.is_empty()
             || self.expected_agent.is_empty()
             || self.expected_session.is_empty()
+            || self.expected_runtime_id.is_empty()
             || self.expected_workspace_id.is_empty()
             || self.expected_cwd.is_empty()
             || agent.terminal_id != self.expected_terminal_id
             || agent.name.as_deref() != Some(self.expected_name.as_str())
             || agent.agent.as_deref() != Some(self.expected_agent.as_str())
             || agent.workspace_id != self.expected_workspace_id
-            || (agent.cwd.as_deref() != Some(self.expected_cwd.as_str())
-                && agent.foreground_cwd.as_deref() != Some(self.expected_cwd.as_str()))
+            || agent
+                .foreground_cwd
+                .as_deref()
+                .filter(|cwd| !cwd.is_empty())
+                .or(agent.cwd.as_deref())
+                != Some(self.expected_cwd.as_str())
+            || agent.runtime_id.as_deref() != Some(self.expected_runtime_id.as_str())
             || agent.agent_session.as_ref().map(|s| s.value.as_str())
                 != Some(self.expected_session.as_str())
         {
@@ -260,6 +267,10 @@ pub struct AgentInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Opaque identity of a verified registered process, independent of resumable session.
+    /// Absent when the harness has no verified process-owner registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
