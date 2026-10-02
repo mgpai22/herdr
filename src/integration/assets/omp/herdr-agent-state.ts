@@ -109,11 +109,14 @@ const runtimeSlot = globalThis as { [key: symbol]: string | undefined };
 const RUNTIME_KEY = Symbol.for("herdr.omp.runtime");
 const runtimeInstance = (runtimeSlot[RUNTIME_KEY] ??= crypto.randomUUID());
 // A herdr `agent.instruct` delivery: one bracketed paste with no Enter. The header carries the
-// instruction id, the unix ms after which the block must be discarded, and the text's UTF-8
-// byte length. OMP hands a paste to input listeners as one string, plus an Enter typed in the
-// same read.
+// instruction id, the unix ms after which the block must be discarded, the text's UTF-8 byte
+// length, and this runtime's token, which only herdr learns (over the peer-checked socket): a
+// person's paste that imitates a block lacks it and reaches the editor as a paste. OMP hands a
+// paste to input listeners as one string, plus an Enter typed in the same read.
 const INSTRUCTION =
-  /^\x1b\[200~herdr-instruction:v2:([0-9a-f]{32}):(\d+):(\d+)\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+  /^\x1b\[200~herdr-instruction:v3:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+// herdr sets the expiry a few seconds ahead; a block claiming a later one is not herdr's.
+const instructionExpiryCapMs = 10_000;
 // herdr follows a taken delivery this long; a later ack only gets instruction_not_found.
 const admissionWaitMs = 120_000;
 // How often an idle delivery checks whether OMP went idle again without starting its turn.
@@ -459,7 +462,10 @@ export default function (pi) {
     if (!match) {
       return undefined;
     }
-    const [, instructionId, expiresMs, byteLength, text, enter] = match;
+    const [, instructionId, expiresMs, byteLength, token, text, enter] = match;
+    if (token !== runtimeInstance || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
+      return undefined;
+    }
     const rest = enter ? { data: enter } : { consume: true };
     // herdr has given up on a late block, and a paste OMP cut short is not the whole text: drop
     // both, unsent and unacked. The report tells herdr that the listener still exists.

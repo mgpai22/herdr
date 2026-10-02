@@ -441,7 +441,8 @@ pub enum InstructionOutcome {
     Pending,
     /// The turn with the text started.
     Prompt,
-    /// Queued for the next step boundary of a running or blocked session.
+    /// Queued for the next step boundary of a running or blocked session. A person interrupting
+    /// the turn before that step leaves the text in the transcript without running a turn.
     Aside,
     /// OMP took the text but went idle without starting its turn (no model or API key, usage
     /// limit, Esc, session change). Nothing ran; OMP may have put the text into an empty editor.

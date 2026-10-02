@@ -2226,7 +2226,7 @@
             },
             {
               "const": "aside",
-              "description": "Queued for the next step boundary of a running or blocked session.",
+              "description": "Queued for the next step boundary of a running or blocked session. A person interrupting\nthe turn before that step leaves the text in the transcript without running a turn.",
               "type": "string"
             },
             {
@@ -7877,7 +7877,7 @@
             },
             {
               "const": "aside",
-              "description": "Queued for the next step boundary of a running or blocked session.",
+              "description": "Queued for the next step boundary of a running or blocked session. A person interrupting\nthe turn before that step leaves the text in the transcript without running a turn.",
               "type": "string"
             },
             {

@@ -94,15 +94,26 @@ pub(super) fn record_instruction_outcome(
     entries.truncate(RECENT_INSTRUCTIONS);
 }
 
-/// The marked paste the OMP integration consumes: `v2:<id>:<expires unix ms>:<text bytes>`.
-fn instruction_block(instruction_id: &str, text: &str) -> String {
+/// The marked paste the OMP integration consumes:
+/// `v3:<id>:<expires unix ms>:<text bytes>:<listener runtime>`. The runtime id is the
+/// integration's own random token, known only to it and to herdr, so a person's paste that
+/// imitates a block is not taken as an instruction.
+fn instruction_block(instruction_id: &str, text: &str, runtime: &str) -> String {
     let expires_ms = (std::time::SystemTime::now() + INSTRUCTION_EXPIRY)
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
     format!(
-        "\x1b[200~herdr-instruction:v2:{instruction_id}:{expires_ms}:{}\n{text}\x1b[201~",
+        "\x1b[200~herdr-instruction:v3:{instruction_id}:{expires_ms}:{}:{runtime}\n{text}\x1b[201~",
         text.len()
     )
+}
+
+/// A listener runtime id that fits the block header: what the integration mints.
+fn valid_listener_runtime(runtime: &str) -> bool {
+    (1..=64).contains(&runtime.len())
+        && runtime
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 /// Ends a delivery that got no final outcome: its `last_instruction` becomes `unconfirmed`, and a
@@ -316,6 +327,21 @@ impl App {
             return Err(agent_not_found(id, &params.target));
         };
         let listener_runtime = terminal.instruction_listener_runtime.clone();
+        // The block is bound to the listener's runtime token; without one it cannot be told apart
+        // from a person's paste, so nothing is written.
+        let Some(block_runtime) = listener_runtime
+            .clone()
+            .filter(|runtime| valid_listener_runtime(runtime))
+        else {
+            return Err(encode_error(
+                id,
+                "agent_instruction_unsupported",
+                format!(
+                    "agent {} registered no instruction token; nothing was written; retry when its OMP integration reports again",
+                    params.target
+                ),
+            ));
+        };
         let terminal_id = terminal.id.clone();
         let launch_pending = terminal.managed_agent_launch_pending();
         self.settle_stale_deliveries(&terminal_id, &owner, listener_runtime.as_deref());
@@ -361,7 +387,7 @@ impl App {
             ));
         }
         let instruction_id = new_instruction_id(&id, terminal_id.as_str());
-        let block = instruction_block(&instruction_id, &params.text);
+        let block = instruction_block(&instruction_id, &params.text, &block_runtime);
         if let Err(err) = runtime.try_send_bytes(Bytes::from(block)) {
             return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
         }
@@ -880,6 +906,7 @@ mod tests {
             )
             .is_some());
         terminal.instruction_listener = Some(owner);
+        terminal.instruction_listener_runtime = Some(FIXTURE_RUNTIME.into());
         app.state.insert_test_runtime(pane_id, runtime);
         let public_pane = app.public_pane_id(0, pane_id).unwrap();
         let info = app.agent_info_for_target(&public_pane).unwrap();
@@ -900,6 +927,10 @@ mod tests {
         (app, params)
     }
 
+    /// The runtime token the fixture's OMP integration registered.
+    #[cfg(target_os = "linux")]
+    const FIXTURE_RUNTIME: &str = "4f9c2a10-7b3e-4d21-9a55-0c1e2f3a4b5c";
+
     #[cfg(target_os = "linux")]
     fn fixture_session_path() -> String {
         std::env::current_dir()
@@ -912,7 +943,13 @@ mod tests {
     /// A v2 session report from this test process, as the OMP integration sends it.
     #[cfg(target_os = "linux")]
     fn report_session(app: &mut App, target: &str, seq: u64, accepts_instructions: bool) -> String {
-        report_session_from(app, target, seq, accepts_instructions, None)
+        report_session_from(
+            app,
+            target,
+            seq,
+            accepts_instructions,
+            Some(FIXTURE_RUNTIME),
+        )
     }
 
     /// A v2 session report whose listener lives in the JS runtime `runtime`.
@@ -977,11 +1014,11 @@ mod tests {
         let bytes = rx.try_recv().expect("the instruction was written");
         let written = std::str::from_utf8(&bytes).unwrap();
         let header = written
-            .strip_prefix("\x1b[200~herdr-instruction:v2:")
+            .strip_prefix("\x1b[200~herdr-instruction:v3:")
             .and_then(|rest| rest.split_once('\n'))
             .expect("marked paste")
             .0;
-        let [id, expires_ms, length] = header.split(':').collect::<Vec<_>>()[..] else {
+        let [id, expires_ms, length, runtime] = header.split(':').collect::<Vec<_>>()[..] else {
             panic!("header {header:?}");
         };
         assert!(
@@ -1001,9 +1038,10 @@ mod tests {
                 && expires_ms <= now_ms + INSTRUCTION_ACK_TIMEOUT.as_millis()
         );
         assert_eq!(length, text.len().to_string());
+        assert!(valid_listener_runtime(runtime), "{runtime:?}");
         assert_eq!(
             written,
-            format!("\x1b[200~herdr-instruction:v2:{header}\n{text}\x1b[201~")
+            format!("\x1b[200~herdr-instruction:v3:{header}\n{text}\x1b[201~")
         );
         assert!(rx.try_recv().is_err(), "nothing follows the paste");
         id.to_string()
@@ -1523,6 +1561,33 @@ mod tests {
         );
         let _second = start_instruct(&mut app, p);
         sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    /// The block carries the listener's runtime token, which a person's paste cannot know; with
+    /// no token registered nothing is written.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_block_is_bound_to_the_listener_runtime() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let _response = start_instruct(&mut app, p.clone());
+        let bytes = rx.try_recv().expect("the instruction was written");
+        let header = std::str::from_utf8(&bytes)
+            .unwrap()
+            .split('\n')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(header.ends_with(&format!(":{FIXTURE_RUNTIME}")), "{header}");
+
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .instruction_listener_runtime = None;
+        assert_eq!(instruct_error(&mut app, p), "agent_instruction_unsupported");
+        assert!(rx.try_recv().is_err());
     }
 
     /// A later delivery does not hide an earlier one's outcome from a caller that follows it.
