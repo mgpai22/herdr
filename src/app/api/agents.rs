@@ -1419,6 +1419,39 @@ mod tests {
         assert_ne!(second, id);
     }
 
+    /// A block written just before `/restart` is never taken. The restarted image's report settles
+    /// it and keeps the listener it registers.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_exec_restart_with_an_untaken_block_keeps_the_new_listener() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let reported = report_session_from(&mut app, &target, 10, true, Some("first"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        let _response = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+
+        let reported = report_session_from(&mut app, &target, 11, true, Some("after-exec"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Unconfirmed
+        );
+        assert!(
+            app.agent_info_for_target(&target)
+                .unwrap()
+                .accepts_instructions
+        );
+        let _second = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+    }
+
     /// A later delivery does not hide an earlier one's outcome from a caller that follows it.
     #[cfg(target_os = "linux")]
     #[tokio::test]

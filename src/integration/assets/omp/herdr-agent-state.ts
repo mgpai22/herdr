@@ -590,19 +590,27 @@ export default function (pi) {
   // compaction. Automatic compactions announce start and end, including an Esc abort. A manual
   // `/compact` announces nothing before `session.compacting`, which also comes from background
   // speculation, so session changes and turn starts clear the flag too.
+  //
+  // The instruction state (listener, awaited deliveries, compaction hold) is module-level, and
+  // OMP binds this same module again for every task subagent in the process. Each handler that
+  // touches it acts only for the root session, so a subagent's events never change it.
   pi.on("auto_compaction_start", () => {
-    compacting = true;
+    if (rootSession) {
+      compacting = true;
+    }
   });
   // Background speculation also emits it, from inside a turn; only a manual compaction emits it
   // while the session is idle (its abort ended the turn), so only then does it hold prompts.
   pi.on("session.compacting", (_event, ctx) => {
-    if (ctx?.isIdle?.() === true) {
+    if (rootSession && ctx?.isIdle?.() === true) {
       compacting = true;
     }
   });
   for (const event of ["auto_compaction_end", "session_compact"]) {
     pi.on(event, () => {
-      compacting = false;
+      if (rootSession) {
+        compacting = false;
+      }
     });
   }
 
@@ -615,7 +623,7 @@ export default function (pi) {
 
   pi.on("message_start", (event) => {
     const message = event?.message;
-    if (awaitingAdmission.length === 0 || message?.role !== "user") {
+    if (!rootSession || awaitingAdmission.length === 0 || message?.role !== "user") {
       return;
     }
     const content = message.content;
@@ -726,9 +734,10 @@ export default function (pi) {
   });
 
   pi.on("session_shutdown", () => {
-    if (rootSession) {
-      clearPendingTimers();
+    if (!rootSession) {
+      return;
     }
+    clearPendingTimers();
     unsubscribeInstructions?.();
     unsubscribeInstructions = undefined;
     instructionListener = false;

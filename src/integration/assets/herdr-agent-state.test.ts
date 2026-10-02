@@ -103,9 +103,11 @@ function configureIntegrationEnvironment(recordingSocketPath: string) {
 
 function captureConnectionEndpoint() {
   let connectedEndpoint: unknown;
+  // Record the endpoint without dialing it: a `\\.\pipe\` path does not exist off Windows,
+  // and Bun can raise that connect error outside the integration's error handler.
   net.createConnection = ((...args: unknown[]) => {
     connectedEndpoint = args[0];
-    return Reflect.apply(originalCreateConnection, net, args);
+    return new net.Socket();
   }) as typeof net.createConnection;
   return () => connectedEndpoint;
 }
@@ -1256,6 +1258,105 @@ test("Oh My Pi reports an idle instruction that OMP drops without a turn", async
   listener?.(instructionBlock(afterSpeculation, "Report status"));
   await waitFor(() => outcomes(afterSpeculation).length === 2);
   expect(outcomes(afterSpeculation)).toEqual(["pending", "dropped"]);
+});
+
+test("Oh My Pi task subagents bound to the same module never touch the root's instructions", async () => {
+  const requests = await startRecordingServer("omp-subagent");
+  process.env.HERDR_OMP_INSTRUCTION_POLL_MS = "5";
+  // OMP imports the extension once and binds the same factory again for each task subagent.
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  const root = createExtensionHarness();
+  const sub = createExtensionHarness();
+  let listener: TerminalInputHandler | undefined;
+  let unsubscribed = 0;
+  let idle = true;
+  install({ ...root.pi, sendUserMessage: () => {} });
+  install({ ...sub.pi, sendUserMessage: () => {} });
+  const rootContext = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => idle,
+    ui: {
+      onTerminalInput(handler: TerminalInputHandler) {
+        listener = handler;
+        return () => {
+          unsubscribed += 1;
+        };
+      },
+    },
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-root.jsonl",
+      getSessionId: () => "omp-root",
+    },
+  };
+  const subContext = {
+    hasUI: false,
+    mode: "tui",
+    isIdle: () => false,
+    sessionManager: {
+      getSessionFile: () => "/tmp/omp-sub.jsonl",
+      getSessionId: () => "omp-sub",
+    },
+  };
+  await root.handlers.get("session_start")?.({ reason: "startup" }, rootContext);
+  await waitFor(() =>
+    requests.some((request) => isRecord(request) && request.method === "pane.report_agent_session_v2"));
+  const outcomes = (id: string) =>
+    instructionAcks(requests)
+      .map((ack) => ack.params)
+      .filter((ack) => ack.instruction_id === id)
+      .map((ack) => ack.outcome);
+  const runSubagent = async (message?: string) => {
+    await sub.handlers.get("session_start")?.({ reason: "startup" }, subContext);
+    await sub.handlers.get("auto_compaction_start")?.({ reason: "threshold" }, subContext);
+    if (message) {
+      await sub.handlers.get("message_start")?.({ message: { role: "user", content: message } }, subContext);
+    }
+    await sub.handlers.get("session_shutdown")?.({}, subContext);
+  };
+
+  // A subagent that ends during the root's run leaves the root listener in place.
+  await runSubagent();
+  expect(unsubscribed).toBe(0);
+
+  // An idle take OMP drops is still reported while a subagent compacts, sends the same text
+  // and ends.
+  const dropped = "00000000000000000000000000000001";
+  listener?.(instructionBlock(dropped, "Report status"));
+  await waitFor(() => outcomes(dropped).length === 1);
+  await runSubagent("Report status");
+  await waitFor(() => outcomes(dropped).length === 2);
+  expect(outcomes(dropped)).toEqual(["pending", "dropped"]);
+
+  // The root's own turn still claims its delivery after a subagent ended.
+  const ran = "00000000000000000000000000000002";
+  idle = true;
+  listener?.(instructionBlock(ran, "Check the logs"));
+  idle = false;
+  await waitFor(() => outcomes(ran).length === 1);
+  await runSubagent();
+  await root.handlers.get("message_start")?.(
+    { message: { role: "user", content: "Check the logs" } },
+    rootContext,
+  );
+  await waitFor(() => outcomes(ran).length === 2);
+  expect(outcomes(ran)).toEqual(["pending", "prompt"]);
+  expect(unsubscribed).toBe(0);
+
+  // The root's manual compaction holds its prompt; a subagent's compaction ending does not
+  // release that hold, so no false drop is reported.
+  const held = "00000000000000000000000000000003";
+  idle = true;
+  await root.handlers.get("session.compacting")?.({ messages: [] }, rootContext);
+  listener?.(instructionBlock(held, "Summarize the plan"));
+  await waitFor(() => outcomes(held).length === 1);
+  for (const event of ["auto_compaction_end", "session_compact"]) {
+    await sub.handlers.get(event)?.({}, subContext);
+  }
+  // Real time on purpose: the drop check is a timer, and ten of its 5 ms polls must pass.
+  await Bun.sleep(50);
+  expect(outcomes(held)).toEqual(["pending"]);
+  await root.handlers.get("session_shutdown")?.({}, rootContext);
 });
 
 test("Oh My Pi reports the same runtime instance across a reload and a new one after exec", async () => {
