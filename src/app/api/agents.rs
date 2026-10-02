@@ -44,6 +44,9 @@ pub(crate) struct PendingInstructionAck {
     /// Cleared once the listener proves it exists after this delivery was written (it took the
     /// block, or the integration reported it), even if the turn start is never confirmed.
     pub(super) withdraws_listener: bool,
+    /// The listener's JS runtime when the block was written. An exec restart keeps the process
+    /// incarnation but starts a new runtime, which knows nothing of this delivery.
+    pub(super) runtime: Option<String>,
 }
 
 /// How many deliveries per agent `AgentInfo.recent_instructions` keeps.
@@ -309,28 +312,10 @@ impl App {
         let Some(owner) = terminal.instruction_listener.clone() else {
             return Err(agent_not_found(id, &params.target));
         };
+        let listener_runtime = terminal.instruction_listener_runtime.clone();
         let terminal_id = terminal.id.clone();
         let launch_pending = terminal.managed_agent_launch_pending();
-        // Only the instructed process can answer for a delivery. One written to an earlier
-        // process in this pane never gets a final outcome, so settle it now.
-        let stale: Vec<String> = self
-            .pending_instruction_acks
-            .iter()
-            .filter(|(_, pending)| pending.terminal_id == terminal_id && pending.owner != owner)
-            .map(|(instruction_id, _)| instruction_id.clone())
-            .collect();
-        let now = Instant::now();
-        for instruction_id in stale {
-            if let Some(pending) = self.pending_instruction_acks.remove(&instruction_id) {
-                settle_unconfirmed(
-                    &mut self.state.terminals,
-                    &mut self.recent_instructions,
-                    &instruction_id,
-                    &pending,
-                    now,
-                );
-            }
-        }
+        self.settle_stale_deliveries(&terminal_id, &owner, listener_runtime.as_deref());
         // One delivery per agent until its outcome is final: while a block is unconfirmed the
         // listener may be gone (a second block would land in the editor), and while a taken
         // delivery waits for its turn, `last_instruction` must keep following it.
@@ -396,6 +381,7 @@ impl App {
                 tx,
                 deadline,
                 withdraws_listener: true,
+                runtime: listener_runtime,
             },
         );
         // Read after the write, so the result's `last_instruction` names this delivery.
@@ -450,6 +436,38 @@ impl App {
             ));
         });
         Ok(())
+    }
+
+    /// Only the listener a block was written to can answer for it. A delivery written to an
+    /// earlier process in the pane, or to the same process before an exec restart replaced its
+    /// runtime, never gets a final outcome, so it is settled as `unconfirmed` at once.
+    pub(super) fn settle_stale_deliveries(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        owner: &crate::platform::OwnerProcessIncarnation,
+        runtime: Option<&str>,
+    ) {
+        let stale: Vec<String> = self
+            .pending_instruction_acks
+            .iter()
+            .filter(|(_, pending)| {
+                pending.terminal_id == *terminal_id
+                    && (pending.owner != *owner || pending.runtime.as_deref() != runtime)
+            })
+            .map(|(instruction_id, _)| instruction_id.clone())
+            .collect();
+        let now = Instant::now();
+        for instruction_id in stale {
+            if let Some(pending) = self.pending_instruction_acks.remove(&instruction_id) {
+                settle_unconfirmed(
+                    &mut self.state.terminals,
+                    &mut self.recent_instructions,
+                    &instruction_id,
+                    &pending,
+                    now,
+                );
+            }
+        }
     }
 
     /// Settles deliveries whose wait has passed. A never-taken delivery may mean the listener is
@@ -891,6 +909,18 @@ mod tests {
     /// A v2 session report from this test process, as the OMP integration sends it.
     #[cfg(target_os = "linux")]
     fn report_session(app: &mut App, target: &str, seq: u64, accepts_instructions: bool) -> String {
+        report_session_from(app, target, seq, accepts_instructions, None)
+    }
+
+    /// A v2 session report whose listener lives in the JS runtime `runtime`.
+    #[cfg(target_os = "linux")]
+    fn report_session_from(
+        app: &mut App,
+        target: &str,
+        seq: u64,
+        accepts_instructions: bool,
+        runtime: Option<&str>,
+    ) -> String {
         let pid = std::process::id();
         app.handle_pane_report_agent_session_v2(
             "v2".into(),
@@ -905,6 +935,7 @@ mod tests {
                 launch_profile: "default".into(),
                 agent_pid: pid,
                 accepts_instructions,
+                runtime_instance: runtime.map(str::to_string),
                 peer_pid: Some(pid),
             },
         )
@@ -1330,6 +1361,62 @@ mod tests {
             .expect("last instruction");
         assert_eq!(last.instruction_id, id);
         last.outcome
+    }
+
+    /// `/restart` execs a new OMP image in the same process: same incarnation, new runtime. Only
+    /// that tells herdr the taken delivery is gone; an extension reload keeps the runtime and the
+    /// running prompt, so it keeps following the delivery.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_exec_restart_settles_the_taken_delivery_but_a_reload_does_not() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let reported = report_session_from(&mut app, &target, 10, true, Some("first"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        let _response = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        let acked = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionOutcome::Pending,
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
+            "{acked}"
+        );
+
+        // Reload: same runtime, the prompt may still start.
+        let reported = report_session_from(&mut app, &target, 11, true, Some("first"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Pending
+        );
+        assert_eq!(instruct_error(&mut app, p.clone()), "agent_not_ready");
+        assert!(rx.try_recv().is_err());
+
+        // Exec restart: new runtime, the old delivery can never finish.
+        let reported = report_session_from(&mut app, &target, 12, true, Some("after-exec"));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Unconfirmed
+        );
+        let _second = start_instruct(&mut app, p);
+        let second = sent_instruction_id(&mut rx, "Report current status");
+        assert_ne!(second, id);
     }
 
     /// A later delivery does not hide an earlier one's outcome from a caller that follows it.

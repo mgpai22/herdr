@@ -100,6 +100,12 @@ let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
 let registeredSessionKey: string | undefined;
 const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() || "default";
+// Identifies this JS runtime. An extension reload keeps it (same globalThis), so herdr keeps
+// following deliveries the running prompt still owns; an exec restart (`/restart`, same pid
+// and start time) starts a new runtime, so herdr knows the old deliveries are gone.
+const runtimeSlot = globalThis as { [key: symbol]: string | undefined };
+const RUNTIME_KEY = Symbol.for("herdr.omp.runtime");
+const runtimeInstance = (runtimeSlot[RUNTIME_KEY] ??= crypto.randomUUID());
 // A herdr `agent.instruct` delivery: one bracketed paste with no Enter. The header carries the
 // instruction id, the unix ms after which the block must be discarded, and the text's UTF-8
 // byte length. OMP hands a paste to input listeners as one string, plus an Enter typed in the
@@ -256,6 +262,7 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
       launch_profile: launchProfile,
       agent_pid: process.pid,
       accepts_instructions: instructionListener,
+      runtime_instance: runtimeInstance,
       ...sessionRef,
     },
   }));
@@ -586,8 +593,12 @@ export default function (pi) {
   pi.on("auto_compaction_start", () => {
     compacting = true;
   });
-  pi.on("session.compacting", () => {
-    compacting = true;
+  // Background speculation also emits it, from inside a turn; only a manual compaction emits it
+  // while the session is idle (its abort ended the turn), so only then does it hold prompts.
+  pi.on("session.compacting", (_event, ctx) => {
+    if (ctx?.isIdle?.() === true) {
+      compacting = true;
+    }
   });
   for (const event of ["auto_compaction_end", "session_compact"]) {
     pi.on(event, () => {

@@ -3127,6 +3127,13 @@
             "pane_id": {
               "type": "string"
             },
+            "runtime_instance": {
+              "description": "Opaque id of the integration's JS runtime: the same across an extension reload, new after\nan exec restart of the same process.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "seq": {
               "format": "uint64",
               "minimum": 0,
@@ -9812,7 +9819,8 @@
             {
               "properties": {
                 "agent": {
-                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo",
+                  "description": "The agent right after the block was written, before OMP took it: its `agent_status`\nand its `last_instruction` (`written`) describe that moment. `delivered_as` is the\noutcome; read `agent.get` for the current status."
                 },
                 "delivered_as": {
                   "$ref": "#/schemas/success_response/$defs/InstructionDelivery"

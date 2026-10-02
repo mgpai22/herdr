@@ -1246,6 +1246,54 @@ test("Oh My Pi reports an idle instruction that OMP drops without a turn", async
   await harness.handlers.get("auto_compaction_end")?.({ aborted: true }, harness.context);
   await waitFor(() => outcomes(cancelled).length === 2);
   expect(outcomes(cancelled)).toEqual(["pending", "dropped"]);
+
+  // Background speculation emits session.compacting from inside a turn and then just arms its
+  // result: the idle session after that turn holds nothing, so a rejected send is a drop.
+  const afterSpeculation = "00000000000000000000000000000006";
+  harness.setIdle(false);
+  await harness.handlers.get("session.compacting")?.({ messages: [] }, harness.context);
+  harness.setIdle(true);
+  listener?.(instructionBlock(afterSpeculation, "Report status"));
+  await waitFor(() => outcomes(afterSpeculation).length === 2);
+  expect(outcomes(afterSpeculation)).toEqual(["pending", "dropped"]);
+});
+
+test("Oh My Pi reports the same runtime instance across a reload and a new one after exec", async () => {
+  const requests = await startRecordingServer("omp-runtime");
+  // What an exec restart does: a new JS runtime has no herdr slot on globalThis.
+  const forgetRuntime = () => Reflect.deleteProperty(globalThis, Symbol.for("herdr.omp.runtime"));
+  forgetRuntime();
+  const instanceOfNextLoad = async () => {
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+    install(pi);
+    const before = requests.length;
+    await handlers.get("session_start")?.({ reason: "startup" }, {
+      hasUI: true,
+      mode: "tui",
+      isIdle: () => true,
+      ui: { onTerminalInput: () => () => {} },
+      sessionManager: {
+        getSessionFile: () => "/tmp/omp-runtime.jsonl",
+        getSessionId: () => "omp-runtime",
+      },
+    });
+    const report = () =>
+      requests
+        .slice(before)
+        .find((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as
+        | { params: Record<string, unknown> }
+        | undefined;
+    await waitFor(() => report() !== undefined);
+    return report()?.params.runtime_instance;
+  };
+  const first = await instanceOfNextLoad();
+  expect(typeof first).toBe("string");
+  // An extension reload imports the module again in the same runtime.
+  expect(await instanceOfNextLoad()).toBe(first);
+  forgetRuntime();
+  expect(await instanceOfNextLoad()).not.toBe(first);
+  forgetRuntime();
 });
 
 test("Oh My Pi drops a late or cut-short instruction unsent and keeps its listener reported", async () => {

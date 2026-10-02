@@ -105,6 +105,9 @@ pub enum ResponseResult {
         agent: AgentInfo,
     },
     AgentInstructed {
+        /// The agent right after the block was written, before OMP took it: its `agent_status`
+        /// and its `last_instruction` (`written`) describe that moment. `delivered_as` is the
+        /// outcome; read `agent.get` for the current status.
         agent: AgentInfo,
         instruction_id: String,
         delivered_as: super::panes::InstructionDelivery,

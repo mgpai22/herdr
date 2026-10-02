@@ -1763,9 +1763,17 @@ impl App {
         // A report without the listener flag (integration v11 or no UI) withdraws it. A report
         // after a delivery proves the listener outlived it, so that delivery cannot withdraw it
         // when it expires unconfirmed.
+        let runtime = params
+            .runtime_instance
+            .filter(|_| params.accepts_instructions);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.instruction_listener = params.accepts_instructions.then_some(owner_after);
+            terminal.instruction_listener =
+                params.accepts_instructions.then(|| owner_after.clone());
+            terminal.instruction_listener_runtime = runtime.clone();
         }
+        // After `/restart` (exec: same process, new runtime) the old deliveries are gone; an
+        // extension reload keeps the runtime and the running prompt.
+        self.settle_stale_deliveries(&terminal_id, &owner_after, runtime.as_deref());
         for pending in self.pending_instruction_acks.values_mut() {
             if pending.terminal_id == terminal_id {
                 pending.withdraws_listener = false;

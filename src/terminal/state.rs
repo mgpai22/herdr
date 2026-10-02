@@ -33,6 +33,8 @@ pub(crate) struct HandoffAgentState {
     acquisition_pending: bool,
     #[serde(default)]
     instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
+    #[serde(default)]
+    instruction_listener_runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +143,8 @@ pub struct TerminalState {
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     /// OMP process incarnation whose integration registered an `agent.instruct` listener.
     pub(crate) instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
+    /// The listener's JS runtime (`runtime_instance` of its report).
+    pub(crate) instruction_listener_runtime: Option<String>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -182,6 +186,7 @@ impl TerminalState {
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
             instruction_listener: None,
+            instruction_listener_runtime: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -244,6 +249,7 @@ impl TerminalState {
             sequence: self.hook_report_sequences.get(&authority.source).copied(),
             acquisition_pending: self.agent_process_acquisition_pending,
             instruction_listener: self.instruction_listener.clone(),
+            instruction_listener_runtime: self.instruction_listener_runtime.clone(),
         })
     }
 
@@ -258,6 +264,7 @@ impl TerminalState {
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
         self.instruction_listener = snapshot.instruction_listener;
+        self.instruction_listener_runtime = snapshot.instruction_listener_runtime;
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
@@ -2478,10 +2485,15 @@ mod tests {
             start_time_ticks: 7,
         };
         terminal.instruction_listener = Some(listener.clone());
+        terminal.instruction_listener_runtime = Some("runtime".into());
         let wire = serde_json::to_value(terminal.handoff_agent_state().unwrap()).unwrap();
         let mut imported = test_terminal();
         imported.restore_handoff_agent_state(serde_json::from_value(wire).unwrap());
         assert_eq!(imported.instruction_listener, Some(listener));
+        assert_eq!(
+            imported.instruction_listener_runtime.as_deref(),
+            Some("runtime")
+        );
     }
 
     #[test]

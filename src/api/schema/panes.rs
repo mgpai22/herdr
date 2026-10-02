@@ -407,6 +407,10 @@ pub struct PaneReportAgentSessionV2Params {
     /// The integration consumes `agent.instruct` deliveries (OMP integration v12+).
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub accepts_instructions: bool,
+    /// Opaque id of the integration's JS runtime: the same across an extension reload, new after
+    /// an exec restart of the same process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_instance: Option<String>,
     #[serde(skip)]
     #[schemars(skip)]
     pub peer_pid: Option<u32>,
