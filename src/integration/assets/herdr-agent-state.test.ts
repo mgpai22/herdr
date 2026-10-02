@@ -11,6 +11,7 @@ const originalEnvironment = {
   HERDR_ENV: process.env.HERDR_ENV,
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
   HERDR_OMP_SESSION_RETRY_MS: process.env.HERDR_OMP_SESSION_RETRY_MS,
+  HERDR_OMP_INSTRUCTION_POLL_MS: process.env.HERDR_OMP_INSTRUCTION_POLL_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
   OMPCODE: process.env.OMPCODE,
@@ -1049,9 +1050,21 @@ async function installOmpWithTerminalInput(name: string, ui: Record<string, unkn
   const requests = await startRecordingServer(name);
   const { handlers, pi } = createExtensionHarness();
   const sent: unknown[][] = [];
+  process.env.HERDR_OMP_INSTRUCTION_POLL_MS = "5";
   const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
-  install({ ...pi, sendUserMessage: (...args: unknown[]) => sent.push(args) });
   let idle = true;
+  // Like OMP, a send makes the session busy while it prepares the turn; a test that drops the
+  // send turns this off or sets the session idle again.
+  let busyOnSend = true;
+  install({
+    ...pi,
+    sendUserMessage: (...args: unknown[]) => {
+      sent.push(args);
+      if (busyOnSend) {
+        idle = false;
+      }
+    },
+  });
   const context = {
     hasUI: true,
     mode: "tui",
@@ -1066,7 +1079,15 @@ async function installOmpWithTerminalInput(name: string, ui: Record<string, unkn
     requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as {
       params: Record<string, unknown>;
     }[];
-  return { requests, handlers, sent, context, reports, setIdle: (value: boolean) => (idle = value) };
+  return {
+    requests,
+    handlers,
+    sent,
+    context,
+    reports,
+    setIdle: (value: boolean) => (idle = value),
+    setBusyOnSend: (value: boolean) => (busyOnSend = value),
+  };
 }
 
 function instructionBlock(
@@ -1096,46 +1117,43 @@ test("Oh My Pi hands a herdr instruction to OMP and acks it once OMP takes it", 
   expect(harness.reports()[0].params.accepts_instructions).toBe(true);
 
   const id = "0123456789abcdef0123456789abcdef";
-  const laterId = "00000000000000000000000000000001";
-  const text = "Report état\nthen stop";
-  const mention = "review the diff with ^openai/gpt-5.1";
-  // Acks use their own connections, so their arrival order is not fixed.
+  const text = "review état with ^openai/gpt-5.1\nthen stop";
   const acks = () => instructionAcks(harness.requests).map((ack) => ack.params);
-  const byId = (list: Record<string, unknown>[]) =>
-    [...list].sort((a, b) => String(a.instruction_id).localeCompare(String(b.instruction_id)));
   // Idle: always an aside, so a turn that starts meanwhile is not cut by a steer. The take is
-  // acked at once: OMP holds the text even if its turn starts after herdr stops waiting.
-  expect(listener?.(instructionBlock(id, mention))).toEqual({ consume: true });
-  expect(listener?.(instructionBlock(laterId, text))).toEqual({ consume: true });
-  expect(harness.sent).toEqual([
-    [mention, { deliverAs: "aside" }],
-    [text, { deliverAs: "aside" }],
-  ]);
-  await waitFor(() => acks().length === 2);
-  expect(byId(acks())).toEqual([
-    { pane_id: "test:p1", instruction_id: laterId, agent_pid: process.pid, delivered_as: "pending" },
-    { pane_id: "test:p1", instruction_id: id, agent_pid: process.pid, delivered_as: "pending" },
-  ]);
-  // Turn starts: an exact text match first; OMP rewrites model mentions, so otherwise the
-  // oldest waiting delivery is the one that started.
+  // acked at once, and OMP is busy preparing the turn.
+  expect(listener?.(instructionBlock(id, text))).toEqual({ consume: true });
+  expect(harness.sent).toEqual([[text, { deliverAs: "aside" }]]);
+  await waitFor(() => acks().length === 1);
+  expect(acks()[0]).toEqual({
+    pane_id: "test:p1",
+    instruction_id: id,
+    agent_pid: process.pid,
+    outcome: "pending",
+  });
+  // The turn starts with OMP's rewritten mention; an assistant message or a person's own
+  // prompt never claims the delivery.
   const messageStart = harness.handlers.get("message_start");
   messageStart?.({ message: { role: "assistant", content: [{ type: "text", text }] } }, harness.context);
-  messageStart?.({ message: { role: "user", content: "review the diff with <agent>gpt</agent>" } }, harness.context);
-  await waitFor(() => acks().length === 3);
-  expect(acks()[2]).toMatchObject({ instruction_id: id, delivered_as: "prompt" });
-  messageStart?.({ message: { role: "user", content: [{ type: "text", text }] } }, harness.context);
   messageStart?.({ message: { role: "user", content: "a person's own prompt" } }, harness.context);
-  await waitFor(() => acks().length === 4);
-  expect(acks()[3]).toMatchObject({ instruction_id: laterId, delivered_as: "prompt" });
+  messageStart?.(
+    {
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "review état with <agent>m1</agent>\nthen stop" }],
+      },
+    },
+    harness.context,
+  );
+  await waitFor(() => acks().length === 2);
+  expect(acks()[1]).toMatchObject({ instruction_id: id, outcome: "prompt" });
 
-  harness.setIdle(false);
   // Busy: the aside is queued, so one ack goes at once. A person's Enter that arrived in the
   // same read still reaches the editor.
   const busyId = "fedcba9876543210fedcba9876543210";
   expect(listener?.(`${instructionBlock(busyId, text)}\r`)).toEqual({ data: "\r" });
-  expect(harness.sent[2]).toEqual([text, { deliverAs: "aside" }]);
-  await waitFor(() => acks().length === 5);
-  expect(acks()[4]).toMatchObject({ instruction_id: busyId, delivered_as: "aside" });
+  expect(harness.sent[1]).toEqual([text, { deliverAs: "aside" }]);
+  await waitFor(() => acks().length === 3);
+  expect(acks()[2]).toMatchObject({ instruction_id: busyId, outcome: "aside" });
 
   for (const ordinary of [
     `\x1b[200~herdr-instruction:v1:${id}\nx\x1b[201~`,
@@ -1146,9 +1164,72 @@ test("Oh My Pi hands a herdr instruction to OMP and acks it once OMP takes it", 
   ]) {
     expect(listener?.(ordinary)).toBeUndefined();
   }
-  expect(harness.sent).toHaveLength(3);
+  expect(harness.sent).toHaveLength(2);
   expect(harness.reports()).toHaveLength(1);
-  expect(acks()).toHaveLength(5);
+  expect(acks()).toHaveLength(3);
+});
+
+test("Oh My Pi reports an idle instruction that OMP drops without a turn", async () => {
+  let listener: TerminalInputHandler | undefined;
+  const harness = await installOmpWithTerminalInput("omp-instruct-dropped", {
+    onTerminalInput(handler: TerminalInputHandler) {
+      listener = handler;
+      return () => {};
+    },
+  });
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  await waitFor(() => harness.reports().length === 1);
+  const acks = () => instructionAcks(harness.requests).map((ack) => ack.params);
+  const outcomes = (id: string) =>
+    acks()
+      .filter((ack) => ack.instruction_id === id)
+      .map((ack) => ack.outcome);
+
+  // Rejected at once (no model or API key): the session never gets busy.
+  const rejected = "00000000000000000000000000000001";
+  harness.setBusyOnSend(false);
+  listener?.(instructionBlock(rejected, "Report status"));
+  await waitFor(() => outcomes(rejected).length === 2);
+  expect(outcomes(rejected)).toEqual(["pending", "dropped"]);
+
+  // Esc during the turn's preparation: busy, then idle without a turn. A later prompt with
+  // the same text, typed by the person from the editor OMP refilled, is not the delivery.
+  const aborted = "00000000000000000000000000000002";
+  harness.setBusyOnSend(true);
+  listener?.(instructionBlock(aborted, "Report status"));
+  await waitFor(() => outcomes(aborted).length === 1);
+  harness.setIdle(true);
+  await waitFor(() => outcomes(aborted).length === 2);
+  expect(outcomes(aborted)).toEqual(["pending", "dropped"]);
+  harness.handlers.get("message_start")?.(
+    { message: { role: "user", content: "Report status" } },
+    harness.context,
+  );
+
+  // A manual compaction holds the prompt while the session looks idle: not a drop until the
+  // compaction ends without a turn.
+  const held = "00000000000000000000000000000003";
+  harness.setBusyOnSend(false);
+  await harness.handlers.get("session_before_compact")?.({}, harness.context);
+  listener?.(instructionBlock(held, "Report status"));
+  await waitFor(() => outcomes(held).length === 1);
+  const heldToo = "00000000000000000000000000000004";
+  listener?.(instructionBlock(heldToo, "Check the logs"));
+  await waitFor(() => outcomes(heldToo).length === 1);
+  // Real time on purpose: the drop check is a timer, and ten of its 5 ms polls must pass.
+  await Bun.sleep(50);
+  expect(outcomes(held)).toEqual(["pending"]);
+  // Each turn claims only its own delivery, never the oldest waiting one.
+  const messageStart = harness.handlers.get("message_start");
+  messageStart?.({ message: { role: "user", content: "a person's own prompt" } }, harness.context);
+  messageStart?.({ message: { role: "user", content: "Check the logs" } }, harness.context);
+  await waitFor(() => outcomes(heldToo).length === 2);
+  expect(outcomes(heldToo)).toEqual(["pending", "prompt"]);
+  expect(outcomes(held)).toEqual(["pending"]);
+  messageStart?.({ message: { role: "user", content: "Report status" } }, harness.context);
+  await waitFor(() => outcomes(held).length === 2);
+  expect(outcomes(held)).toEqual(["pending", "prompt"]);
+  expect(outcomes(aborted)).toEqual(["pending", "dropped"]);
 });
 
 test("Oh My Pi drops a late or cut-short instruction unsent and keeps its listener reported", async () => {

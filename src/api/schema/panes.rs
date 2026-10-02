@@ -421,8 +421,36 @@ pub enum InstructionDelivery {
     /// Queued for the next step boundary of a running or blocked session.
     Aside,
     /// OMP took the text on an idle session but had not started its turn when Herdr stopped
-    /// waiting. OMP still holds the text: never send it again.
+    /// waiting. The outcome is not final: `AgentInfo.last_instruction` later shows `prompt` or
+    /// `dropped`.
     Pending,
+}
+
+/// What became of an `agent.instruct` delivery, as the OMP integration reports it and as
+/// `AgentInfo.last_instruction` shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionOutcome {
+    /// Written to the terminal; OMP has not confirmed taking it. Never sent by the integration.
+    Written,
+    /// OMP took the text on an idle session and is preparing its turn.
+    Pending,
+    /// The turn with the text started.
+    Prompt,
+    /// Queued for the next step boundary of a running or blocked session.
+    Aside,
+    /// OMP took the text but went idle without starting its turn (no model or API key, usage
+    /// limit, Esc, session change). Nothing ran; OMP may have put the text into an empty editor.
+    Dropped,
+    /// Nothing final was confirmed in time; the outcome is unknown. Never sent by the integration.
+    Unconfirmed,
+}
+
+/// The latest `agent.instruct` delivery to an agent and its outcome so far.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LastInstructionInfo {
+    pub instruction_id: String,
+    pub outcome: InstructionOutcome,
 }
 
 /// Sent by the OMP integration process that consumed an `agent.instruct` delivery.
@@ -432,7 +460,8 @@ pub struct PaneAckInstructionParams {
     pub pane_id: String,
     pub instruction_id: String,
     pub agent_pid: u32,
-    pub delivered_as: InstructionDelivery,
+    /// `pending`, `prompt`, `aside` or `dropped`.
+    pub outcome: InstructionOutcome,
     #[serde(skip)]
     #[schemars(skip)]
     pub peer_pid: Option<u32>,

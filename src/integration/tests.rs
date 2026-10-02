@@ -949,6 +949,35 @@ fn install_omp_continues_past_a_profile_it_cannot_write() {
 }
 
 #[test]
+fn install_omp_accepts_the_default_omp_agent_dir_as_pi_coding_agent_dir() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let default_agent = home.join(".omp/agent");
+    fs::create_dir_all(default_agent.join("extensions")).unwrap();
+    std::env::set_var("HOME", &home);
+    // What a default-profile OMP session exports to the commands it runs.
+    std::env::set_var(PI_CODING_AGENT_DIR_ENV_VAR, &default_agent);
+
+    let installed = install_omp()
+        .unwrap()
+        .into_iter()
+        .map(|installed| installed.extension_path)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        installed,
+        vec![default_agent
+            .join("extensions")
+            .join(OMP_EXTENSION_INSTALL_NAME)]
+    );
+
+    std::env::remove_var("HOME");
+    clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 fn omp_integration_inside_a_named_profile_session_still_covers_the_default_profile() {
     let _lock = integration_env_lock();
     let base = unique_base();

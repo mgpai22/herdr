@@ -475,6 +475,10 @@ impl App {
             agent_session: pane.agent_session,
             runtime_id,
             accepts_instructions,
+            last_instruction: self
+                .last_instructions
+                .get(&terminal.id)
+                .map(|last| last.info.clone()),
             launch_profile,
             launch_executable,
             workspace_id: pane.workspace_id,

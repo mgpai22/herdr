@@ -106,28 +106,64 @@ const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim(
 // same read.
 const INSTRUCTION =
   /^\x1b\[200~herdr-instruction:v2:([0-9a-f]{32}):(\d+):(\d+)\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
-// How long an idle delivery waits for OMP to start its turn. herdr stops waiting much earlier;
-// a later ack only gets instruction_not_found.
-const admissionWaitMs = 30_000;
+// herdr follows a taken delivery this long; a later ack only gets instruction_not_found.
+const admissionWaitMs = 120_000;
+// How often an idle delivery checks whether OMP went idle again without starting its turn.
+const admissionPollMs = parseDurationEnv("HERDR_OMP_INSTRUCTION_POLL_MS", 250);
+// A model mention, as OMP's editor finds it. OMP rewrites a mention of a known model into an
+// agent tag before the turn starts.
+const MODEL_MENTION = /(^|\s)\^[^\s^]+(?=\s|$)/g;
 let instructionListener = false;
 let unsubscribeInstructions: (() => void) | undefined;
-// Idle deliveries handed to OMP and acked as taken, acked again once OMP starts their turn.
-let awaitingAdmission: { instructionId: string; text: string; until: number }[] = [];
+// Idle deliveries handed to OMP and acked as taken, acked again when OMP starts their turn or
+// goes idle without starting it.
+let awaitingAdmission: {
+  instructionId: string;
+  turnText: RegExp;
+  idlePolls: number;
+  until: number;
+}[] = [];
+let admissionTimer: ReturnType<typeof setInterval> | undefined;
+// A manual compaction holds new prompts while the session looks idle.
+let compacting = false;
 
-// `pending`: OMP took the text and will start a turn with it. `prompt`: the turn started.
-// `aside`: queued for the running turn. Sent outside the report queue, so an ack never waits
-// behind state reports and reaches herdr inside its wait.
-function ackInstruction(instructionId: string, deliveredAs: "pending" | "prompt" | "aside"): void {
+// `pending`: OMP took the text and prepares its turn. `prompt`: the turn started. `aside`:
+// queued for the running turn. `dropped`: OMP went idle without starting the turn, so nothing
+// ran. Sent outside the report queue, so an ack never waits behind state reports.
+function ackInstruction(
+  instructionId: string,
+  outcome: "pending" | "prompt" | "aside" | "dropped",
+): void {
   void sendRequestNow(() => ({
-    id: `${source}:instruction:${instructionId}:${deliveredAs}:${Date.now()}`,
+    id: `${source}:instruction:${instructionId}:${outcome}:${Date.now()}`,
     method: "pane.ack_instruction",
     params: {
       pane_id: paneId,
       instruction_id: instructionId,
       agent_pid: process.pid,
-      delivered_as: deliveredAs,
+      outcome,
     },
   }));
+}
+
+// Matches the text of the user message OMP starts the turn with: the delivered text, with each
+// model mention allowed to have been rewritten.
+function turnTextPattern(text: string): RegExp {
+  const escape = (part: string) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let pattern = "";
+  let last = 0;
+  for (const mention of text.matchAll(MODEL_MENTION)) {
+    const start = mention.index + mention[1].length;
+    pattern += `${escape(text.slice(last, start))}[\\s\\S]*?`;
+    last = start + mention[0].length - mention[1].length;
+  }
+  return new RegExp(`^${pattern}${escape(text.slice(last))}$`);
+}
+
+function stopAdmissionWatch(): void {
+  clearInterval(admissionTimer);
+  admissionTimer = undefined;
+  awaitingAdmission = [];
 }
 
 function nextReportSeq(): number {
@@ -435,10 +471,40 @@ export default function (pi) {
     // idle send (no model, no API key) only on screen. So the take is acked at once, which tells
     // herdr the text must never be sent again, and the turn start is acked when it happens.
     ackInstruction(instructionId, "pending");
-    const now = Date.now();
-    awaitingAdmission = awaitingAdmission.filter((entry) => entry.until > now);
-    awaitingAdmission.push({ instructionId, text, until: now + admissionWaitMs });
+    awaitingAdmission.push({
+      instructionId,
+      turnText: turnTextPattern(text),
+      idlePolls: 0,
+      until: Date.now() + admissionWaitMs,
+    });
+    watchAdmissions(ctx);
     return rest;
+  }
+
+  // OMP's send gives no result to an extension. A send it drops (no model or API key, usage
+  // limit, Esc during preparation, session change) leaves the session idle without a turn:
+  // that, seen on two polls in a row outside a manual compaction, is a drop.
+  function watchAdmissions(ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) {
+    if (admissionTimer) {
+      return;
+    }
+    admissionTimer = setInterval(() => {
+      const now = Date.now();
+      const idle =
+        !compacting && ctx?.isIdle?.() === true && ctx?.hasPendingMessages?.() !== true;
+      awaitingAdmission = awaitingAdmission.filter((entry) => {
+        entry.idlePolls = idle ? entry.idlePolls + 1 : 0;
+        if (entry.idlePolls >= 2) {
+          ackInstruction(entry.instructionId, "dropped");
+          return false;
+        }
+        return entry.until > now;
+      });
+      if (awaitingAdmission.length === 0) {
+        stopAdmissionWatch();
+      }
+    }, admissionPollMs);
+    admissionTimer.unref?.();
   }
 
   function registerInstructionListener(ctx: {
@@ -510,6 +576,15 @@ export default function (pi) {
     publishState(true);
   });
 
+  // A cancelled compaction can end without session_compact; a turn start proves none holds
+  // prompts back.
+  pi.on("session_before_compact", () => {
+    compacting = true;
+  });
+  pi.on("session_compact", () => {
+    compacting = false;
+  });
+
   // Branch and tree navigation end without session_switch, after OMP dropped the listener.
   for (const event of ["session_branch", "session_tree"]) {
     pi.on(event, (_event, ctx) => {
@@ -532,14 +607,13 @@ export default function (pi) {
               .map((part) => part.text)
               .join("\n")
           : undefined;
-    const now = Date.now();
-    awaitingAdmission = awaitingAdmission.filter((entry) => entry.until > now);
-    // OMP can rewrite the text (model mentions such as `^provider/model`), so without an exact
-    // match the oldest waiting delivery is the one this turn started with.
-    const exact = awaitingAdmission.findIndex((entry) => entry.text === text);
-    const [admitted] = awaitingAdmission.splice(exact >= 0 ? exact : 0, 1);
-    if (admitted) {
-      ackInstruction(admitted.instructionId, "prompt");
+    // Only the delivered text starts its turn; a person's own prompt never claims it.
+    const index =
+      typeof text === "string"
+        ? awaitingAdmission.findIndex((entry) => entry.turnText.test(text))
+        : -1;
+    if (index >= 0) {
+      ackInstruction(awaitingAdmission.splice(index, 1)[0].instructionId, "prompt");
     }
   });
 
@@ -558,6 +632,7 @@ export default function (pi) {
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
+    compacting = false;
     registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession();
@@ -636,6 +711,7 @@ export default function (pi) {
     unsubscribeInstructions?.();
     unsubscribeInstructions = undefined;
     instructionListener = false;
-    awaitingAdmission = [];
+    stopAdmissionWatch();
+    compacting = false;
   });
 }

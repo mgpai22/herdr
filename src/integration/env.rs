@@ -56,6 +56,12 @@ pub(crate) fn omp_extension_dir() -> io::Result<PathBuf> {
     Ok(omp_config_root()?.join("agent").join("extensions"))
 }
 
+/// True for an agent dir that OMP owns: its default `<OMP config root>/agent` or a named
+/// profile's agent dir. A `PI_CODING_AGENT_DIR` naming one of these is OMP's, not Pi's.
+pub(crate) fn is_omp_agent_dir(dir: &Path) -> bool {
+    is_omp_profile_agent_dir(dir) || omp_config_root().is_ok_and(|root| dir == root.join("agent"))
+}
+
 /// True for `<OMP config root>/profiles/<name>/agent`, the agent dir OMP derives for a named
 /// profile.
 pub(crate) fn is_omp_profile_agent_dir(dir: &Path) -> bool {

@@ -1796,6 +1796,17 @@ impl App {
         id: String,
         params: crate::api::schema::PaneAckInstructionParams,
     ) -> String {
+        use crate::api::schema::InstructionOutcome;
+        if matches!(
+            params.outcome,
+            InstructionOutcome::Written | InstructionOutcome::Unconfirmed
+        ) {
+            return encode_error(
+                id,
+                "invalid_request",
+                "an instruction ack reports pending, prompt, aside or dropped",
+            );
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -1833,18 +1844,32 @@ impl App {
                 "the acknowledging process is not the instructed OMP process",
             );
         }
-        if params.delivered_as == crate::api::schema::InstructionDelivery::Pending {
-            // OMP took the block: its listener exists. Keep the entry for the turn-start ack.
+        let now = std::time::Instant::now();
+        let terminal_id = pending.terminal_id.clone();
+        if params.outcome == InstructionOutcome::Pending {
+            // OMP took the block, so its listener exists. Keep following the delivery until the
+            // integration reports the turn start or the drop.
             if let Some(pending) = self
                 .pending_instruction_acks
                 .get_mut(&params.instruction_id)
             {
                 pending.withdraws_listener = false;
-                let _ = pending.tx.send(params.delivered_as);
+                pending.deadline = now + super::agents::INSTRUCTION_OUTCOME_TTL;
+                let _ = pending.tx.send(params.outcome);
             }
         } else if let Some(pending) = self.pending_instruction_acks.remove(&params.instruction_id) {
-            let _ = pending.tx.send(params.delivered_as);
+            let _ = pending.tx.send(params.outcome);
         }
+        self.last_instructions.insert(
+            terminal_id,
+            super::agents::LastInstruction {
+                info: crate::api::schema::LastInstructionInfo {
+                    instruction_id: params.instruction_id,
+                    outcome: params.outcome,
+                },
+                until: now + super::agents::INSTRUCTION_OUTCOME_TTL,
+            },
+        );
         encode_success(id, ResponseResult::Ok {})
     }
 

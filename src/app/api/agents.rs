@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 
 use crate::api::schema::{
     AgentInstructParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams,
-    AgentStartParams, AgentTarget, InstructionDelivery, PaneReadResult, ResponseResult,
+    AgentStartParams, AgentTarget, InstructionDelivery, InstructionOutcome, LastInstructionInfo,
+    PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -26,15 +27,29 @@ const INSTRUCTION_QUEUE_LIMIT: Duration = Duration::from_secs(5);
 const INSTRUCTION_EXPIRY: Duration =
     Duration::from_millis(INSTRUCTION_ACK_TIMEOUT.as_millis() as u64 / 2);
 
-/// An `agent.instruct` delivery written to the PTY and waiting for the OMP integration ack.
+/// How long Herdr follows a taken delivery whose turn has not started, and keeps the last
+/// outcome in `AgentInfo.last_instruction`.
+#[cfg(not(test))]
+pub(super) const INSTRUCTION_OUTCOME_TTL: Duration = Duration::from_secs(120);
+#[cfg(test)]
+pub(super) const INSTRUCTION_OUTCOME_TTL: Duration = Duration::from_secs(2);
+
+/// An `agent.instruct` delivery written to the PTY whose outcome is not final yet.
 pub(crate) struct PendingInstructionAck {
     pub(super) terminal_id: crate::terminal::TerminalId,
     pub(super) owner: crate::platform::OwnerProcessIncarnation,
-    pub(super) tx: std::sync::mpsc::Sender<InstructionDelivery>,
+    pub(super) tx: std::sync::mpsc::Sender<InstructionOutcome>,
+    /// The ack wait until the take is confirmed, then the outcome wait.
     pub(super) deadline: Instant,
     /// Cleared once the listener proves it exists after this delivery was written (it took the
     /// block, or the integration reported it), even if the turn start is never confirmed.
     pub(super) withdraws_listener: bool,
+}
+
+/// `AgentInfo.last_instruction` for one terminal, until `until`.
+pub(crate) struct LastInstruction {
+    pub(crate) info: crate::api::schema::LastInstructionInfo,
+    pub(super) until: Instant,
 }
 
 /// The marked paste the OMP integration consumes: `v2:<id>:<expires unix ms>:<text bytes>`.
@@ -228,18 +243,19 @@ impl App {
         };
         let terminal_id = terminal.id.clone();
         let launch_pending = terminal.managed_agent_launch_pending();
-        // While an earlier block is unconfirmed, the listener may be gone; a second block would
-        // also land in the editor.
+        // One delivery per agent until its outcome is final: while a block is unconfirmed the
+        // listener may be gone (a second block would land in the editor), and while a taken
+        // delivery waits for its turn, `last_instruction` must keep following it.
         if self
             .pending_instruction_acks
             .values()
-            .any(|pending| pending.terminal_id == terminal_id && pending.withdraws_listener)
+            .any(|pending| pending.terminal_id == terminal_id)
         {
             return Err(encode_error(
                 id,
                 "agent_not_ready",
                 format!(
-                    "an earlier instruction to agent {} is not confirmed yet",
+                    "an earlier instruction to agent {} has no final outcome yet",
                     params.target
                 ),
             ));
@@ -274,8 +290,19 @@ impl App {
             return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
         }
         // Acks are handled by this app loop after this step, so registering now misses none.
-        let deadline = Instant::now() + INSTRUCTION_ACK_TIMEOUT;
+        let now = Instant::now();
+        let deadline = now + INSTRUCTION_ACK_TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
+        self.last_instructions.insert(
+            terminal_id.clone(),
+            LastInstruction {
+                info: LastInstructionInfo {
+                    instruction_id: instruction_id.clone(),
+                    outcome: InstructionOutcome::Written,
+                },
+                until: now + INSTRUCTION_OUTCOME_TTL,
+            },
+        );
         self.pending_instruction_acks.insert(
             instruction_id.clone(),
             PendingInstructionAck {
@@ -288,58 +315,84 @@ impl App {
         );
         let respond_to = respond_to.clone();
         std::thread::spawn(move || {
-            // A `pending` ack means OMP took the text; wait on for the turn start, and answer
-            // `pending` if it does not come in time. OMP still holds the text either way.
+            // A `pending` ack means OMP took the text; wait on for the turn start or the drop,
+            // and answer `pending` if neither comes in time.
             let mut taken = false;
-            let delivered_as = loop {
+            let outcome = loop {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(InstructionDelivery::Pending) => taken = true,
-                    Ok(delivered_as) => break Some(delivered_as),
-                    Err(_) => break taken.then_some(InstructionDelivery::Pending),
+                    Ok(InstructionOutcome::Pending) => taken = true,
+                    Ok(outcome) => break Some(outcome),
+                    Err(_) => break taken.then_some(InstructionOutcome::Pending),
                 }
             };
-            let response = match delivered_as {
-                Some(delivered_as) => encode_success(
-                    id,
-                    ResponseResult::AgentInstructed {
-                        agent,
-                        instruction_id,
-                        delivered_as,
-                    },
-                ),
-                None => encode_error(
-                    id,
-                    "instruction_unconfirmed",
-                    format!(
-                        "OMP did not confirm taking instruction {instruction_id}; it discards a block it reads more than {} ms late, but a lost confirmation looks the same, so do not send it again automatically",
-                        INSTRUCTION_EXPIRY.as_millis()
-                    ),
-                ),
+            let delivered_as = match outcome {
+                Some(InstructionOutcome::Prompt) => InstructionDelivery::Prompt,
+                Some(InstructionOutcome::Aside) => InstructionDelivery::Aside,
+                Some(InstructionOutcome::Pending) => InstructionDelivery::Pending,
+                Some(InstructionOutcome::Dropped) => {
+                    let _ = respond_to.send(encode_error(
+                        id,
+                        "instruction_dropped",
+                        format!(
+                            "OMP took instruction {instruction_id} but did not start its turn (no model or API key, usage limit, Esc or a session change); nothing ran, and OMP may have put the text into an empty editor"
+                        ),
+                    ));
+                    return;
+                }
+                _ => {
+                    let _ = respond_to.send(encode_error(
+                        id,
+                        "instruction_unconfirmed",
+                        format!(
+                            "OMP did not confirm taking instruction {instruction_id}; it discards a block it reads more than {} ms late, but a lost confirmation looks the same, so do not send it again automatically",
+                            INSTRUCTION_EXPIRY.as_millis()
+                        ),
+                    ));
+                    return;
+                }
             };
-            let _ = respond_to.send(response);
+            let _ = respond_to.send(encode_success(
+                id,
+                ResponseResult::AgentInstructed {
+                    agent,
+                    instruction_id,
+                    delivered_as,
+                },
+            ));
         });
         Ok(())
     }
 
-    /// Drops deliveries whose ack time has passed. An unconfirmed delivery may mean the listener
-    /// is gone (OMP dropped it on a session change or an exec restart), so the agent stops
-    /// accepting instructions until the integration reports its listener again. At most one
-    /// block can then reach the editor.
+    /// Settles deliveries whose wait has passed. A never-taken delivery may mean the listener is
+    /// gone (OMP dropped it on a session change or an exec restart), so the agent stops accepting
+    /// instructions until the integration reports its listener again; at most one block can then
+    /// reach the editor. Either way the outcome becomes `unconfirmed`.
     pub(super) fn expire_instruction_acks(&mut self) {
         let now = Instant::now();
         let terminals = &mut self.state.terminals;
-        self.pending_instruction_acks.retain(|_, pending| {
-            if pending.deadline > now {
-                return true;
-            }
-            if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
-                pending.withdraws_listener
-                    && terminal.instruction_listener.as_ref() == Some(&pending.owner)
-            }) {
-                terminal.instruction_listener = None;
-            }
-            false
-        });
+        let last_instructions = &mut self.last_instructions;
+        self.pending_instruction_acks
+            .retain(|instruction_id, pending| {
+                if pending.deadline > now {
+                    return true;
+                }
+                if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
+                    pending.withdraws_listener
+                        && terminal.instruction_listener.as_ref() == Some(&pending.owner)
+                }) {
+                    terminal.instruction_listener = None;
+                }
+                if let Some(last) = last_instructions
+                    .get_mut(&pending.terminal_id)
+                    .filter(|last| last.info.instruction_id == *instruction_id)
+                {
+                    last.info.outcome = InstructionOutcome::Unconfirmed;
+                    last.until = now + INSTRUCTION_OUTCOME_TTL;
+                }
+                false
+            });
+        last_instructions
+            .retain(|terminal_id, last| last.until > now && terminals.contains_key(terminal_id));
     }
 
     fn queue_agent_prompt(
@@ -849,7 +902,7 @@ mod tests {
         target: &str,
         instruction_id: &str,
         (peer_pid, agent_pid): (u32, u32),
-        delivered_as: InstructionDelivery,
+        outcome: InstructionOutcome,
     ) -> String {
         app.handle_pane_ack_instruction(
             "ack".into(),
@@ -857,7 +910,7 @@ mod tests {
                 pane_id: target.into(),
                 instruction_id: instruction_id.into(),
                 agent_pid,
-                delivered_as,
+                outcome,
                 peer_pid: Some(peer_pid),
             },
         )
@@ -876,9 +929,17 @@ mod tests {
     async fn agent_instruct_delivers_marked_paste_and_answers_after_owner_ack() {
         let pid = std::process::id();
         // A blocked agent is not refused: OMP queues the message behind its dialog.
-        for (state, delivered_as) in [
-            (AgentState::Idle, InstructionDelivery::Prompt),
-            (AgentState::Blocked, InstructionDelivery::Aside),
+        for (state, outcome, delivered_as) in [
+            (
+                AgentState::Idle,
+                InstructionOutcome::Prompt,
+                InstructionDelivery::Prompt,
+            ),
+            (
+                AgentState::Blocked,
+                InstructionOutcome::Aside,
+                InstructionDelivery::Aside,
+            ),
         ] {
             let (mut app, mut p, mut rx) = guarded_fixture(state);
             // The header counts UTF-8 bytes, which the integration compares with what arrived.
@@ -887,7 +948,7 @@ mod tests {
             let response = start_instruct(&mut app, p);
             let id = sent_instruction_id(&mut rx, "Report état");
             assert!(response.try_recv().is_err(), "answered before the ack");
-            let acked = ack(&mut app, &target, &id, (pid, pid), delivered_as);
+            let acked = ack(&mut app, &target, &id, (pid, pid), outcome);
             assert!(serde_json::from_str::<SuccessResponse>(&acked).is_ok());
             let success: SuccessResponse =
                 serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap())
@@ -904,7 +965,7 @@ mod tests {
             assert_eq!(answered, delivered_as);
             assert_eq!(agent.name.as_deref(), Some("director"));
             // The ack is consumed, so a replay cannot answer anything.
-            let replay = ack(&mut app, &target, &id, (pid, pid), delivered_as);
+            let replay = ack(&mut app, &target, &id, (pid, pid), outcome);
             assert_eq!(error_code(&replay), "instruction_not_found");
         }
     }
@@ -1069,7 +1130,7 @@ mod tests {
         let response = start_instruct(&mut app, p);
         let id = sent_instruction_id(&mut rx, "Report current status");
         for pids in [(pid + 1, pid), (pid + 1, pid + 1)] {
-            let rejected = ack(&mut app, &target, &id, pids, InstructionDelivery::Prompt);
+            let rejected = ack(&mut app, &target, &id, pids, InstructionOutcome::Prompt);
             assert_eq!(error_code(&rejected), "process_mismatch");
         }
         // The socket peer is right, but the pid now names another incarnation.
@@ -1084,7 +1145,7 @@ mod tests {
             &target,
             &id,
             (pid, pid),
-            InstructionDelivery::Prompt,
+            InstructionOutcome::Prompt,
         );
         assert_eq!(error_code(&rejected), "process_mismatch");
         app.pending_instruction_acks.get_mut(&id).unwrap().owner = owner;
@@ -1094,7 +1155,7 @@ mod tests {
             &target,
             &id,
             (pid, pid),
-            InstructionDelivery::Prompt,
+            InstructionOutcome::Prompt,
         );
         assert!(serde_json::from_str::<SuccessResponse>(&acked).is_ok());
         assert!(response.recv_timeout(Duration::from_secs(1)).is_ok());
@@ -1147,27 +1208,109 @@ mod tests {
 
         let response = start_instruct(&mut app, p.clone());
         let id = sent_instruction_id(&mut rx, "Report current status");
-        take(&mut app, &id, InstructionDelivery::Pending);
+        take(&mut app, &id, InstructionOutcome::Pending);
         assert!(response.try_recv().is_err(), "waits for the turn start");
-        take(&mut app, &id, InstructionDelivery::Prompt);
+        take(&mut app, &id, InstructionOutcome::Prompt);
         let answered = response.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(instructed_as(&answered), InstructionDelivery::Prompt);
 
         let response = start_instruct(&mut app, p.clone());
         let id = sent_instruction_id(&mut rx, "Report current status");
-        take(&mut app, &id, InstructionDelivery::Pending);
+        take(&mut app, &id, InstructionOutcome::Pending);
         let answered = response
             .recv_timeout(INSTRUCTION_ACK_TIMEOUT + Duration::from_secs(1))
             .unwrap();
         assert_eq!(instructed_as(&answered), InstructionDelivery::Pending);
-        // The take proved the listener, so it stays.
-        assert!(
-            app.agent_info_for_target(&target)
-                .unwrap()
-                .accepts_instructions
+        // The take proved the listener, so it stays, and the outcome is still followed: the
+        // agent shows it, and a second instruction waits for it.
+        let info = app.agent_info_for_target(&target).unwrap();
+        assert!(info.accepts_instructions);
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Pending
         );
+        assert_eq!(instruct_error(&mut app, p.clone()), "agent_not_ready");
+        assert!(rx.try_recv().is_err());
+        take(&mut app, &id, InstructionOutcome::Prompt);
+        assert_eq!(last_outcome(&app, &target, &id), InstructionOutcome::Prompt);
         let _response = start_instruct(&mut app, p);
         sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn last_outcome(app: &App, target: &str, id: &str) -> InstructionOutcome {
+        let last = app
+            .agent_info_for_target(target)
+            .unwrap()
+            .last_instruction
+            .expect("last instruction");
+        assert_eq!(last.instruction_id, id);
+        last.outcome
+    }
+
+    /// OMP took the text but went idle without starting its turn (no API key, Esc): the
+    /// caller learns that nothing ran, whether the drop comes inside the wait or after it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dropped_take_is_reported_as_dropped() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let take = |app: &mut App, id: &str, outcome| {
+            let acked = ack(app, &target, id, (pid, pid), outcome);
+            assert!(
+                serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
+                "{acked}"
+            );
+        };
+
+        let response = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Written
+        );
+        take(&mut app, &id, InstructionOutcome::Pending);
+        take(&mut app, &id, InstructionOutcome::Dropped);
+        let answered = response.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(error_code(&answered), "instruction_dropped");
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Dropped
+        );
+
+        // Dropped after the wait answered `pending`.
+        let response = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        take(&mut app, &id, InstructionOutcome::Pending);
+        let answered = response
+            .recv_timeout(INSTRUCTION_ACK_TIMEOUT + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(instructed_as(&answered), InstructionDelivery::Pending);
+        take(&mut app, &id, InstructionOutcome::Dropped);
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Dropped
+        );
+
+        // Only the integration's outcomes are accepted.
+        let response = start_instruct(&mut app, p);
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        for invalid in [InstructionOutcome::Written, InstructionOutcome::Unconfirmed] {
+            let refused = ack(&mut app, &target, &id, (pid, pid), invalid);
+            assert_eq!(error_code(&refused), "invalid_request");
+        }
+        // Nothing final within the outcome window: unknown.
+        wait_unconfirmed(response);
+        let deadline = Instant::now() + INSTRUCTION_OUTCOME_TTL + Duration::from_secs(1);
+        while app.pending_instruction_acks.contains_key(&id) && Instant::now() < deadline {
+            app.expire_instruction_acks();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            last_outcome(&app, &target, &id),
+            InstructionOutcome::Unconfirmed
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1189,7 +1332,7 @@ mod tests {
             &target,
             &id,
             (pid, pid),
-            InstructionDelivery::Aside,
+            InstructionOutcome::Aside,
         );
         assert!(
             serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
@@ -1316,7 +1459,7 @@ mod tests {
             &target,
             &id,
             (pid, pid),
-            InstructionDelivery::Prompt,
+            InstructionOutcome::Prompt,
         );
         assert_eq!(error_code(&misdirected), "instruction_not_found");
         let pending = app.pending_instruction_acks.get_mut(&id).unwrap();
@@ -1327,7 +1470,7 @@ mod tests {
             &target,
             &id,
             (pid, pid),
-            InstructionDelivery::Prompt,
+            InstructionOutcome::Prompt,
         );
         assert_eq!(error_code(&late), "instruction_not_found");
         wait_unconfirmed(response);

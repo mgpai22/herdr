@@ -288,6 +288,10 @@ pub struct AgentInfo {
     /// `agent.instruct` deliveries.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub accepts_instructions: bool,
+    /// The latest `agent.instruct` delivery to this agent and its outcome so far, kept for
+    /// two minutes after it was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_instruction: Option<super::panes::LastInstructionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

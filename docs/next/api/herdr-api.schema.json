@@ -2206,12 +2206,22 @@
           ],
           "type": "object"
         },
-        "InstructionDelivery": {
-          "description": "How OMP accepted an `agent.instruct` delivery.",
+        "InstructionOutcome": {
+          "description": "What became of an `agent.instruct` delivery, as the OMP integration reports it and as\n`AgentInfo.last_instruction` shows it.",
           "oneOf": [
             {
+              "const": "written",
+              "description": "Written to the terminal; OMP has not confirmed taking it. Never sent by the integration.",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "description": "OMP took the text on an idle session and is preparing its turn.",
+              "type": "string"
+            },
+            {
               "const": "prompt",
-              "description": "Started a new turn on an idle session.",
+              "description": "The turn with the text started.",
               "type": "string"
             },
             {
@@ -2220,8 +2230,13 @@
               "type": "string"
             },
             {
-              "const": "pending",
-              "description": "OMP took the text on an idle session but had not started its turn when Herdr stopped\nwaiting. OMP still holds the text: never send it again.",
+              "const": "dropped",
+              "description": "OMP took the text but went idle without starting its turn (no model or API key, usage\nlimit, Esc, session change). Nothing ran; OMP may have put the text into an empty editor.",
+              "type": "string"
+            },
+            {
+              "const": "unconfirmed",
+              "description": "Nothing final was confirmed in time; the outcome is unknown. Never sent by the integration.",
               "type": "string"
             }
           ]
@@ -2512,11 +2527,12 @@
               "minimum": 0,
               "type": "integer"
             },
-            "delivered_as": {
-              "$ref": "#/schemas/request/$defs/InstructionDelivery"
-            },
             "instruction_id": {
               "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/schemas/request/$defs/InstructionOutcome",
+              "description": "`pending`, `prompt`, `aside` or `dropped`."
             },
             "pane_id": {
               "type": "string"
@@ -2526,7 +2542,7 @@
             "pane_id",
             "instruction_id",
             "agent_pid",
-            "delivered_as"
+            "outcome"
           ],
           "type": "object"
         },
@@ -6787,6 +6803,17 @@
             "interactive_ready": {
               "type": "boolean"
             },
+            "last_instruction": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/LastInstructionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The latest `agent.instruct` delivery to this agent and its outcome so far, kept for\ntwo minutes after it was written."
+            },
             "launch_executable": {
               "type": [
                 "string",
@@ -7811,7 +7838,42 @@
             },
             {
               "const": "pending",
-              "description": "OMP took the text on an idle session but had not started its turn when Herdr stopped\nwaiting. OMP still holds the text: never send it again.",
+              "description": "OMP took the text on an idle session but had not started its turn when Herdr stopped\nwaiting. The outcome is not final: `AgentInfo.last_instruction` later shows `prompt` or\n`dropped`.",
+              "type": "string"
+            }
+          ]
+        },
+        "InstructionOutcome": {
+          "description": "What became of an `agent.instruct` delivery, as the OMP integration reports it and as\n`AgentInfo.last_instruction` shows it.",
+          "oneOf": [
+            {
+              "const": "written",
+              "description": "Written to the terminal; OMP has not confirmed taking it. Never sent by the integration.",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "description": "OMP took the text on an idle session and is preparing its turn.",
+              "type": "string"
+            },
+            {
+              "const": "prompt",
+              "description": "The turn with the text started.",
+              "type": "string"
+            },
+            {
+              "const": "aside",
+              "description": "Queued for the next step boundary of a running or blocked session.",
+              "type": "string"
+            },
+            {
+              "const": "dropped",
+              "description": "OMP took the text but went idle without starting its turn (no model or API key, usage\nlimit, Esc, session change). Nothing ran; OMP may have put the text into an empty editor.",
+              "type": "string"
+            },
+            {
+              "const": "unconfirmed",
+              "description": "Nothing final was confirmed in time; the outcome is unknown. Never sent by the integration.",
               "type": "string"
             }
           ]
@@ -7898,6 +7960,22 @@
           },
           "required": [
             "messages"
+          ],
+          "type": "object"
+        },
+        "LastInstructionInfo": {
+          "description": "The latest `agent.instruct` delivery to an agent and its outcome so far.",
+          "properties": {
+            "instruction_id": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/schemas/success_response/$defs/InstructionOutcome"
+            }
+          },
+          "required": [
+            "instruction_id",
+            "outcome"
           ],
           "type": "object"
         },
