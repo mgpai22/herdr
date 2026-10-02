@@ -2218,6 +2218,11 @@
               "const": "aside",
               "description": "Queued for the next step boundary of a running or blocked session.",
               "type": "string"
+            },
+            {
+              "const": "pending",
+              "description": "OMP took the text on an idle session but had not started its turn when Herdr stopped\nwaiting. OMP still holds the text: never send it again.",
+              "type": "string"
             }
           ]
         },
@@ -7802,6 +7807,11 @@
             {
               "const": "aside",
               "description": "Queued for the next step boundary of a running or blocked session.",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "description": "OMP took the text on an idle session but had not started its turn when Herdr stopped\nwaiting. OMP still holds the text: never send it again.",
               "type": "string"
             }
           ]

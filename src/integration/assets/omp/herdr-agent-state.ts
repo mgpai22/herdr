@@ -111,12 +111,15 @@ const INSTRUCTION =
 const admissionWaitMs = 30_000;
 let instructionListener = false;
 let unsubscribeInstructions: (() => void) | undefined;
-// Idle deliveries handed to OMP, acked once OMP starts a turn with their text.
+// Idle deliveries handed to OMP and acked as taken, acked again once OMP starts their turn.
 let awaitingAdmission: { instructionId: string; text: string; until: number }[] = [];
 
-function ackInstruction(instructionId: string, deliveredAs: "prompt" | "aside"): void {
-  void sendRequest(() => ({
-    id: `${source}:instruction:${instructionId}:${Date.now()}`,
+// `pending`: OMP took the text and will start a turn with it. `prompt`: the turn started.
+// `aside`: queued for the running turn. Sent outside the report queue, so an ack never waits
+// behind state reports and reaches herdr inside its wait.
+function ackInstruction(instructionId: string, deliveredAs: "pending" | "prompt" | "aside"): void {
+  void sendRequestNow(() => ({
+    id: `${source}:instruction:${instructionId}:${deliveredAs}:${Date.now()}`,
     method: "pane.ack_instruction",
     params: {
       pane_id: paneId,
@@ -428,13 +431,13 @@ export default function (pi) {
       ackInstruction(instructionId, "aside");
       return rest;
     }
-    // OMP shows a failed idle send (no model, no API key, an abort) only on screen, so the ack
-    // waits until a turn starts with this text. Reporting now keeps herdr from withdrawing the
-    // listener if that never happens.
+    // OMP may spend a long time before the turn starts (compaction, hooks), and shows a failed
+    // idle send (no model, no API key) only on screen. So the take is acked at once, which tells
+    // herdr the text must never be sent again, and the turn start is acked when it happens.
+    ackInstruction(instructionId, "pending");
     const now = Date.now();
     awaitingAdmission = awaitingAdmission.filter((entry) => entry.until > now);
     awaitingAdmission.push({ instructionId, text, until: now + admissionWaitMs });
-    void reportSession();
     return rest;
   }
 
@@ -530,9 +533,13 @@ export default function (pi) {
               .join("\n")
           : undefined;
     const now = Date.now();
-    const index = awaitingAdmission.findIndex((entry) => entry.text === text && entry.until > now);
-    if (index >= 0) {
-      ackInstruction(awaitingAdmission.splice(index, 1)[0].instructionId, "prompt");
+    awaitingAdmission = awaitingAdmission.filter((entry) => entry.until > now);
+    // OMP can rewrite the text (model mentions such as `^provider/model`), so without an exact
+    // match the oldest waiting delivery is the one this turn started with.
+    const exact = awaitingAdmission.findIndex((entry) => entry.text === text);
+    const [admitted] = awaitingAdmission.splice(exact >= 0 ? exact : 0, 1);
+    if (admitted) {
+      ackInstruction(admitted.instructionId, "prompt");
     }
   });
 

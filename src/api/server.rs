@@ -74,9 +74,9 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         agent_start_profile: true,
-        // Instructions need a live process incarnation (`observe_process`), which macOS and the
-        // fallback platforms lack; callers then keep using `agent.prompt`.
-        agent_instruct: cfg!(any(target_os = "linux", windows)),
+        // Where `agent.instruct` lacks its guards it refuses, so it is not advertised there and
+        // callers keep using `agent.prompt`.
+        agent_instruct: crate::app::INSTRUCTIONS_SUPPORTED,
     })
 }
 
@@ -280,6 +280,7 @@ fn handle_connection_with_stop(
     match &mut request.method {
         Method::PaneReportAgentSessionV2(params) => params.peer_pid = peer_pid,
         Method::PaneAckInstruction(params) => params.peer_pid = peer_pid,
+        Method::AgentInstruct(params) => params.received_at = Some(std::time::Instant::now()),
         _ => {}
     }
 
@@ -1475,9 +1476,10 @@ mod tests {
         // `agent start --profile` refuses to run against a server without this flag.
         let capabilities = default_capabilities().unwrap();
         assert!(capabilities.agent_start_profile);
-        assert_eq!(
-            capabilities.agent_instruct,
-            crate::platform::observe_process(std::process::id()).is_ok()
+        // An advertised `agent.instruct` must be able to verify a live process incarnation.
+        assert!(
+            !capabilities.agent_instruct
+                || crate::platform::observe_process(std::process::id()).is_ok()
         );
     }
 
@@ -1608,6 +1610,42 @@ mod tests {
             .expect("response write completion");
         let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response.id, "req_write");
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn socket_instruct_requests_carry_their_receive_time() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+        let (mut client, server, _path) = local_stream_pair("instruct-stamp");
+        client
+            .write_all(br#"{"id":"stamped","method":"agent.instruct","params":{"target":"w1:p1","text":"Report status","expected_terminal_id":"term-1","expected_agent":"omp","expected_session":"/s.jsonl","expected_runtime_id":"r","expected_workspace_id":"w1","expected_cwd":"/p"}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let before = std::time::Instant::now();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+        });
+
+        let msg = api_rx.blocking_recv().unwrap();
+        let Method::AgentInstruct(params) = &msg.request.method else {
+            panic!("unexpected request: {:?}", msg.request.method);
+        };
+        // The app loop refuses an instruction that waited too long in its queue.
+        assert!(params
+            .received_at
+            .is_some_and(|received| received >= before && received <= std::time::Instant::now()));
+        msg.respond_to
+            .send(error_response_json(
+                msg.request.id,
+                "agent_not_ready",
+                "fixture".into(),
+            ))
+            .unwrap();
+        assert!(read_line(&mut client).contains("agent_not_ready"));
         server_thread.join().unwrap().unwrap();
     }
 

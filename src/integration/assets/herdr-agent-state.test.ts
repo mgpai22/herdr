@@ -1096,34 +1096,46 @@ test("Oh My Pi hands a herdr instruction to OMP and acks it once OMP takes it", 
   expect(harness.reports()[0].params.accepts_instructions).toBe(true);
 
   const id = "0123456789abcdef0123456789abcdef";
+  const laterId = "00000000000000000000000000000001";
   const text = "Report état\nthen stop";
-  const acks = () => instructionAcks(harness.requests);
-  // Idle: always an aside, so a turn that starts meanwhile is not cut by a steer.
-  expect(listener?.(instructionBlock(id, text))).toEqual({ consume: true });
-  expect(harness.sent).toEqual([[text, { deliverAs: "aside" }]]);
-  // The listener is reported again at once; the ack waits until OMP starts the turn.
-  await waitFor(() => harness.reports().length === 2);
-  expect(acks()).toHaveLength(0);
+  const mention = "review the diff with ^openai/gpt-5.1";
+  // Acks use their own connections, so their arrival order is not fixed.
+  const acks = () => instructionAcks(harness.requests).map((ack) => ack.params);
+  const byId = (list: Record<string, unknown>[]) =>
+    [...list].sort((a, b) => String(a.instruction_id).localeCompare(String(b.instruction_id)));
+  // Idle: always an aside, so a turn that starts meanwhile is not cut by a steer. The take is
+  // acked at once: OMP holds the text even if its turn starts after herdr stops waiting.
+  expect(listener?.(instructionBlock(id, mention))).toEqual({ consume: true });
+  expect(listener?.(instructionBlock(laterId, text))).toEqual({ consume: true });
+  expect(harness.sent).toEqual([
+    [mention, { deliverAs: "aside" }],
+    [text, { deliverAs: "aside" }],
+  ]);
+  await waitFor(() => acks().length === 2);
+  expect(byId(acks())).toEqual([
+    { pane_id: "test:p1", instruction_id: laterId, agent_pid: process.pid, delivered_as: "pending" },
+    { pane_id: "test:p1", instruction_id: id, agent_pid: process.pid, delivered_as: "pending" },
+  ]);
+  // Turn starts: an exact text match first; OMP rewrites model mentions, so otherwise the
+  // oldest waiting delivery is the one that started.
   const messageStart = harness.handlers.get("message_start");
   messageStart?.({ message: { role: "assistant", content: [{ type: "text", text }] } }, harness.context);
-  messageStart?.({ message: { role: "user", content: "another prompt" } }, harness.context);
+  messageStart?.({ message: { role: "user", content: "review the diff with <agent>gpt</agent>" } }, harness.context);
+  await waitFor(() => acks().length === 3);
+  expect(acks()[2]).toMatchObject({ instruction_id: id, delivered_as: "prompt" });
   messageStart?.({ message: { role: "user", content: [{ type: "text", text }] } }, harness.context);
-  await waitFor(() => acks().length === 1);
-  expect(acks()[0].params).toEqual({
-    pane_id: "test:p1",
-    instruction_id: id,
-    agent_pid: process.pid,
-    delivered_as: "prompt",
-  });
+  messageStart?.({ message: { role: "user", content: "a person's own prompt" } }, harness.context);
+  await waitFor(() => acks().length === 4);
+  expect(acks()[3]).toMatchObject({ instruction_id: laterId, delivered_as: "prompt" });
 
   harness.setIdle(false);
-  // Busy: the aside is queued, so the ack goes at once. A person's Enter that arrived in the
+  // Busy: the aside is queued, so one ack goes at once. A person's Enter that arrived in the
   // same read still reaches the editor.
   const busyId = "fedcba9876543210fedcba9876543210";
   expect(listener?.(`${instructionBlock(busyId, text)}\r`)).toEqual({ data: "\r" });
-  expect(harness.sent[1]).toEqual([text, { deliverAs: "aside" }]);
-  await waitFor(() => acks().length === 2);
-  expect(acks()[1].params).toMatchObject({ instruction_id: busyId, delivered_as: "aside" });
+  expect(harness.sent[2]).toEqual([text, { deliverAs: "aside" }]);
+  await waitFor(() => acks().length === 5);
+  expect(acks()[4]).toMatchObject({ instruction_id: busyId, delivered_as: "aside" });
 
   for (const ordinary of [
     `\x1b[200~herdr-instruction:v1:${id}\nx\x1b[201~`,
@@ -1134,9 +1146,9 @@ test("Oh My Pi hands a herdr instruction to OMP and acks it once OMP takes it", 
   ]) {
     expect(listener?.(ordinary)).toBeUndefined();
   }
-  expect(harness.sent).toHaveLength(2);
-  expect(harness.reports()).toHaveLength(2);
-  expect(acks()).toHaveLength(2);
+  expect(harness.sent).toHaveLength(3);
+  expect(harness.reports()).toHaveLength(1);
+  expect(acks()).toHaveLength(5);
 });
 
 test("Oh My Pi drops a late or cut-short instruction unsent and keeps its listener reported", async () => {

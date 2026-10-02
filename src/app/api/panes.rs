@@ -1833,7 +1833,16 @@ impl App {
                 "the acknowledging process is not the instructed OMP process",
             );
         }
-        if let Some(pending) = self.pending_instruction_acks.remove(&params.instruction_id) {
+        if params.delivered_as == crate::api::schema::InstructionDelivery::Pending {
+            // OMP took the block: its listener exists. Keep the entry for the turn-start ack.
+            if let Some(pending) = self
+                .pending_instruction_acks
+                .get_mut(&params.instruction_id)
+            {
+                pending.withdraws_listener = false;
+                let _ = pending.tx.send(params.delivered_as);
+            }
+        } else if let Some(pending) = self.pending_instruction_acks.remove(&params.instruction_id) {
             let _ = pending.tx.send(params.delivered_as);
         }
         encode_success(id, ResponseResult::Ok {})

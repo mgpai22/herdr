@@ -18,9 +18,11 @@ const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(test)]
 pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_millis(200);
-/// The integration discards a block that reaches it later than this after it was written, so an
-/// unconfirmed instruction cannot arrive after the caller gave up on it. The rest of the ack
-/// timeout leaves time for OMP to start the turn and for the ack to come back.
+/// The longest an instruction may wait in the server queue before it is written. With the ack
+/// wait this stays under the 15 s that callers allow for an answer.
+const INSTRUCTION_QUEUE_LIMIT: Duration = Duration::from_secs(5);
+/// The integration discards a block that reaches it later than this after it was written. The
+/// rest of the ack timeout leaves time for the take to be acked.
 const INSTRUCTION_EXPIRY: Duration =
     Duration::from_millis(INSTRUCTION_ACK_TIMEOUT.as_millis() as u64 / 2);
 
@@ -30,8 +32,8 @@ pub(crate) struct PendingInstructionAck {
     pub(super) owner: crate::platform::OwnerProcessIncarnation,
     pub(super) tx: std::sync::mpsc::Sender<InstructionDelivery>,
     pub(super) deadline: Instant,
-    /// Cleared when the integration reports its listener after this delivery was written: the
-    /// listener then exists, even if this one delivery was never confirmed.
+    /// Cleared once the listener proves it exists after this delivery was written (it took the
+    /// block, or the integration reported it), even if the turn start is never confirmed.
     pub(super) withdraws_listener: bool,
 }
 
@@ -83,6 +85,7 @@ fn append_codex_paste_boundary(runtime: &crate::terminal::TerminalRuntime, text:
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
+        self.expire_instruction_acks();
         encode_success(
             id,
             ResponseResult::AgentList {
@@ -92,6 +95,7 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
+        self.expire_instruction_acks();
         self.reconcile_managed_agent_target(&target.target);
         let agent = match self.agent_info_for_target(&target.target) {
             Ok(agent) => agent,
@@ -173,6 +177,25 @@ impl App {
         params: AgentInstructParams,
         respond_to: &std::sync::mpsc::Sender<String>,
     ) -> Result<(), String> {
+        if !super::super::agents::INSTRUCTIONS_SUPPORTED {
+            return Err(encode_error(
+                id,
+                "agent_instruction_unsupported",
+                "agent.instruct needs process identity and terminal-reader checks this platform lacks",
+            ));
+        }
+        // A request that waited long in the server queue would leave the caller too little of its
+        // own timeout for the ack wait, and it may have given up already: write nothing.
+        if params
+            .received_at
+            .is_some_and(|received| received.elapsed() > INSTRUCTION_QUEUE_LIMIT)
+        {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                "the instruction waited too long in the server queue; nothing was written",
+            ));
+        }
         self.expire_instruction_acks();
         self.reconcile_managed_agent_target(&params.target);
         let agent = self
@@ -205,6 +228,22 @@ impl App {
         };
         let terminal_id = terminal.id.clone();
         let launch_pending = terminal.managed_agent_launch_pending();
+        // While an earlier block is unconfirmed, the listener may be gone; a second block would
+        // also land in the editor.
+        if self
+            .pending_instruction_acks
+            .values()
+            .any(|pending| pending.terminal_id == terminal_id && pending.withdraws_listener)
+        {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!(
+                    "an earlier instruction to agent {} is not confirmed yet",
+                    params.target
+                ),
+            ));
+        }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
@@ -218,6 +257,7 @@ impl App {
         if launch_pending || !runtime.bracketed_paste_enabled() {
             return Err(agent_not_ready(id, &params.target));
         }
+        #[cfg(target_os = "linux")]
         if super::super::agents::owner_child_reads_tty(runtime, owner.pid) {
             return Err(encode_error(
                 id,
@@ -234,6 +274,7 @@ impl App {
             return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
         }
         // Acks are handled by this app loop after this step, so registering now misses none.
+        let deadline = Instant::now() + INSTRUCTION_ACK_TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
         self.pending_instruction_acks.insert(
             instruction_id.clone(),
@@ -241,14 +282,24 @@ impl App {
                 terminal_id,
                 owner,
                 tx,
-                deadline: Instant::now() + INSTRUCTION_ACK_TIMEOUT,
+                deadline,
                 withdraws_listener: true,
             },
         );
         let respond_to = respond_to.clone();
         std::thread::spawn(move || {
-            let response = match rx.recv_timeout(INSTRUCTION_ACK_TIMEOUT) {
-                Ok(delivered_as) => encode_success(
+            // A `pending` ack means OMP took the text; wait on for the turn start, and answer
+            // `pending` if it does not come in time. OMP still holds the text either way.
+            let mut taken = false;
+            let delivered_as = loop {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(InstructionDelivery::Pending) => taken = true,
+                    Ok(delivered_as) => break Some(delivered_as),
+                    Err(_) => break taken.then_some(InstructionDelivery::Pending),
+                }
+            };
+            let response = match delivered_as {
+                Some(delivered_as) => encode_success(
                     id,
                     ResponseResult::AgentInstructed {
                         agent,
@@ -256,11 +307,11 @@ impl App {
                         delivered_as,
                     },
                 ),
-                Err(_) => encode_error(
+                None => encode_error(
                     id,
                     "instruction_unconfirmed",
                     format!(
-                        "instruction {instruction_id} was not confirmed; OMP discards it if it reaches OMP after {} ms, read the transcript before sending it again",
+                        "OMP did not confirm taking instruction {instruction_id}; it discards a block it reads more than {} ms late, but a lost confirmation looks the same, so do not send it again automatically",
                         INSTRUCTION_EXPIRY.as_millis()
                     ),
                 ),
@@ -274,7 +325,7 @@ impl App {
     /// is gone (OMP dropped it on a session change or an exec restart), so the agent stops
     /// accepting instructions until the integration reports its listener again. At most one
     /// block can then reach the editor.
-    fn expire_instruction_acks(&mut self) {
+    pub(super) fn expire_instruction_acks(&mut self) {
         let now = Instant::now();
         let terminals = &mut self.state.terminals;
         self.pending_instruction_acks.retain(|_, pending| {
@@ -622,7 +673,7 @@ mod tests {
             .expect("agent prompt responds after submission")
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn fixture_terminal_id(app: &App) -> crate::terminal::TerminalId {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         app.state.workspaces[0].tabs[0].panes[&pane_id]
@@ -632,7 +683,7 @@ mod tests {
 
     /// An OMP pane registered by this test process, which stands in for the live OMP owner
     /// whose integration listens for instructions, with bracketed paste on.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn guarded_fixture(
         state: AgentState,
     ) -> (App, AgentInstructParams, tokio::sync::mpsc::Receiver<Bytes>) {
@@ -649,7 +700,7 @@ mod tests {
     }
 
     /// An OMP pane whose registered owner and instruction listener is `owner`, on `runtime`.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn guarded_app(
         state: AgentState,
         owner: crate::platform::OwnerProcessIncarnation,
@@ -691,11 +742,12 @@ mod tests {
             expected_workspace_id: info.workspace_id,
             // The foreground cwd of a real pane is its process cwd, not the fixture cwd.
             expected_cwd: info.foreground_cwd.or(info.cwd).unwrap(),
+            received_at: None,
         };
         (app, params)
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn fixture_session_path() -> String {
         std::env::current_dir()
             .unwrap()
@@ -705,7 +757,7 @@ mod tests {
     }
 
     /// A v2 session report from this test process, as the OMP integration sends it.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn report_session(app: &mut App, target: &str, seq: u64, accepts_instructions: bool) -> String {
         let pid = std::process::id();
         app.handle_pane_report_agent_session_v2(
@@ -726,7 +778,7 @@ mod tests {
         )
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn start_instruct(
         app: &mut App,
         params: AgentInstructParams,
@@ -742,7 +794,7 @@ mod tests {
         rx
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn instruct_error(app: &mut App, params: AgentInstructParams) -> String {
         let response = start_instruct(app, params)
             .recv_timeout(Duration::from_secs(1))
@@ -754,7 +806,7 @@ mod tests {
     }
 
     /// The single write is the marked paste with no Enter; returns its instruction id.
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn sent_instruction_id(rx: &mut tokio::sync::mpsc::Receiver<Bytes>, text: &str) -> String {
         let bytes = rx.try_recv().expect("the instruction was written");
         let written = std::str::from_utf8(&bytes).unwrap();
@@ -791,7 +843,7 @@ mod tests {
         id.to_string()
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn ack(
         app: &mut App,
         target: &str,
@@ -811,7 +863,7 @@ mod tests {
         )
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn error_code(response: &str) -> String {
         serde_json::from_str::<crate::api::schema::ErrorResponse>(response)
             .unwrap()
@@ -819,7 +871,7 @@ mod tests {
             .code
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn agent_instruct_delivers_marked_paste_and_answers_after_owner_ack() {
         let pid = std::process::id();
@@ -857,7 +909,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn agent_instruct_without_ack_is_unconfirmed() {
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Working);
@@ -870,7 +922,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn agent_instruct_refuses_process_without_listener() {
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
@@ -888,7 +940,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn agent_instruct_refuses_stale_owner() {
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
@@ -911,7 +963,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn agent_instruct_checks_every_identity_field_before_writing() {
         for field in 0..8 {
@@ -947,7 +999,7 @@ mod tests {
         sent_instruction_id(&mut rx, "Report current status");
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn agent_instruct_refuses_unregistered_process_and_uses_foreground_scope() {
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
@@ -976,7 +1028,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn agent_instruct_rejects_unbounded_control_and_command_text_without_writing() {
         for text in [
@@ -1008,7 +1060,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn instruction_ack_from_another_process_is_rejected() {
         let pid = std::process::id();
@@ -1048,7 +1100,7 @@ mod tests {
         assert!(response.recv_timeout(Duration::from_secs(1)).is_ok());
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     fn wait_unconfirmed(response: std::sync::mpsc::Receiver<String>) {
         let response = response
             .recv_timeout(INSTRUCTION_ACK_TIMEOUT + Duration::from_secs(1))
@@ -1056,7 +1108,112 @@ mod tests {
         assert_eq!(error_code(&response), "instruction_unconfirmed");
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
+    fn instructed_as(response: &str) -> InstructionDelivery {
+        let success: SuccessResponse = serde_json::from_str(response).unwrap();
+        let ResponseResult::AgentInstructed { delivered_as, .. } = success.result else {
+            panic!("expected agent_instructed: {response}");
+        };
+        delivered_as
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_instruction_that_waited_too_long_in_the_server_queue_is_not_written() {
+        let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
+        p.received_at = Some(Instant::now() - INSTRUCTION_QUEUE_LIMIT - Duration::from_millis(1));
+        assert_eq!(instruct_error(&mut app, p.clone()), "agent_not_ready");
+        assert!(rx.try_recv().is_err());
+        p.received_at = Some(Instant::now());
+        let _response = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    /// OMP took the text on an idle session but its turn starts late (compaction, hooks): the
+    /// caller must learn that OMP holds the text, never "not confirmed".
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_idle_take_answers_pending_until_the_turn_starts() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let take = |app: &mut App, id: &str, delivered_as| {
+            let acked = ack(app, &target, id, (pid, pid), delivered_as);
+            assert!(
+                serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
+                "{acked}"
+            );
+        };
+
+        let response = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        take(&mut app, &id, InstructionDelivery::Pending);
+        assert!(response.try_recv().is_err(), "waits for the turn start");
+        take(&mut app, &id, InstructionDelivery::Prompt);
+        let answered = response.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(instructed_as(&answered), InstructionDelivery::Prompt);
+
+        let response = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        take(&mut app, &id, InstructionDelivery::Pending);
+        let answered = response
+            .recv_timeout(INSTRUCTION_ACK_TIMEOUT + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(instructed_as(&answered), InstructionDelivery::Pending);
+        // The take proved the listener, so it stays.
+        assert!(
+            app.agent_info_for_target(&target)
+                .unwrap()
+                .accepts_instructions
+        );
+        let _response = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_second_instruction_waits_until_the_first_is_taken() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Working);
+        let target = p.target.clone();
+        let first = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        assert_eq!(instruct_error(&mut app, p.clone()), "agent_not_ready");
+        assert!(
+            rx.try_recv().is_err(),
+            "one block while the first is unconfirmed"
+        );
+
+        let acked = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionDelivery::Aside,
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
+            "{acked}"
+        );
+        assert!(first.recv_timeout(Duration::from_secs(1)).is_ok());
+        let second = start_instruct(&mut app, p);
+        sent_instruction_id(&mut rx, "Report current status");
+        wait_unconfirmed(second);
+        // Reads settle the expired delivery without another instruct.
+        let response = app.handle_agent_get(
+            "get".into(),
+            AgentTarget {
+                target: target.clone(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = success.result else {
+            panic!("expected agent info");
+        };
+        assert!(!agent.accepts_instructions);
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn unconfirmed_delivery_withdraws_the_listener_until_the_integration_reports_again() {
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
@@ -1092,7 +1249,7 @@ mod tests {
         sent_instruction_id(&mut rx, "Report current status");
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_listener_reported_after_a_delivery_outlives_that_delivery() {
         let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
@@ -1110,7 +1267,7 @@ mod tests {
         sent_instruction_id(&mut rx, "Report current status");
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn session_reports_grant_and_withdraw_the_instruction_listener() {
         let (mut app, p, _rx) = guarded_fixture(AgentState::Idle);
@@ -1141,7 +1298,7 @@ mod tests {
         assert!(accepts(&app));
     }
 
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn late_or_misdirected_instruction_acks_are_not_found() {
         let pid = std::process::id();

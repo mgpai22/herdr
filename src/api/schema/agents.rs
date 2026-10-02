@@ -203,6 +203,10 @@ pub struct AgentInstructParams {
     pub expected_runtime_id: String,
     pub expected_workspace_id: String,
     pub expected_cwd: String,
+    /// When the socket server read the request; set by the server, never by the caller.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub received_at: Option<std::time::Instant>,
 }
 
 impl AgentInstructParams {

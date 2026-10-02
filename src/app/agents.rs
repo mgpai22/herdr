@@ -545,55 +545,52 @@ pub(super) fn owner_in_foreground_job(
     member
 }
 
+/// Platforms where `agent.instruct` has every guard it needs: a live process incarnation
+/// (`observe_process`) and `owner_child_reads_tty`. The server advertises the capability from
+/// this, and `agent.instruct` refuses elsewhere.
+pub(crate) const INSTRUCTIONS_SUPPORTED: bool = cfg!(target_os = "linux");
+
 /// Whether a process that `owner` started reads the pane terminal in its place: it is in the
 /// foreground job, descends from `owner`, and has the pane tty as stdin. OMP's external editor
 /// (Ctrl+G) runs like this while the OMP TUI is stopped, so a paste would land in the editor.
-/// Only Linux can tell; elsewhere `observe_process` support decides whether instructions run.
+#[cfg(target_os = "linux")]
 pub(super) fn owner_child_reads_tty(
     runtime: &crate::terminal::TerminalRuntime,
     owner: u32,
 ) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let stdin = |pid: u32| std::fs::read_link(format!("/proc/{pid}/fd/0")).ok();
-        let parent = |pid: u32| -> Option<u32> {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            // After "(comm) ": state, then ppid.
-            stat.get(stat.rfind(')')? + 2..)?
-                .split_whitespace()
-                .nth(1)?
-                .parse()
-                .ok()
-        };
-        // The pane shell's stdin is the pane tty.
-        let Some(child_pid) = runtime.child_pid() else {
-            return false;
-        };
-        let (Some(tty), Some(job)) = (stdin(child_pid), crate::detect::foreground_job(child_pid))
-        else {
-            return false;
-        };
-        let descends_from_owner = |mut pid: u32| {
-            for _ in 0..job.processes.len() {
-                match parent(pid) {
-                    Some(ppid) if ppid == owner => return true,
-                    Some(ppid) if ppid > 1 => pid = ppid,
-                    _ => return false,
-                }
+    let stdin = |pid: u32| std::fs::read_link(format!("/proc/{pid}/fd/0")).ok();
+    let parent = |pid: u32| -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // After "(comm) ": state, then ppid.
+        stat.get(stat.rfind(')')? + 2..)?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    // The pane shell's stdin is the pane tty.
+    let Some(child_pid) = runtime.child_pid() else {
+        return false;
+    };
+    let (Some(tty), Some(job)) = (stdin(child_pid), crate::detect::foreground_job(child_pid))
+    else {
+        return false;
+    };
+    let descends_from_owner = |mut pid: u32| {
+        for _ in 0..job.processes.len() {
+            match parent(pid) {
+                Some(ppid) if ppid == owner => return true,
+                Some(ppid) if ppid > 1 => pid = ppid,
+                _ => return false,
             }
-            false
-        };
-        job.processes.iter().any(|process| {
-            process.pid != owner
-                && stdin(process.pid).as_ref() == Some(&tty)
-                && descends_from_owner(process.pid)
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (runtime, owner);
+        }
         false
-    }
+    };
+    job.processes.iter().any(|process| {
+        process.pid != owner
+            && stdin(process.pid).as_ref() == Some(&tty)
+            && descends_from_owner(process.pid)
+    })
 }
 
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {

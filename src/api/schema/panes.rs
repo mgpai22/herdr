@@ -420,6 +420,9 @@ pub enum InstructionDelivery {
     Prompt,
     /// Queued for the next step boundary of a running or blocked session.
     Aside,
+    /// OMP took the text on an idle session but had not started its turn when Herdr stopped
+    /// waiting. OMP still holds the text: never send it again.
+    Pending,
 }
 
 /// Sent by the OMP integration process that consumed an `agent.instruct` delivery.
