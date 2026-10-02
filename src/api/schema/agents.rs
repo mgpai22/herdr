@@ -292,6 +292,10 @@ pub struct AgentInfo {
     /// two minutes after it was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_instruction: Option<super::panes::LastInstructionInfo>,
+    /// Up to the 8 latest `agent.instruct` deliveries to this agent, newest first, each with its
+    /// outcome so far and kept for two minutes after its outcome last changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_instructions: Vec<super::panes::LastInstructionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

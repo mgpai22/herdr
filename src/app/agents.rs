@@ -460,6 +460,13 @@ impl App {
         });
         let accepts_instructions =
             live_owner.is_some() && terminal.instruction_listener.as_ref() == live_owner;
+        let recent_instructions: Vec<_> = self
+            .recent_instructions
+            .get(&terminal.id)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.info.clone())
+            .collect();
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -475,10 +482,8 @@ impl App {
             agent_session: pane.agent_session,
             runtime_id,
             accepts_instructions,
-            last_instruction: self
-                .last_instructions
-                .get(&terminal.id)
-                .map(|last| last.info.clone()),
+            last_instruction: recent_instructions.first().cloned(),
+            recent_instructions,
             launch_profile,
             launch_executable,
             workspace_id: pane.workspace_id,

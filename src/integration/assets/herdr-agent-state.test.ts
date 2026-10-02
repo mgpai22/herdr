@@ -1179,6 +1179,8 @@ test("Oh My Pi reports an idle instruction that OMP drops without a turn", async
   });
   await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
   await waitFor(() => harness.reports().length === 1);
+  // A session_before_compact handler would turn off OMP's background compaction.
+  expect(harness.handlers.has("session_before_compact")).toBe(false);
   const acks = () => instructionAcks(harness.requests).map((ack) => ack.params);
   const outcomes = (id: string) =>
     acks()
@@ -1210,7 +1212,7 @@ test("Oh My Pi reports an idle instruction that OMP drops without a turn", async
   // compaction ends without a turn.
   const held = "00000000000000000000000000000003";
   harness.setBusyOnSend(false);
-  await harness.handlers.get("session_before_compact")?.({}, harness.context);
+  await harness.handlers.get("session.compacting")?.({ messages: [] }, harness.context);
   listener?.(instructionBlock(held, "Report status"));
   await waitFor(() => outcomes(held).length === 1);
   const heldToo = "00000000000000000000000000000004";
@@ -1230,6 +1232,20 @@ test("Oh My Pi reports an idle instruction that OMP drops without a turn", async
   await waitFor(() => outcomes(held).length === 2);
   expect(outcomes(held)).toEqual(["pending", "prompt"]);
   expect(outcomes(aborted)).toEqual(["pending", "dropped"]);
+
+  // Esc during OMP's automatic compaction before the turn: the compaction ends aborted, the
+  // session is idle without a turn, and the drop is reported.
+  const cancelled = "00000000000000000000000000000005";
+  harness.setBusyOnSend(false);
+  await harness.handlers.get("session_compact")?.({}, harness.context);
+  await harness.handlers.get("auto_compaction_start")?.({ reason: "threshold" }, harness.context);
+  listener?.(instructionBlock(cancelled, "Summarize the plan"));
+  await waitFor(() => outcomes(cancelled).length === 1);
+  await Bun.sleep(50);
+  expect(outcomes(cancelled)).toEqual(["pending"]);
+  await harness.handlers.get("auto_compaction_end")?.({ aborted: true }, harness.context);
+  await waitFor(() => outcomes(cancelled).length === 2);
+  expect(outcomes(cancelled)).toEqual(["pending", "dropped"]);
 });
 
 test("Oh My Pi drops a late or cut-short instruction unsent and keeps its listener reported", async () => {

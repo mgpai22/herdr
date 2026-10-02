@@ -46,10 +46,49 @@ pub(crate) struct PendingInstructionAck {
     pub(super) withdraws_listener: bool,
 }
 
-/// `AgentInfo.last_instruction` for one terminal, until `until`.
-pub(crate) struct LastInstruction {
+/// How many deliveries per agent `AgentInfo.recent_instructions` keeps.
+const RECENT_INSTRUCTIONS: usize = 8;
+
+/// One entry of `AgentInfo.recent_instructions`, shown until `until`.
+pub(crate) struct RecentInstruction {
     pub(crate) info: crate::api::schema::LastInstructionInfo,
     pub(super) until: Instant,
+}
+
+/// Recent deliveries per terminal, newest written first.
+pub(crate) type RecentInstructions =
+    std::collections::HashMap<crate::terminal::TerminalId, Vec<RecentInstruction>>;
+
+/// Sets the outcome of `instruction_id`, adding it as the newest delivery when it is not listed,
+/// and keeps it visible for the outcome TTL from now.
+pub(super) fn record_instruction_outcome(
+    recent: &mut RecentInstructions,
+    terminal_id: &crate::terminal::TerminalId,
+    instruction_id: &str,
+    outcome: InstructionOutcome,
+    now: Instant,
+) {
+    let entries = recent.entry(terminal_id.clone()).or_default();
+    let until = now + INSTRUCTION_OUTCOME_TTL;
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.info.instruction_id == instruction_id)
+    {
+        entry.info.outcome = outcome;
+        entry.until = until;
+        return;
+    }
+    entries.insert(
+        0,
+        RecentInstruction {
+            info: LastInstructionInfo {
+                instruction_id: instruction_id.to_string(),
+                outcome,
+            },
+            until,
+        },
+    );
+    entries.truncate(RECENT_INSTRUCTIONS);
 }
 
 /// The marked paste the OMP integration consumes: `v2:<id>:<expires unix ms>:<text bytes>`.
@@ -61,6 +100,35 @@ fn instruction_block(instruction_id: &str, text: &str) -> String {
         "\x1b[200~herdr-instruction:v2:{instruction_id}:{expires_ms}:{}\n{text}\x1b[201~",
         text.len()
     )
+}
+
+/// Ends a delivery that got no final outcome: its `last_instruction` becomes `unconfirmed`, and a
+/// never-taken delivery withdraws the listener of the process it was written to, which may be
+/// gone.
+fn settle_unconfirmed(
+    terminals: &mut std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+    recent: &mut RecentInstructions,
+    instruction_id: &str,
+    pending: &PendingInstructionAck,
+    now: Instant,
+) {
+    if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
+        pending.withdraws_listener && terminal.instruction_listener.as_ref() == Some(&pending.owner)
+    }) {
+        terminal.instruction_listener = None;
+    }
+    // An evicted delivery is not listed again.
+    if let Some(entry) = recent.get_mut(&pending.terminal_id).and_then(|entries| {
+        entries
+            .iter_mut()
+            .find(|entry| entry.info.instruction_id == instruction_id)
+    }) {
+        entry.info.outcome = InstructionOutcome::Unconfirmed;
+        entry.until = now + INSTRUCTION_OUTCOME_TTL;
+    }
 }
 
 fn new_instruction_id(request_id: &str, terminal_id: &str) -> String {
@@ -243,6 +311,26 @@ impl App {
         };
         let terminal_id = terminal.id.clone();
         let launch_pending = terminal.managed_agent_launch_pending();
+        // Only the instructed process can answer for a delivery. One written to an earlier
+        // process in this pane never gets a final outcome, so settle it now.
+        let stale: Vec<String> = self
+            .pending_instruction_acks
+            .iter()
+            .filter(|(_, pending)| pending.terminal_id == terminal_id && pending.owner != owner)
+            .map(|(instruction_id, _)| instruction_id.clone())
+            .collect();
+        let now = Instant::now();
+        for instruction_id in stale {
+            if let Some(pending) = self.pending_instruction_acks.remove(&instruction_id) {
+                settle_unconfirmed(
+                    &mut self.state.terminals,
+                    &mut self.recent_instructions,
+                    &instruction_id,
+                    &pending,
+                    now,
+                );
+            }
+        }
         // One delivery per agent until its outcome is final: while a block is unconfirmed the
         // listener may be gone (a second block would land in the editor), and while a taken
         // delivery waits for its turn, `last_instruction` must keep following it.
@@ -293,15 +381,12 @@ impl App {
         let now = Instant::now();
         let deadline = now + INSTRUCTION_ACK_TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
-        self.last_instructions.insert(
-            terminal_id.clone(),
-            LastInstruction {
-                info: LastInstructionInfo {
-                    instruction_id: instruction_id.clone(),
-                    outcome: InstructionOutcome::Written,
-                },
-                until: now + INSTRUCTION_OUTCOME_TTL,
-            },
+        record_instruction_outcome(
+            &mut self.recent_instructions,
+            &terminal_id,
+            &instruction_id,
+            InstructionOutcome::Written,
+            now,
         );
         self.pending_instruction_acks.insert(
             instruction_id.clone(),
@@ -313,6 +398,10 @@ impl App {
                 withdraws_listener: true,
             },
         );
+        // Read after the write, so the result's `last_instruction` names this delivery.
+        let agent = self
+            .agent_info(resolved.ws_idx, resolved.pane_id)
+            .unwrap_or(agent);
         let respond_to = respond_to.clone();
         std::thread::spawn(move || {
             // A `pending` ack means OMP took the text; wait on for the turn start or the drop,
@@ -370,29 +459,19 @@ impl App {
     pub(super) fn expire_instruction_acks(&mut self) {
         let now = Instant::now();
         let terminals = &mut self.state.terminals;
-        let last_instructions = &mut self.last_instructions;
+        let recent = &mut self.recent_instructions;
         self.pending_instruction_acks
             .retain(|instruction_id, pending| {
                 if pending.deadline > now {
                     return true;
                 }
-                if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
-                    pending.withdraws_listener
-                        && terminal.instruction_listener.as_ref() == Some(&pending.owner)
-                }) {
-                    terminal.instruction_listener = None;
-                }
-                if let Some(last) = last_instructions
-                    .get_mut(&pending.terminal_id)
-                    .filter(|last| last.info.instruction_id == *instruction_id)
-                {
-                    last.info.outcome = InstructionOutcome::Unconfirmed;
-                    last.until = now + INSTRUCTION_OUTCOME_TTL;
-                }
+                settle_unconfirmed(terminals, recent, instruction_id, pending, now);
                 false
             });
-        last_instructions
-            .retain(|terminal_id, last| last.until > now && terminals.contains_key(terminal_id));
+        recent.retain(|terminal_id, entries| {
+            entries.retain(|entry| entry.until > now);
+            !entries.is_empty() && terminals.contains_key(terminal_id)
+        });
     }
 
     fn queue_agent_prompt(
@@ -964,6 +1043,11 @@ mod tests {
             assert_eq!(instruction_id, id);
             assert_eq!(answered, delivered_as);
             assert_eq!(agent.name.as_deref(), Some("director"));
+            // The agent is read after the write, so it names this delivery.
+            assert_eq!(
+                agent.last_instruction.map(|last| last.instruction_id),
+                Some(id.clone())
+            );
             // The ack is consumed, so a replay cannot answer anything.
             let replay = ack(&mut app, &target, &id, (pid, pid), outcome);
             assert_eq!(error_code(&replay), "instruction_not_found");
@@ -1246,6 +1330,87 @@ mod tests {
             .expect("last instruction");
         assert_eq!(last.instruction_id, id);
         last.outcome
+    }
+
+    /// A later delivery does not hide an earlier one's outcome from a caller that follows it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn recent_instructions_keep_earlier_outcomes() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let mut ids = Vec::new();
+        for _ in 0..RECENT_INSTRUCTIONS + 1 {
+            let response = start_instruct(&mut app, p.clone());
+            let id = sent_instruction_id(&mut rx, "Report current status");
+            let acked = ack(
+                &mut app,
+                &target,
+                &id,
+                (pid, pid),
+                InstructionOutcome::Prompt,
+            );
+            assert!(
+                serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
+                "{acked}"
+            );
+            assert!(response.recv_timeout(Duration::from_secs(1)).is_ok());
+            ids.push(id);
+        }
+        let info = app.agent_info_for_target(&target).unwrap();
+        let listed: Vec<_> = info
+            .recent_instructions
+            .iter()
+            .map(|entry| (entry.instruction_id.clone(), entry.outcome))
+            .collect();
+        let expected: Vec<_> = ids
+            .iter()
+            .rev()
+            .take(RECENT_INSTRUCTIONS)
+            .map(|id| (id.clone(), InstructionOutcome::Prompt))
+            .collect();
+        assert_eq!(listed, expected, "newest first, the oldest evicted");
+        assert_eq!(
+            info.last_instruction,
+            info.recent_instructions.first().cloned()
+        );
+    }
+
+    /// OMP took a delivery and exited before its turn: only that process could answer, so the
+    /// next OMP in the pane must not wait two minutes for it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_delivery_to_an_earlier_process_does_not_block_the_next_one() {
+        let pid = std::process::id();
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target.clone();
+        let _first = start_instruct(&mut app, p.clone());
+        let id = sent_instruction_id(&mut rx, "Report current status");
+        let acked = ack(
+            &mut app,
+            &target,
+            &id,
+            (pid, pid),
+            InstructionOutcome::Pending,
+        );
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&acked).is_ok(),
+            "{acked}"
+        );
+        // The process that took it is gone; the pane's listener is a newer process.
+        app.pending_instruction_acks
+            .get_mut(&id)
+            .unwrap()
+            .owner
+            .start_time_ticks += 1;
+
+        let _second = start_instruct(&mut app, p);
+        let second = sent_instruction_id(&mut rx, "Report current status");
+        assert!(!app.pending_instruction_acks.contains_key(&id));
+        assert_eq!(
+            last_outcome(&app, &target, &second),
+            InstructionOutcome::Written
+        );
     }
 
     /// OMP took the text but went idle without starting its turn (no API key, Esc): the

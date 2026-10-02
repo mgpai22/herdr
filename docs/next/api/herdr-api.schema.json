@@ -6838,6 +6838,13 @@
             "pane_id": {
               "type": "string"
             },
+            "recent_instructions": {
+              "description": "Up to the 8 latest `agent.instruct` deliveries to this agent, newest first, each with its\noutcome so far and kept for two minutes after its outcome last changed.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/LastInstructionInfo"
+              },
+              "type": "array"
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,

@@ -1860,15 +1860,12 @@ impl App {
         } else if let Some(pending) = self.pending_instruction_acks.remove(&params.instruction_id) {
             let _ = pending.tx.send(params.outcome);
         }
-        self.last_instructions.insert(
-            terminal_id,
-            super::agents::LastInstruction {
-                info: crate::api::schema::LastInstructionInfo {
-                    instruction_id: params.instruction_id,
-                    outcome: params.outcome,
-                },
-                until: now + super::agents::INSTRUCTION_OUTCOME_TTL,
-            },
+        super::agents::record_instruction_outcome(
+            &mut self.recent_instructions,
+            &terminal_id,
+            &params.instruction_id,
+            params.outcome,
+            now,
         );
         encode_success(id, ResponseResult::Ok {})
     }

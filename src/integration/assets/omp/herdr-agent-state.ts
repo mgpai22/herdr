@@ -124,7 +124,7 @@ let awaitingAdmission: {
   until: number;
 }[] = [];
 let admissionTimer: ReturnType<typeof setInterval> | undefined;
-// A manual compaction holds new prompts while the session looks idle.
+// A compaction holds new prompts while the session looks idle.
 let compacting = false;
 
 // `pending`: OMP took the text and prepares its turn. `prompt`: the turn started. `aside`:
@@ -526,6 +526,8 @@ export default function (pi) {
       return false;
     }
     rootSession = true;
+    // A new or changed session has no compaction of its own running.
+    compacting = false;
     registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
@@ -576,14 +578,22 @@ export default function (pi) {
     publishState(true);
   });
 
-  // A cancelled compaction can end without session_compact; a turn start proves none holds
-  // prompts back.
-  pi.on("session_before_compact", () => {
+  // Only notification events: any `session_before_compact` handler makes OMP treat the
+  // extension as one that may veto compaction, which turns off its background (speculative)
+  // compaction. Automatic compactions announce start and end, including an Esc abort. A manual
+  // `/compact` announces nothing before `session.compacting`, which also comes from background
+  // speculation, so session changes and turn starts clear the flag too.
+  pi.on("auto_compaction_start", () => {
     compacting = true;
   });
-  pi.on("session_compact", () => {
-    compacting = false;
+  pi.on("session.compacting", () => {
+    compacting = true;
   });
+  for (const event of ["auto_compaction_end", "session_compact"]) {
+    pi.on(event, () => {
+      compacting = false;
+    });
+  }
 
   // Branch and tree navigation end without session_switch, after OMP dropped the listener.
   for (const event of ["session_branch", "session_tree"]) {
