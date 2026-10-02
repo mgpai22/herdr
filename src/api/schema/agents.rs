@@ -187,6 +187,54 @@ pub struct AgentPromptParams {
     pub wait: Option<AgentPromptWaitOptions>,
 }
 
+/// A bounded instruction bound to the exact agent incarnation reviewed by a caller.
+/// A separate method prevents older servers from silently ignoring the guards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstructParams {
+    pub target: String,
+    pub text: String,
+    pub expected_terminal_id: String,
+    pub expected_name: String,
+    pub expected_agent: String,
+    pub expected_session: String,
+    pub expected_workspace_id: String,
+    pub expected_cwd: String,
+}
+
+impl AgentInstructParams {
+    pub(crate) fn validate(&self, agent: &AgentInfo) -> Result<(), &'static str> {
+        if self.text.trim().is_empty()
+            || self.text.len() > 8192
+            || self
+                .text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            || self.text.trim_start().starts_with('/')
+        {
+            return Err("invalid_instruction");
+        }
+        if self.expected_terminal_id.is_empty()
+            || self.expected_name.is_empty()
+            || self.expected_agent.is_empty()
+            || self.expected_session.is_empty()
+            || self.expected_workspace_id.is_empty()
+            || self.expected_cwd.is_empty()
+            || agent.terminal_id != self.expected_terminal_id
+            || agent.name.as_deref() != Some(self.expected_name.as_str())
+            || agent.agent.as_deref() != Some(self.expected_agent.as_str())
+            || agent.workspace_id != self.expected_workspace_id
+            || (agent.cwd.as_deref() != Some(self.expected_cwd.as_str())
+                && agent.foreground_cwd.as_deref() != Some(self.expected_cwd.as_str()))
+            || agent.agent_session.as_ref().map(|s| s.value.as_str())
+                != Some(self.expected_session.as_str())
+        {
+            return Err("agent_identity_changed");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,

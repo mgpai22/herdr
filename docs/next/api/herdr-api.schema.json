@@ -1228,6 +1228,47 @@
     },
     "request": {
       "$defs": {
+        "AgentInstructParams": {
+          "additionalProperties": false,
+          "description": "A bounded instruction bound to the exact agent incarnation reviewed by a caller.\nA separate method prevents older servers from silently ignoring the guards.",
+          "properties": {
+            "expected_agent": {
+              "type": "string"
+            },
+            "expected_cwd": {
+              "type": "string"
+            },
+            "expected_name": {
+              "type": "string"
+            },
+            "expected_session": {
+              "type": "string"
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_workspace_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal_id",
+            "expected_name",
+            "expected_agent",
+            "expected_session",
+            "expected_workspace_id",
+            "expected_cwd"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -5451,6 +5492,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.instruct",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentInstructParams"
             }
           },
           "required": [

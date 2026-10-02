@@ -84,8 +84,37 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
-        let crate::api::schema::Method::AgentPrompt(params) = request.method else {
-            return false;
+        let params = match request.method {
+            crate::api::schema::Method::AgentPrompt(params) => params,
+            crate::api::schema::Method::AgentInstruct(params) => {
+                // This runs in the server-owned app loop immediately before queueing
+                // the submission. No read/submit socket round trip can retarget it.
+                self.reconcile_managed_agent_target(&params.target);
+                let agent = match self.agent_info_for_target(&params.target) {
+                    Ok(agent) => agent,
+                    Err(err) => {
+                        let _ = respond_to.send(encode_error_body(
+                            request.id,
+                            self.agent_target_error_body(err),
+                        ));
+                        return true;
+                    }
+                };
+                if let Err(code) = params.validate(&agent) {
+                    let _ = respond_to.send(encode_error(
+                        request.id,
+                        code,
+                        "instruction refused before submission",
+                    ));
+                    return true;
+                }
+                AgentPromptParams {
+                    target: params.target,
+                    text: params.text,
+                    wait: None,
+                }
+            }
+            _ => return false,
         };
         match self.queue_agent_prompt(request.id, params) {
             Ok((id, agent, completion)) => {
@@ -437,6 +466,142 @@ mod tests {
         start_deferred_agent_prompt(app, id, params)
             .recv_timeout(Duration::from_secs(1))
             .expect("agent prompt responds after submission")
+    }
+
+    fn guarded_fixture(
+        state: AgentState,
+    ) -> (
+        App,
+        crate::api::schema::AgentInstructParams,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.cwd = "/fixture/project".into();
+        terminal.set_agent_name("director".into());
+        terminal.set_detected_state(Some(Agent::Omp), state);
+        assert!(terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::agent_resume::AgentSessionRef::path("/fixture/omp-native.jsonl"),
+                Some(1),
+                Some("startup".into()),
+            )
+            .is_some());
+        let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let public_pane = app.public_pane_id(0, pane_id).unwrap();
+        let info = app.agent_info_for_target(&public_pane).unwrap();
+        let params = crate::api::schema::AgentInstructParams {
+            target: public_pane,
+            text: "Report current status".into(),
+            expected_terminal_id: info.terminal_id,
+            expected_name: info.name.unwrap(),
+            expected_agent: info.agent.unwrap(),
+            expected_session: info.agent_session.unwrap().value,
+            expected_workspace_id: info.workspace_id,
+            expected_cwd: info.cwd.unwrap(),
+        };
+        (app, params, rx)
+    }
+
+    fn instruct(app: &mut App, params: crate::api::schema::AgentInstructParams) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(app.handle_deferred_agent_api_request(
+            crate::api::schema::Request {
+                id: "guarded".into(),
+                method: crate::api::schema::Method::AgentInstruct(params)
+            },
+            tx
+        ));
+        rx.recv_timeout(Duration::from_secs(1)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_instruct_checks_every_identity_field_before_writing() {
+        for field in 0..6 {
+            let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
+            match field {
+                0 => p.expected_terminal_id = "other-terminal".into(),
+                1 => p.expected_name = "other-name".into(),
+                2 => p.expected_agent = "other-agent".into(),
+                3 => p.expected_session = "restarted-session".into(),
+                4 => p.expected_workspace_id = "other-workspace".into(),
+                _ => p.expected_cwd = "/other/project".into(),
+            }
+            let error: crate::api::schema::ErrorResponse =
+                serde_json::from_str(&instruct(&mut app, p)).unwrap();
+            assert_eq!(error.error.code, "agent_identity_changed");
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_instruct_rejects_unbounded_control_and_slash_text_without_writing() {
+        for text in [
+            String::new(),
+            " \n".into(),
+            "/new".into(),
+            " \t/quit".into(),
+            "hello\x1b[201~".into(),
+            "hello\rthere".into(),
+            "é".repeat(4097),
+        ] {
+            let (mut app, mut p, mut rx) = guarded_fixture(AgentState::Idle);
+            p.text = text;
+            let error: crate::api::schema::ErrorResponse =
+                serde_json::from_str(&instruct(&mut app, p)).unwrap();
+            assert_eq!(error.error.code, "invalid_instruction");
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_instruct_preserves_harness_approval_gate_and_normal_submission() {
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Blocked);
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&instruct(&mut app, p)).unwrap();
+        assert_eq!(error.error.code, "agent_blocked");
+        assert!(rx.try_recv().is_err());
+        let (mut app, p, mut rx) = guarded_fixture(AgentState::Idle);
+        let success: SuccessResponse = serde_json::from_str(&instruct(&mut app, p)).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"Report current status")
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+    }
+
+    #[test]
+    fn agent_instruct_wire_requires_guards_and_refuses_unknown_parameters() {
+        let params = serde_json::json!({"target":"w1:p1","text":"Report status","expected_terminal_id":"term1","expected_name":"director","expected_agent":"omp","expected_session":"native1","expected_workspace_id":"w1","expected_cwd":"/project"});
+        let request = serde_json::json!({"id":"guarded","method":"agent.instruct","params":params});
+        let parsed: crate::api::schema::Request = serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), request);
+        for field in [
+            "expected_terminal_id",
+            "expected_name",
+            "expected_agent",
+            "expected_session",
+            "expected_workspace_id",
+            "expected_cwd",
+        ] {
+            let mut broken = request.clone();
+            broken["params"].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<crate::api::schema::Request>(broken).is_err());
+        }
+        let mut broken = request;
+        broken["params"]["keys"] = serde_json::json!(["enter"]);
+        assert!(serde_json::from_value::<crate::api::schema::Request>(broken).is_err());
     }
 
     #[cfg(windows)]

@@ -544,6 +544,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentInstruct(_) => "agent.instruct",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -1530,6 +1531,33 @@ mod tests {
         let response = thread.join().unwrap();
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_2");
+    }
+
+    #[test]
+    fn agent_instruct_dispatch_preserves_guards_and_mutation_classification() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id":"guarded-dispatch", "method":"agent.instruct", "params":{
+                "target":"w1:p1", "text":"Report status", "expected_terminal_id":"term-1", "expected_name":"director",
+                "expected_agent":"omp", "expected_session":"/fixture/session.jsonl", "expected_workspace_id":"w1", "expected_cwd":"/fixture/project"
+            }
+        })).unwrap();
+        assert!(crate::api::request_changes_ui(&request));
+        assert_eq!(api_method_name(&request.method), "agent.instruct");
+        let original = request.clone();
+        let worker = std::thread::spawn(move || handle_request(request, &tx, None, None, None));
+        let message = rx.blocking_recv().unwrap();
+        assert_eq!(message.request, original);
+        message
+            .respond_to
+            .send(error_response_json(
+                original.id,
+                "agent_identity_changed",
+                "fixture response".into(),
+            ))
+            .unwrap();
+        let response: ErrorResponse = serde_json::from_str(&worker.join().unwrap()).unwrap();
+        assert_eq!(response.error.code, "agent_identity_changed");
     }
 
     #[test]
