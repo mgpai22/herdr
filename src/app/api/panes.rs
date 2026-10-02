@@ -1774,6 +1774,15 @@ impl App {
             params.runtime_instance.as_deref(),
         );
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            // A report without a listener from the process that had one is OMP shutting its
+            // session down to restart or reload; a process that never registered one is not.
+            terminal.instruction_listener_withdrawn = if params.accepts_instructions {
+                None
+            } else if terminal.instruction_listener.as_ref() == Some(&owner_after) {
+                Some((owner_after.clone(), std::time::Instant::now()))
+            } else {
+                terminal.instruction_listener_withdrawn.take()
+            };
             terminal.instruction_listener =
                 params.accepts_instructions.then(|| owner_after.clone());
             terminal.instruction_listener_runtime = params

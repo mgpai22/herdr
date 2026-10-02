@@ -145,6 +145,10 @@ pub struct TerminalState {
     pub(crate) instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
     /// The listener's JS runtime (`runtime_instance` of its report).
     pub(crate) instruction_listener_runtime: Option<String>,
+    /// The process whose listener a report without one withdrew (OMP `/restart`, extension
+    /// reload), and when; shown as `AgentInfo.listener_withdrawn` until it registers again.
+    pub(crate) instruction_listener_withdrawn:
+        Option<(crate::platform::OwnerProcessIncarnation, Instant)>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -187,6 +191,7 @@ impl TerminalState {
             persisted_agent_session: None,
             instruction_listener: None,
             instruction_listener_runtime: None,
+            instruction_listener_withdrawn: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,

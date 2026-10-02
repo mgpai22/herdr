@@ -6836,6 +6836,10 @@
                 "null"
               ]
             },
+            "listener_withdrawn": {
+              "description": "The agent's OMP integration had an instruction listener and withdrew it when OMP shut\nits session down (`/restart`, extension reload); it registers again within seconds.\nFalse for an agent that never registered one. Shown for at most 30 seconds.",
+              "type": "boolean"
+            },
             "name": {
               "type": [
                 "string",

@@ -1590,6 +1590,64 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A shutdown report (OMP `/restart` or reload) marks the listener withdrawn until the next
+    /// registration; an agent that never registered one is not marked.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_withdrawn_listener_is_told_apart_from_one_never_registered() {
+        let (mut app, p, _rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target;
+        let row = |app: &App| {
+            let info = app.agent_info_for_target(&target).unwrap();
+            (info.accepts_instructions, info.listener_withdrawn)
+        };
+        let report = |app: &mut App, seq, accepts, runtime| {
+            let reported = report_session_from(app, &target, seq, accepts, Some(runtime));
+            assert!(
+                serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+                "{reported}"
+            );
+        };
+        assert_eq!(row(&app), (true, false));
+        report(&mut app, 10, false, FIXTURE_RUNTIME);
+        assert_eq!(row(&app), (false, true));
+        // A repeated report without a listener keeps the mark.
+        report(&mut app, 11, false, FIXTURE_RUNTIME);
+        assert_eq!(row(&app), (false, true));
+        report(&mut app, 12, true, "after-exec");
+        assert_eq!(row(&app), (true, false));
+
+        // Not forever: an image that never registers again is not "restarting".
+        report(&mut app, 13, false, "after-exec");
+        let terminal_id = fixture_terminal_id(&app);
+        let withdrawn = app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .instruction_listener_withdrawn
+            .as_mut()
+            .unwrap();
+        withdrawn.1 -= crate::app::agents::LISTENER_WITHDRAWN_FOR;
+        assert_eq!(row(&app), (false, false));
+
+        // A process that never had a listener (integration without one) is not marked.
+        let (mut app, p, _rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .instruction_listener = None;
+        let reported = report_session_from(&mut app, &p.target, 10, false, Some(FIXTURE_RUNTIME));
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        let info = app.agent_info_for_target(&p.target).unwrap();
+        assert!(!info.accepts_instructions && !info.listener_withdrawn);
+    }
+
     /// A later delivery does not hide an earlier one's outcome from a caller that follows it.
     #[cfg(target_os = "linux")]
     #[tokio::test]

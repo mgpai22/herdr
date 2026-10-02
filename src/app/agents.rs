@@ -7,6 +7,9 @@ use super::{terminal_targets::TerminalTargetError, App};
 use crate::api::schema::AgentStartParams;
 
 const DEFAULT_AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `AgentInfo.listener_withdrawn` shows a withdrawal; an OMP restart or extension
+/// reload registers again within a few seconds.
+pub(crate) const LISTENER_WITHDRAWN_FOR: Duration = Duration::from_secs(30);
 pub(crate) const MAX_AGENT_START_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const AGENT_START_SETTLE_DELAY: Duration = Duration::from_secs(3);
 const INVALID_AGENT_TIMEOUT_MESSAGE: &str =
@@ -460,6 +463,15 @@ impl App {
         });
         let accepts_instructions =
             live_owner.is_some() && terminal.instruction_listener.as_ref() == live_owner;
+        // Only while the same live process has not registered again, and not forever: an image
+        // that never registers is no longer "restarting".
+        let listener_withdrawn = !accepts_instructions
+            && terminal
+                .instruction_listener_withdrawn
+                .as_ref()
+                .is_some_and(|(owner, at)| {
+                    Some(owner) == live_owner && at.elapsed() < LISTENER_WITHDRAWN_FOR
+                });
         let recent_instructions: Vec<_> = self
             .recent_instructions
             .get(&terminal.id)
@@ -482,6 +494,7 @@ impl App {
             agent_session: pane.agent_session,
             runtime_id,
             accepts_instructions,
+            listener_withdrawn,
             last_instruction: recent_instructions.first().cloned(),
             recent_instructions,
             launch_profile,
