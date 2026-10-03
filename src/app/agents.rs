@@ -1,11 +1,15 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use super::{terminal_targets::TerminalTargetError, App};
 use crate::api::schema::AgentStartParams;
 
 const DEFAULT_AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `AgentInfo.listener_withdrawn` shows a withdrawal; an OMP restart or extension
+/// reload registers again within a few seconds.
+pub(crate) const LISTENER_WITHDRAWN_FOR: Duration = Duration::from_secs(30);
 pub(crate) const MAX_AGENT_START_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const AGENT_START_SETTLE_DELAY: Duration = Duration::from_secs(3);
 const INVALID_AGENT_TIMEOUT_MESSAGE: &str =
@@ -428,6 +432,53 @@ impl App {
             .and_then(|profile| self.omp_launchers.get(profile))
             .filter(|executable| !executable.is_empty())
             .cloned();
+        // OMP registration verifies the process against its socket peer and foreground job.
+        // A resumed native session has a different owner, an unregistered/restored session
+        // cannot supply an incarnation guard, and a missed exit leaves a dead owner behind,
+        // so the saved owner must still be the live incarnation.
+        let live_owner = terminal.persisted_agent_session.as_ref().and_then(|saved| {
+            let session = pane.agent_session.as_ref()?;
+            let owner = saved.owner_process.as_ref()?;
+            (saved.source == session.source
+                && saved.agent == session.agent
+                && pane.agent.as_deref() == Some(saved.agent.as_str())
+                && saved.session_ref.kind == session.kind
+                && saved.session_ref.value == session.value
+                && crate::agent_resume::is_official_agent_source(&saved.source, &saved.agent)
+                && owner.pid != 0
+                && !owner.boot_id.is_empty()
+                && owner.start_time_ticks != 0
+                && crate::platform::observe_process(owner.pid)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    == Some(owner))
+            .then_some(owner)
+        });
+        let runtime_id = live_owner.map(|owner| {
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(owner).expect("process identity serializes"))
+            )
+        });
+        let accepts_instructions =
+            live_owner.is_some() && terminal.instruction_listener.as_ref() == live_owner;
+        // Only while the same live process has not registered again, and not forever: an image
+        // that never registers is no longer "restarting".
+        let listener_withdrawn = !accepts_instructions
+            && terminal
+                .instruction_listener_withdrawn
+                .as_ref()
+                .is_some_and(|(owner, at)| {
+                    Some(owner) == live_owner && at.elapsed() < LISTENER_WITHDRAWN_FOR
+                });
+        let recent_instructions: Vec<_> = self
+            .recent_instructions
+            .get(&terminal.id)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.info.clone())
+            .collect();
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -441,6 +492,11 @@ impl App {
             state_labels: pane.state_labels,
             tokens: pane.tokens,
             agent_session: pane.agent_session,
+            runtime_id,
+            accepts_instructions,
+            listener_withdrawn,
+            last_instruction: recent_instructions.first().cloned(),
+            recent_instructions,
             launch_profile,
             launch_executable,
             workspace_id: pane.workspace_id,
@@ -488,6 +544,75 @@ pub(super) fn runtime_hosts_agent(
         return true;
     }
     live_runtime_agent(runtime) == Some(expected)
+}
+
+/// Whether `pid` belongs to the pane's foreground job, so it owns the terminal input.
+pub(super) fn owner_in_foreground_job(
+    runtime: &crate::terminal::TerminalRuntime,
+    pid: u32,
+) -> bool {
+    #[cfg(test)]
+    if runtime.child_pid().is_none() {
+        return true;
+    }
+    #[cfg(not(windows))]
+    let member = runtime
+        .child_pid()
+        .and_then(crate::detect::foreground_job)
+        .is_some_and(|job| job.processes.iter().any(|process| process.pid == pid));
+    #[cfg(windows)]
+    let member = runtime
+        .child_pid()
+        .is_some_and(|child_pid| crate::platform::foreground_job_includes_process(child_pid, pid));
+    member
+}
+
+/// Platforms where `agent.instruct` has every guard it needs: a live process incarnation
+/// (`observe_process`) and `owner_child_reads_tty`. The server advertises the capability from
+/// this, and `agent.instruct` refuses elsewhere.
+pub(crate) const INSTRUCTIONS_SUPPORTED: bool = cfg!(target_os = "linux");
+
+/// Whether a process that `owner` started reads the pane terminal in its place: it is in the
+/// foreground job, descends from `owner`, and has the pane tty as stdin. OMP's external editor
+/// (Ctrl+G) runs like this while the OMP TUI is stopped, so a paste would land in the editor.
+#[cfg(target_os = "linux")]
+pub(super) fn owner_child_reads_tty(
+    runtime: &crate::terminal::TerminalRuntime,
+    owner: u32,
+) -> bool {
+    let stdin = |pid: u32| std::fs::read_link(format!("/proc/{pid}/fd/0")).ok();
+    let parent = |pid: u32| -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // After "(comm) ": state, then ppid.
+        stat.get(stat.rfind(')')? + 2..)?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    // The pane shell's stdin is the pane tty.
+    let Some(child_pid) = runtime.child_pid() else {
+        return false;
+    };
+    let (Some(tty), Some(job)) = (stdin(child_pid), crate::detect::foreground_job(child_pid))
+    else {
+        return false;
+    };
+    let descends_from_owner = |mut pid: u32| {
+        for _ in 0..job.processes.len() {
+            match parent(pid) {
+                Some(ppid) if ppid == owner => return true,
+                Some(ppid) if ppid > 1 => pid = ppid,
+                _ => return false,
+            }
+        }
+        false
+    };
+    job.processes.iter().any(|process| {
+        process.pid != owner
+            && stdin(process.pid).as_ref() == Some(&tty)
+            && descends_from_owner(process.pid)
+    })
 }
 
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {

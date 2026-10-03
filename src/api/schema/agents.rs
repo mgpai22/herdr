@@ -187,6 +187,74 @@ pub struct AgentPromptParams {
     pub wait: Option<AgentPromptWaitOptions>,
 }
 
+/// A bounded instruction bound to the exact agent incarnation read by a caller.
+/// A separate method prevents older servers from silently ignoring the guards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstructParams {
+    pub target: String,
+    pub text: String,
+    pub expected_terminal_id: String,
+    /// Must equal the agent name; omit only for an agent that has no name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_name: Option<String>,
+    pub expected_agent: String,
+    pub expected_session: String,
+    pub expected_runtime_id: String,
+    pub expected_workspace_id: String,
+    pub expected_cwd: String,
+    /// When the socket server read the request; set by the server, never by the caller.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub received_at: Option<std::time::Instant>,
+}
+
+impl AgentInstructParams {
+    pub(crate) fn validate(&self, agent: &AgentInfo) -> Result<(), &'static str> {
+        let lead = self.text.trim_start();
+        // OMP runs `/` as a command, `!` as user bash, and `$`/`$$` before whitespace as
+        // Python. Refuse them so a fallback typed path can never execute the text.
+        let python = lead
+            .strip_prefix("$$")
+            .or_else(|| lead.strip_prefix('$'))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '\n']));
+        if lead.is_empty()
+            || self.text.len() > 8192
+            || self
+                .text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            || lead.starts_with(['/', '!'])
+            || python
+        {
+            return Err("invalid_instruction");
+        }
+        if self.expected_terminal_id.is_empty()
+            || self.expected_agent.is_empty()
+            || self.expected_session.is_empty()
+            || self.expected_runtime_id.is_empty()
+            || self.expected_workspace_id.is_empty()
+            || self.expected_cwd.is_empty()
+            || agent.terminal_id != self.expected_terminal_id
+            || agent.name != self.expected_name
+            || agent.agent.as_deref() != Some(self.expected_agent.as_str())
+            || agent.workspace_id != self.expected_workspace_id
+            || agent
+                .foreground_cwd
+                .as_deref()
+                .filter(|cwd| !cwd.is_empty())
+                .or(agent.cwd.as_deref())
+                != Some(self.expected_cwd.as_str())
+            || agent.runtime_id.as_deref() != Some(self.expected_runtime_id.as_str())
+            || agent.agent_session.as_ref().map(|s| s.value.as_str())
+                != Some(self.expected_session.as_str())
+        {
+            return Err("agent_identity_changed");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
@@ -212,6 +280,27 @@ pub struct AgentInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Opaque identity of a verified registered process, independent of resumable session.
+    /// Absent when the harness has no verified process-owner registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    /// The live `runtime_id` process registered the OMP integration listener that consumes
+    /// `agent.instruct` deliveries.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub accepts_instructions: bool,
+    /// The agent's OMP integration had an instruction listener and withdrew it when OMP shut
+    /// its session down (`/restart`, extension reload); it registers again within seconds.
+    /// False for an agent that never registered one. Shown for at most 30 seconds.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub listener_withdrawn: bool,
+    /// The latest `agent.instruct` delivery to this agent and its outcome so far, kept for
+    /// two minutes after it was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_instruction: Option<super::panes::LastInstructionInfo>,
+    /// Up to the 8 latest `agent.instruct` deliveries to this agent, newest first, each with its
+    /// outcome so far and kept for two minutes after its outcome last changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_instructions: Vec<super::panes::LastInstructionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

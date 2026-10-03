@@ -39,4 +39,7 @@ pub struct ServerCapabilities {
     /// Supports `agent.start` `profile` (OMP launch profiles).
     #[serde(default)]
     pub agent_start_profile: bool,
+    /// Supports `agent.instruct` delivery acknowledged by the OMP integration.
+    #[serde(default)]
+    pub agent_instruct: bool,
 }

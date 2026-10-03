@@ -438,6 +438,7 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 agent_start_profile: false,
+                agent_instruct: false,
             }),
         }
     }

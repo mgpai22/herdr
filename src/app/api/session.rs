@@ -5,6 +5,7 @@ use super::responses::encode_success;
 
 impl App {
     pub(super) fn handle_session_snapshot(&mut self, id: String) -> String {
+        self.expire_instruction_acks();
         encode_success(
             id,
             ResponseResult::SessionSnapshot {

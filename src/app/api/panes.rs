@@ -1669,7 +1669,7 @@ impl App {
                 "OMP session report sequence is stale or missing",
             );
         }
-        let Some(runtime) = self.terminal_runtimes.get(&terminal_id) else {
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return encode_error(id, "process_unavailable", "pane runtime is unavailable");
         };
         let owner_before = match crate::platform::observe_process(params.agent_pid) {
@@ -1683,20 +1683,7 @@ impl App {
                 )
             }
         };
-        #[cfg(not(windows))]
-        let is_foreground_member = runtime
-            .child_pid()
-            .and_then(crate::detect::foreground_job)
-            .is_some_and(|job| {
-                job.processes
-                    .iter()
-                    .any(|process| process.pid == params.agent_pid)
-            });
-        #[cfg(windows)]
-        let is_foreground_member = runtime.child_pid().is_some_and(|child_pid| {
-            crate::platform::foreground_job_includes_process(child_pid, params.agent_pid)
-        });
-        if !is_foreground_member {
+        if !super::super::agents::owner_in_foreground_job(runtime, params.agent_pid) {
             return encode_error(
                 id,
                 "process_mismatch",
@@ -1773,6 +1760,41 @@ impl App {
         if !applied {
             return encode_error(id, "report_rejected", "OMP session report was rejected");
         }
+        // A report without the listener flag (integration v11 or no UI) withdraws it. A report
+        // after a delivery proves the listener outlived it, so that delivery cannot withdraw it
+        // when it expires unconfirmed.
+        // After `/restart` (exec: same process, new runtime) the old deliveries are gone; an
+        // extension reload keeps the runtime and the running prompt, also in the report the old
+        // binding sends without its listener at shutdown. Settled before the new listener is
+        // stored, so a withdrawal for a never-taken block hits the old registration and this one
+        // replaces it.
+        self.settle_stale_deliveries(
+            &terminal_id,
+            &owner_after,
+            params.runtime_instance.as_deref(),
+        );
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            // A report without a listener from the process that had one is OMP shutting its
+            // session down to restart or reload; a process that never registered one is not.
+            terminal.instruction_listener_withdrawn = if params.accepts_instructions {
+                None
+            } else if terminal.instruction_listener.as_ref() == Some(&owner_after) {
+                Some((owner_after.clone(), std::time::Instant::now()))
+            } else {
+                terminal.instruction_listener_withdrawn.take()
+            };
+            terminal.instruction_listener =
+                params.accepts_instructions.then(|| owner_after.clone());
+            terminal.instruction_listener_runtime = params
+                .runtime_instance
+                .clone()
+                .filter(|_| params.accepts_instructions);
+        }
+        for pending in self.pending_instruction_acks.values_mut() {
+            if pending.terminal_id == terminal_id {
+                pending.withdraws_listener = false;
+            }
+        }
         if let Some(requested) = self
             .state
             .terminals
@@ -1788,6 +1810,87 @@ impl App {
                 "OMP reported a launch profile other than the one agent.start requested"
             );
         }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Accepts the OMP integration's confirmation for a pending `agent.instruct` delivery only
+    /// from the exact process incarnation the instruction was written to.
+    pub(super) fn handle_pane_ack_instruction(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneAckInstructionParams,
+    ) -> String {
+        use crate::api::schema::InstructionOutcome;
+        if matches!(
+            params.outcome,
+            InstructionOutcome::Written | InstructionOutcome::Unconfirmed
+        ) {
+            return encode_error(
+                id,
+                "invalid_request",
+                "an instruction ack reports pending, prompt, aside or dropped",
+            );
+        }
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| &pane.attached_terminal_id);
+        let Some(pending) = self
+            .pending_instruction_acks
+            .get(&params.instruction_id)
+            .filter(|pending| {
+                pending.deadline > std::time::Instant::now()
+                    && Some(&pending.terminal_id) == terminal_id
+            })
+        else {
+            return encode_error(
+                id,
+                "instruction_not_found",
+                "no pending instruction with this id for this pane",
+            );
+        };
+        if params.peer_pid != Some(params.agent_pid)
+            || params.agent_pid != pending.owner.pid
+            || crate::platform::observe_process(params.agent_pid)
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(&pending.owner)
+        {
+            return encode_error(
+                id,
+                "process_mismatch",
+                "the acknowledging process is not the instructed OMP process",
+            );
+        }
+        let now = std::time::Instant::now();
+        let terminal_id = pending.terminal_id.clone();
+        if params.outcome == InstructionOutcome::Pending {
+            // OMP took the block, so its listener exists. Keep following the delivery until the
+            // integration reports the turn start or the drop.
+            if let Some(pending) = self
+                .pending_instruction_acks
+                .get_mut(&params.instruction_id)
+            {
+                pending.withdraws_listener = false;
+                pending.deadline = now + super::agents::INSTRUCTION_OUTCOME_TTL;
+                let _ = pending.tx.send(params.outcome);
+            }
+        } else if let Some(pending) = self.pending_instruction_acks.remove(&params.instruction_id) {
+            let _ = pending.tx.send(params.outcome);
+        }
+        super::agents::record_instruction_outcome(
+            &mut self.recent_instructions,
+            &terminal_id,
+            &params.instruction_id,
+            params.outcome,
+            now,
+        );
         encode_success(id, ResponseResult::Ok {})
     }
 

@@ -7,6 +7,7 @@ pub(crate) mod actions;
 mod agent_resume;
 pub(crate) mod agent_view;
 mod agents;
+pub(crate) use agents::INSTRUCTIONS_SUPPORTED;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 #[cfg(test)]
@@ -136,6 +137,9 @@ pub struct App {
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
     pub(crate) omp_launchers: std::collections::BTreeMap<String, String>,
+    pub(crate) pending_instruction_acks:
+        std::collections::HashMap<String, api::agents::PendingInstructionAck>,
+    pub(crate) recent_instructions: api::agents::RecentInstructions,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -598,6 +602,8 @@ impl App {
             ),
             next_agent_resume_at: None,
             omp_launchers: config.session.omp_launchers.clone(),
+            pending_instruction_acks: std::collections::HashMap::new(),
+            recent_instructions: std::collections::HashMap::new(),
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,

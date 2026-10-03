@@ -291,8 +291,23 @@ fn remote_bridge_refuses_unreachable_live_server() {
     cmd.env("HERDR_SOCKET_PATH", &api_socket);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env_remove("HERDR_ENV");
+    let started = Instant::now();
     let mut local = pair.slave.spawn_command(cmd).unwrap();
     drop(pair.slave);
+    // Drain from spawn: a PTY buffer that fills up blocks the child before it can exit, and
+    // the captured output explains a failure.
+    let captured = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let drain = {
+        let captured = std::sync::Arc::clone(&captured);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(read @ 1..) = reader.read(&mut buf) {
+                captured.lock().unwrap().extend_from_slice(&buf[..read]);
+            }
+        })
+    };
+    let captured_text = || String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
     let deadline = Instant::now() + Duration::from_secs(5);
     let exit = loop {
         if let Some(exit) = local.try_wait().unwrap() {
@@ -300,18 +315,21 @@ fn remote_bridge_refuses_unreachable_live_server() {
         }
         if Instant::now() >= deadline {
             local.kill().unwrap();
-            panic!("local autodetect did not report the unreachable server");
+            panic!(
+                "local autodetect did not report the unreachable server after {:?}; output: {:?}",
+                started.elapsed(),
+                captured_text()
+            );
         }
         thread::sleep(Duration::from_millis(20));
     };
-    assert!(!exit.success());
-    let mut output = String::new();
-    pair.master
-        .try_clone_reader()
-        .unwrap()
-        .read_to_string(&mut output)
-        .unwrap();
-    assert!(output.contains("running but its socket"), "{output}");
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    while !drain.is_finished() && Instant::now() < drain_deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let output = captured_text();
+    assert!(!exit.success(), "{output:?}");
+    assert!(output.contains("running but its socket"), "{output:?}");
     assert!(UnixStream::connect(&client_socket).is_err());
     assert!(UnixStream::connect(&api_socket).is_err());
     assert_eq!(

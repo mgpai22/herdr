@@ -1228,6 +1228,54 @@
     },
     "request": {
       "$defs": {
+        "AgentInstructParams": {
+          "additionalProperties": false,
+          "description": "A bounded instruction bound to the exact agent incarnation read by a caller.\nA separate method prevents older servers from silently ignoring the guards.",
+          "properties": {
+            "expected_agent": {
+              "type": "string"
+            },
+            "expected_cwd": {
+              "type": "string"
+            },
+            "expected_name": {
+              "description": "Must equal the agent name; omit only for an agent that has no name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expected_runtime_id": {
+              "type": "string"
+            },
+            "expected_session": {
+              "type": "string"
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_workspace_id": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_terminal_id",
+            "expected_agent",
+            "expected_session",
+            "expected_runtime_id",
+            "expected_workspace_id",
+            "expected_cwd"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -2158,6 +2206,41 @@
           ],
           "type": "object"
         },
+        "InstructionOutcome": {
+          "description": "What became of an `agent.instruct` delivery, as the OMP integration reports it and as\n`AgentInfo.last_instruction` shows it.",
+          "oneOf": [
+            {
+              "const": "written",
+              "description": "Written to the terminal; OMP has not confirmed taking it. Never sent by the integration.",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "description": "OMP took the text on an idle session and is preparing its turn.",
+              "type": "string"
+            },
+            {
+              "const": "prompt",
+              "description": "The turn with the text started.",
+              "type": "string"
+            },
+            {
+              "const": "aside",
+              "description": "Queued for the next step boundary of a running or blocked session. A person interrupting\nthe turn before that step leaves the text in the transcript without running a turn.",
+              "type": "string"
+            },
+            {
+              "const": "dropped",
+              "description": "OMP took the text but went idle without starting its turn (no model or API key, usage\nlimit, Esc, session change). Nothing ran; OMP may have put the text into an empty editor.",
+              "type": "string"
+            },
+            {
+              "const": "unconfirmed",
+              "description": "Nothing final was confirmed in time; the outcome is unknown. Never sent by the integration.",
+              "type": "string"
+            }
+          ]
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -2434,6 +2517,34 @@
               "type": "object"
             }
           ]
+        },
+        "PaneAckInstructionParams": {
+          "additionalProperties": false,
+          "description": "Sent by the OMP integration process that consumed an `agent.instruct` delivery.",
+          "properties": {
+            "agent_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "instruction_id": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/schemas/request/$defs/InstructionOutcome",
+              "description": "`pending`, `prompt`, `aside` or `dropped`."
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "instruction_id",
+            "agent_pid",
+            "outcome"
+          ],
+          "type": "object"
         },
         "PaneAgentState": {
           "enum": [
@@ -2986,6 +3097,10 @@
         },
         "PaneReportAgentSessionV2Params": {
           "properties": {
+            "accepts_instructions": {
+              "description": "The integration consumes `agent.instruct` deliveries (OMP integration v13+).",
+              "type": "boolean"
+            },
             "agent": {
               "type": "string"
             },
@@ -3011,6 +3126,13 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "runtime_instance": {
+              "description": "Opaque id of the integration's JS runtime: the same across an extension reload, new after\nan exec restart of the same process.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "seq": {
               "format": "uint64",
@@ -5462,6 +5584,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.instruct",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentInstructParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.wait",
               "type": "string"
             },
@@ -6011,6 +6149,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneReportAgentSessionV2Params"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.ack_instruction",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneAckInstructionParams"
             }
           },
           "required": [
@@ -6600,6 +6754,10 @@
       "$defs": {
         "AgentInfo": {
           "properties": {
+            "accepts_instructions": {
+              "description": "The live `runtime_id` process registered the OMP integration listener that consumes\n`agent.instruct` deliveries.",
+              "type": "boolean"
+            },
             "agent": {
               "type": [
                 "string",
@@ -6652,6 +6810,17 @@
             "interactive_ready": {
               "type": "boolean"
             },
+            "last_instruction": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/LastInstructionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The latest `agent.instruct` delivery to this agent and its outcome so far, kept for\ntwo minutes after it was written."
+            },
             "launch_executable": {
               "type": [
                 "string",
@@ -6667,6 +6836,10 @@
                 "null"
               ]
             },
+            "listener_withdrawn": {
+              "description": "The agent's OMP integration had an instruction listener and withdrew it when OMP shut\nits session down (`/restart`, extension reload); it registers again within seconds.\nFalse for an agent that never registered one. Shown for at most 30 seconds.",
+              "type": "boolean"
+            },
             "name": {
               "type": [
                 "string",
@@ -6676,10 +6849,24 @@
             "pane_id": {
               "type": "string"
             },
+            "recent_instructions": {
+              "description": "Up to the 8 latest `agent.instruct` deliveries to this agent, newest first, each with its\noutcome so far and kept for two minutes after its outcome last changed.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/LastInstructionInfo"
+              },
+              "type": "array"
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
+            },
+            "runtime_id": {
+              "description": "Opaque identity of a verified registered process, independent of resumable session.\nAbsent when the harness has no verified process-owner registration.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "screen_detection_skipped": {
               "type": "boolean"
@@ -7654,6 +7841,61 @@
           ],
           "type": "object"
         },
+        "InstructionDelivery": {
+          "description": "How OMP accepted an `agent.instruct` delivery.",
+          "oneOf": [
+            {
+              "const": "prompt",
+              "description": "Started a new turn on an idle session.",
+              "type": "string"
+            },
+            {
+              "const": "aside",
+              "description": "Queued for the next step boundary of a running or blocked session.",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "description": "OMP took the text on an idle session but had not started its turn when Herdr stopped\nwaiting. The outcome is not final: `AgentInfo.last_instruction` later shows `prompt` or\n`dropped`.",
+              "type": "string"
+            }
+          ]
+        },
+        "InstructionOutcome": {
+          "description": "What became of an `agent.instruct` delivery, as the OMP integration reports it and as\n`AgentInfo.last_instruction` shows it.",
+          "oneOf": [
+            {
+              "const": "written",
+              "description": "Written to the terminal; OMP has not confirmed taking it. Never sent by the integration.",
+              "type": "string"
+            },
+            {
+              "const": "pending",
+              "description": "OMP took the text on an idle session and is preparing its turn.",
+              "type": "string"
+            },
+            {
+              "const": "prompt",
+              "description": "The turn with the text started.",
+              "type": "string"
+            },
+            {
+              "const": "aside",
+              "description": "Queued for the next step boundary of a running or blocked session. A person interrupting\nthe turn before that step leaves the text in the transcript without running a turn.",
+              "type": "string"
+            },
+            {
+              "const": "dropped",
+              "description": "OMP took the text but went idle without starting its turn (no model or API key, usage\nlimit, Esc, session change). Nothing ran; OMP may have put the text into an empty editor.",
+              "type": "string"
+            },
+            {
+              "const": "unconfirmed",
+              "description": "Nothing final was confirmed in time; the outcome is unknown. Never sent by the integration.",
+              "type": "string"
+            }
+          ]
+        },
         "IntegrationInfo": {
           "properties": {
             "available": {
@@ -7736,6 +7978,22 @@
           },
           "required": [
             "messages"
+          ],
+          "type": "object"
+        },
+        "LastInstructionInfo": {
+          "description": "The latest `agent.instruct` delivery to an agent and its outcome so far.",
+          "properties": {
+            "instruction_id": {
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/schemas/success_response/$defs/InstructionOutcome"
+            }
+          },
+          "required": [
+            "instruction_id",
+            "outcome"
           ],
           "type": "object"
         },
@@ -9564,6 +9822,31 @@
             },
             {
               "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo",
+                  "description": "The agent right after the block was written, before OMP took it: its `agent_status`\nand its `last_instruction` (`written`) describe that moment. `delivered_as` is the\noutcome; read `agent.get` for the current status."
+                },
+                "delivered_as": {
+                  "$ref": "#/schemas/success_response/$defs/InstructionDelivery"
+                },
+                "instruction_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_instructed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "instruction_id",
+                "delivered_as"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agents": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/AgentInfo"
@@ -10490,6 +10773,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_instruct": {
+              "default": false,
+              "description": "Supports `agent.instruct` delivery acknowledged by the OMP integration.",
+              "type": "boolean"
+            },
             "agent_start_profile": {
               "default": false,
               "description": "Supports `agent.start` `profile` (OMP launch profiles).",

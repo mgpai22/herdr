@@ -31,6 +31,10 @@ pub(crate) struct HandoffAgentState {
     authority: HookAuthority,
     sequence: Option<u64>,
     acquisition_pending: bool,
+    #[serde(default)]
+    instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
+    #[serde(default)]
+    instruction_listener_runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +141,14 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    /// OMP process incarnation whose integration registered an `agent.instruct` listener.
+    pub(crate) instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
+    /// The listener's JS runtime (`runtime_instance` of its report).
+    pub(crate) instruction_listener_runtime: Option<String>,
+    /// The process whose listener a report without one withdrew (OMP `/restart`, extension
+    /// reload), and when; shown as `AgentInfo.listener_withdrawn` until it registers again.
+    pub(crate) instruction_listener_withdrawn:
+        Option<(crate::platform::OwnerProcessIncarnation, Instant)>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
@@ -177,6 +189,9 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            instruction_listener: None,
+            instruction_listener_runtime: None,
+            instruction_listener_withdrawn: None,
             terminal_title: None,
             manual_label: None,
             agent_name: None,
@@ -238,6 +253,8 @@ impl TerminalState {
             authority: authority.clone(),
             sequence: self.hook_report_sequences.get(&authority.source).copied(),
             acquisition_pending: self.agent_process_acquisition_pending,
+            instruction_listener: self.instruction_listener.clone(),
+            instruction_listener_runtime: self.instruction_listener_runtime.clone(),
         })
     }
 
@@ -251,6 +268,8 @@ impl TerminalState {
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
+        self.instruction_listener = snapshot.instruction_listener;
+        self.instruction_listener_runtime = snapshot.instruction_listener_runtime;
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
@@ -2441,6 +2460,45 @@ mod tests {
             launch_profile: None,
             owner_process: None,
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_handoff_keeps_the_instruction_listener() {
+        let mut terminal = test_terminal();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("omp-handoff.jsonl"))
+                .unwrap();
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Omp,
+            "herdr:omp",
+            "omp",
+            session_ref.clone(),
+        );
+        let _ = terminal.set_hook_authority_with_session_ref(
+            "herdr:omp".into(),
+            "omp".into(),
+            AgentState::Idle,
+            None,
+            Some(session_ref),
+            Some(1),
+        );
+        let listener = crate::platform::OwnerProcessIncarnation {
+            pid: 42,
+            boot_id: "boot".into(),
+            start_time_ticks: 7,
+        };
+        terminal.instruction_listener = Some(listener.clone());
+        terminal.instruction_listener_runtime = Some("runtime".into());
+        let wire = serde_json::to_value(terminal.handoff_agent_state().unwrap()).unwrap();
+        let mut imported = test_terminal();
+        imported.restore_handoff_agent_state(serde_json::from_value(wire).unwrap());
+        assert_eq!(imported.instruction_listener, Some(listener));
+        assert_eq!(
+            imported.instruction_listener_runtime.as_deref(),
+            Some("runtime")
+        );
     }
 
     #[test]

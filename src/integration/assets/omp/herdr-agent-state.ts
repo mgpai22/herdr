@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=11
+// HERDR_INTEGRATION_VERSION=13
 // @ts-nocheck
 
 import net from "node:net";
@@ -92,6 +92,8 @@ const retryGraceMs = parseDurationEnv("HERDR_OMP_RETRY_GRACE_MS", 2500);
 // with doubling delays, so a resumed session registers without waiting for the next prompt.
 const sessionRetryBaseMs = parseDurationEnv("HERDR_OMP_SESSION_RETRY_MS", 1000);
 const sessionRetryLimit = 8;
+// The shutdown report's single attempt; OMP gives a shutdown handler at most 2 s.
+const shutdownReportTimeoutMs = 1000;
 let sessionRetryTimer: ReturnType<typeof setTimeout> | undefined;
 const retryableErrorPattern =
   /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
@@ -100,6 +102,80 @@ let currentAgentSessionId: string | undefined;
 let currentAgentSessionPath: string | undefined;
 let registeredSessionKey: string | undefined;
 const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim() || "default";
+// Identifies this JS runtime. An extension reload keeps it (same globalThis), so herdr keeps
+// following deliveries the running prompt still owns; an exec restart (`/restart`, same pid
+// and start time) starts a new runtime, so herdr knows the old deliveries are gone.
+const runtimeSlot = globalThis as { [key: symbol]: string | undefined };
+const RUNTIME_KEY = Symbol.for("herdr.omp.runtime");
+const runtimeInstance = (runtimeSlot[RUNTIME_KEY] ??= crypto.randomUUID());
+// A herdr `agent.instruct` delivery: one bracketed paste with no Enter. The header carries the
+// instruction id, the unix ms after which the block must be discarded, the text's UTF-8 byte
+// length, and this runtime's token, which only herdr learns (over the peer-checked socket): a
+// person's paste that imitates a block lacks it and reaches the editor as a paste. OMP hands a
+// paste to input listeners as one string, plus an Enter typed in the same read.
+const INSTRUCTION =
+  /^\x1b\[200~herdr-instruction:v3:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+// herdr sets the expiry a few seconds ahead; a block claiming a later one is not herdr's.
+const instructionExpiryCapMs = 10_000;
+// herdr follows a taken delivery this long; a later ack only gets instruction_not_found.
+const admissionWaitMs = 120_000;
+// How often an idle delivery checks whether OMP went idle again without starting its turn.
+const admissionPollMs = parseDurationEnv("HERDR_OMP_INSTRUCTION_POLL_MS", 250);
+// A model mention, as OMP's editor finds it. OMP rewrites a mention of a known model into an
+// agent tag before the turn starts.
+const MODEL_MENTION = /(^|\s)\^[^\s^]+(?=\s|$)/g;
+let instructionListener = false;
+let unsubscribeInstructions: (() => void) | undefined;
+// Idle deliveries handed to OMP and acked as taken, acked again when OMP starts their turn or
+// goes idle without starting it.
+let awaitingAdmission: {
+  instructionId: string;
+  turnText: RegExp;
+  idlePolls: number;
+  until: number;
+}[] = [];
+let admissionTimer: ReturnType<typeof setInterval> | undefined;
+// A compaction holds new prompts while the session looks idle.
+let compacting = false;
+
+// `pending`: OMP took the text and prepares its turn. `prompt`: the turn started. `aside`:
+// queued for the running turn. `dropped`: OMP went idle without starting the turn, so nothing
+// ran. Sent outside the report queue, so an ack never waits behind state reports.
+function ackInstruction(
+  instructionId: string,
+  outcome: "pending" | "prompt" | "aside" | "dropped",
+): void {
+  void sendRequestNow(() => ({
+    id: `${source}:instruction:${instructionId}:${outcome}:${Date.now()}`,
+    method: "pane.ack_instruction",
+    params: {
+      pane_id: paneId,
+      instruction_id: instructionId,
+      agent_pid: process.pid,
+      outcome,
+    },
+  }));
+}
+
+// Matches the text of the user message OMP starts the turn with: the delivered text, with each
+// model mention allowed to have been rewritten.
+function turnTextPattern(text: string): RegExp {
+  const escape = (part: string) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let pattern = "";
+  let last = 0;
+  for (const mention of text.matchAll(MODEL_MENTION)) {
+    const start = mention.index + mention[1].length;
+    pattern += `${escape(text.slice(last, start))}[\\s\\S]*?`;
+    last = start + mention[0].length - mention[1].length;
+  }
+  return new RegExp(`^${pattern}${escape(text.slice(last))}$`);
+}
+
+function stopAdmissionWatch(): void {
+  clearInterval(admissionTimer);
+  admissionTimer = undefined;
+  awaitingAdmission = [];
+}
 
 function nextReportSeq(): number {
   reportSeq += 1;
@@ -166,6 +242,26 @@ function currentSessionRef(): Record<string, unknown> | undefined {
   return undefined;
 }
 
+// A session report with a fresh id and sequence number, built when it is sent.
+function sessionReport(sessionStartSource: string, sessionRef: Record<string, unknown>) {
+  return {
+    id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+    method: "pane.report_agent_session_v2",
+    params: {
+      pane_id: paneId,
+      source,
+      agent: "omp",
+      seq: nextReportSeq(),
+      session_start_source: sessionStartSource,
+      launch_profile: launchProfile,
+      agent_pid: process.pid,
+      accepts_instructions: instructionListener,
+      runtime_instance: runtimeInstance,
+      ...sessionRef,
+    },
+  };
+}
+
 async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
   const sessionRef = currentSessionRef();
   const sessionKey = currentSessionKey();
@@ -179,20 +275,7 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
   // would be rejected as stale and leave the session unregistered with no
   // later session event to recover it. A fresh retry replays the same
   // profile, PID, and session through every server check and converges.
-  const delivered = await sendRequest(() => ({
-    id: `${source}:session:${Date.now()}:${Math.random().toString(36).slice(2)}`,
-    method: "pane.report_agent_session_v2",
-    params: {
-      pane_id: paneId,
-      source,
-      agent: "omp",
-      seq: nextReportSeq(),
-      session_start_source: sessionStartSource,
-      launch_profile: launchProfile,
-      agent_pid: process.pid,
-      ...sessionRef,
-    },
-  }));
+  const delivered = await sendRequest(() => sessionReport(sessionStartSource, sessionRef));
   if (delivered && currentSessionKey() === sessionKey) {
     registeredSessionKey = sessionKey;
   } else if (!delivered && currentSessionKey() === sessionKey && attempt < sessionRetryLimit) {
@@ -372,11 +455,100 @@ export default function (pi) {
     retryTimer.unref?.();
   }
 
+  // Runs before OMP's editor and dialogs, so a delivery never mixes with a person's draft or
+  // picks a dialog item. sendUserMessage bypasses `/`, `!` and `$` command handling.
+  function takeInstruction(ctx: { isIdle?: () => boolean }, data: string) {
+    const match = INSTRUCTION.exec(data);
+    if (!match) {
+      return undefined;
+    }
+    const [, instructionId, expiresMs, byteLength, token, text, enter] = match;
+    if (token !== runtimeInstance || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
+      return undefined;
+    }
+    const rest = enter ? { data: enter } : { consume: true };
+    // herdr has given up on a late block, and a paste OMP cut short is not the whole text: drop
+    // both, unsent and unacked. The report tells herdr that the listener still exists.
+    if (Date.now() > Number(expiresMs) || Buffer.byteLength(text, "utf8") !== Number(byteLength)) {
+      void reportSession();
+      return rest;
+    }
+    const idle = ctx?.isIdle?.() === true;
+    try {
+      // Always an aside: if a turn starts before OMP dispatches the text, it waits for the next
+      // step instead of becoming a steer that aborts the running tool batch; on an idle session
+      // an aside starts a turn. Not awaited: an idle send resolves only after the whole turn.
+      pi.sendUserMessage(text, { deliverAs: "aside" })?.catch?.(() => {});
+    } catch {
+      // No ack: the caller reports the delivery as unconfirmed.
+      return rest;
+    }
+    if (!idle) {
+      ackInstruction(instructionId, "aside");
+      return rest;
+    }
+    // OMP may spend a long time before the turn starts (compaction, hooks), and shows a failed
+    // idle send (no model, no API key) only on screen. So the take is acked at once, which tells
+    // herdr the text must never be sent again, and the turn start is acked when it happens.
+    ackInstruction(instructionId, "pending");
+    awaitingAdmission.push({
+      instructionId,
+      turnText: turnTextPattern(text),
+      idlePolls: 0,
+      until: Date.now() + admissionWaitMs,
+    });
+    watchAdmissions(ctx);
+    return rest;
+  }
+
+  // OMP's send gives no result to an extension. A send it drops (no model or API key, usage
+  // limit, Esc during preparation, session change) leaves the session idle without a turn:
+  // that, seen on two polls in a row outside a manual compaction, is a drop.
+  function watchAdmissions(ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) {
+    if (admissionTimer) {
+      return;
+    }
+    admissionTimer = setInterval(() => {
+      const now = Date.now();
+      const idle =
+        !compacting && ctx?.isIdle?.() === true && ctx?.hasPendingMessages?.() !== true;
+      awaitingAdmission = awaitingAdmission.filter((entry) => {
+        entry.idlePolls = idle ? entry.idlePolls + 1 : 0;
+        if (entry.idlePolls >= 2) {
+          ackInstruction(entry.instructionId, "dropped");
+          return false;
+        }
+        return entry.until > now;
+      });
+      if (awaitingAdmission.length === 0) {
+        stopAdmissionWatch();
+      }
+    }, admissionPollMs);
+    admissionTimer.unref?.();
+  }
+
+  function registerInstructionListener(ctx: {
+    isIdle?: () => boolean;
+    ui?: { onTerminalInput?: (handler: (data: string) => unknown) => unknown };
+  }) {
+    // OMP drops extension input listeners on every session change (/new, /resume, branch,
+    // reload), sometimes without a session event, so each activation and each turn start
+    // registers a fresh one.
+    unsubscribeInstructions?.();
+    unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) =>
+      takeInstruction(ctx, data),
+    );
+    instructionListener = typeof unsubscribeInstructions === "function";
+  }
+
   function activateRootSession(ctx: any, sessionStartSource = "startup"): boolean {
     if (ctx?.hasUI !== true) {
       return false;
     }
     rootSession = true;
+    // A new or changed session has no compaction of its own running.
+    compacting = false;
+    registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
     return true;
@@ -426,6 +598,67 @@ export default function (pi) {
     publishState(true);
   });
 
+  // Only notification events: any `session_before_compact` handler makes OMP treat the
+  // extension as one that may veto compaction, which turns off its background (speculative)
+  // compaction. Automatic compactions announce start and end, including an Esc abort. A manual
+  // `/compact` announces nothing before `session.compacting`, which also comes from background
+  // speculation, so session changes and turn starts clear the flag too.
+  //
+  // The instruction state (listener, awaited deliveries, compaction hold) is module-level, and
+  // OMP binds this same module again for every task subagent in the process. Each handler that
+  // touches it acts only for the root session, so a subagent's events never change it.
+  pi.on("auto_compaction_start", () => {
+    if (rootSession) {
+      compacting = true;
+    }
+  });
+  // Background speculation also emits it, from inside a turn; only a manual compaction emits it
+  // while the session is idle (its abort ended the turn), so only then does it hold prompts.
+  pi.on("session.compacting", (_event, ctx) => {
+    if (rootSession && ctx?.isIdle?.() === true) {
+      compacting = true;
+    }
+  });
+  for (const event of ["auto_compaction_end", "session_compact"]) {
+    pi.on(event, () => {
+      if (rootSession) {
+        compacting = false;
+      }
+    });
+  }
+
+  // Branch and tree navigation end without session_switch, after OMP dropped the listener.
+  for (const event of ["session_branch", "session_tree"]) {
+    pi.on(event, (_event, ctx) => {
+      activateRootSession(ctx, "branch");
+    });
+  }
+
+  pi.on("message_start", (event) => {
+    const message = event?.message;
+    if (!rootSession || awaitingAdmission.length === 0 || message?.role !== "user") {
+      return;
+    }
+    const content = message.content;
+    const text =
+      typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content
+              .filter((part) => part?.type === "text")
+              .map((part) => part.text)
+              .join("\n")
+          : undefined;
+    // Only the delivered text starts its turn; a person's own prompt never claims it.
+    const index =
+      typeof text === "string"
+        ? awaitingAdmission.findIndex((entry) => entry.turnText.test(text))
+        : -1;
+    if (index >= 0) {
+      ackInstruction(awaitingAdmission.splice(index, 1)[0].instructionId, "prompt");
+    }
+  });
+
   pi.on("session_switch", (event, ctx) => {
     if (!activateRootSession(ctx, event?.reason || "resume")) {
       return;
@@ -441,6 +674,8 @@ export default function (pi) {
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
+    compacting = false;
+    registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession();
     clearPendingTimers();
@@ -511,9 +746,28 @@ export default function (pi) {
     scheduleIdle();
   });
 
-  pi.on("session_shutdown", () => {
-    if (rootSession) {
-      clearPendingTimers();
+  pi.on("session_shutdown", async () => {
+    if (!rootSession) {
+      return;
+    }
+    clearPendingTimers();
+    unsubscribeInstructions?.();
+    unsubscribeInstructions = undefined;
+    instructionListener = false;
+    stopAdmissionWatch();
+    compacting = false;
+    // Tell herdr the listener is gone before OMP goes on (it awaits this handler): `/restart`
+    // execs a new image, which reads the terminal before it registers its own listener. herdr
+    // then refuses instructions until the next registration instead of writing a block nobody
+    // can confirm; the same runtime id keeps in-flight deliveries followed. One attempt outside
+    // the report queue, well under OMP's 2 s cap for shutdown handlers, so a slow herdr never
+    // stalls the exit. Sending it ahead of queued state reports is safe: each carries the seq
+    // minted when it is built. No retry: a later report is the next image's to send.
+    clearTimeout(sessionRetryTimer);
+    sessionRetryTimer = undefined;
+    const sessionRef = currentSessionRef();
+    if (sessionRef) {
+      await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
     }
   });
 }

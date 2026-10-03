@@ -22,9 +22,9 @@ use super::config_edit::{
 use super::config_file::{check_config_targets, write_config};
 use super::env::{
     antigravity_cli_dir, claude_dir, codex_dir, copilot_dir, cursor_dir, devin_dir, droid_dir,
-    grok_dir, hermes_dir, hermes_plugin_dir, is_omp_profile_agent_dir, kilo_dir, kimi_dir,
-    letta_dir, mastracode_dir, omp_extension_dirs, opencode_dir, opencode_state_dir,
-    pi_extension_dir, qodercli_dir, qwen_dir,
+    grok_dir, hermes_dir, hermes_plugin_dir, is_omp_agent_dir, kilo_dir, kimi_dir, letta_dir,
+    mastracode_dir, omp_extension_dirs, opencode_dir, opencode_state_dir, pi_extension_dir,
+    qodercli_dir, qwen_dir,
 };
 use super::file_ops::{
     make_executable, remove_dir_all_if_exists, remove_file_if_exists, remove_legacy_bash_hook_file,
@@ -90,8 +90,9 @@ pub(crate) fn install_pi() -> io::Result<PathBuf> {
 pub(crate) fn install_omp() -> io::Result<Vec<OmpInstallPaths>> {
     let dirs = omp_extension_dirs()?;
     let pi_dir = pi_extension_dir()?;
-    // A named OMP profile exports its own agent dir as PI_CODING_AGENT_DIR; that is not a Pi dir.
-    if dirs.contains(&pi_dir) && !pi_dir.parent().is_some_and(is_omp_profile_agent_dir) {
+    // OMP sessions export their agent dir (default or named profile) as PI_CODING_AGENT_DIR;
+    // that is OMP's dir, not a Pi dir.
+    if dirs.contains(&pi_dir) && !pi_dir.parent().is_some_and(is_omp_agent_dir) {
         return Err(io::Error::other(format!(
             "Pi and OMP resolve to the same extension directory at {}; configure separate agent directories before installing OMP",
             pi_dir.display()

@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+### Added
+- `agent.instruct` sends a bounded instruction to one exact OMP process. Herdr checks the agent's identity, then writes one marked bracketed paste with no Enter; the OMP integration takes it before the editor and any open dialog, passes it to OMP as an aside (a new turn when idle) and confirms it with the new `pane.ack_instruction` method. The result is `agent_instructed` with `delivered_as` `prompt` or `aside`, or `pending` when OMP took the text but its turn had not started within 8 seconds; `AgentInfo.last_instruction` and `AgentInfo.recent_instructions` (the 8 latest) then show the final outcome. It is `instruction_dropped` when OMP took the text but went idle without running it (no model or API key, Esc, a usage limit), and `instruction_unconfirmed` when nothing confirms within 8 seconds, and then the outcome is unknown. Text that starts with `/`, `!`, or `$`/`$$` and a space is refused, and so is an agent that has handed the terminal to its external editor or still has an instruction without a final outcome. Only Linux servers advertise `capabilities.agent_instruct`; other platforms refuse the method.
+- `AgentInfo.runtime_id` identifies the live registered OMP process, and `AgentInfo.accepts_instructions` shows that this process can receive `agent.instruct`. `AgentInfo.listener_withdrawn` shows that OMP withdrew its listener to restart or reload and registers again within seconds. `expected_name` is optional, so an OMP started without a Herdr name can be instructed.
+- The OMP integration (version 13) registers an instruction listener and reports `accepts_instructions` with its session.
+
 ### Fixed
+- Descriptors received in a live handoff are close-on-exec, so processes started later can no longer keep the server lock after the server exits.
 - A live server keeps ownership of its session when its sockets disappear, so local startup and SSH bridges refuse to start a second server.
 - The status command exits 1 when its server is not running, while preserving the printed status.
 

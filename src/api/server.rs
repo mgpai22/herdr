@@ -74,6 +74,9 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         health_check: true,
         ssh_agent_registration: false,
         agent_start_profile: true,
+        // Where `agent.instruct` lacks its guards it refuses, so it is not advertised there and
+        // callers keep using `agent.prompt`.
+        agent_instruct: crate::app::INSTRUCTIONS_SUPPORTED,
     })
 }
 
@@ -274,8 +277,11 @@ fn handle_connection_with_stop(
             return Ok(());
         }
     };
-    if let Method::PaneReportAgentSessionV2(params) = &mut request.method {
-        params.peer_pid = peer_pid;
+    match &mut request.method {
+        Method::PaneReportAgentSessionV2(params) => params.peer_pid = peer_pid,
+        Method::PaneAckInstruction(params) => params.peer_pid = peer_pid,
+        Method::AgentInstruct(params) => params.received_at = Some(std::time::Instant::now()),
+        _ => {}
     }
 
     let request_id = request.id.clone();
@@ -544,6 +550,8 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentInstruct(_) => "agent.instruct",
+        Method::PaneAckInstruction(_) => "pane.ack_instruction",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -1452,6 +1460,7 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 agent_start_profile: true,
+                agent_instruct: true,
             }),
             None,
             None,
@@ -1463,9 +1472,15 @@ mod tests {
     }
 
     #[test]
-    fn server_advertises_agent_start_profile() {
+    fn server_advertises_agent_start_profile_and_instruct_where_supported() {
         // `agent start --profile` refuses to run against a server without this flag.
-        assert!(default_capabilities().unwrap().agent_start_profile);
+        let capabilities = default_capabilities().unwrap();
+        assert!(capabilities.agent_start_profile);
+        // An advertised `agent.instruct` must be able to verify a live process incarnation.
+        assert!(
+            !capabilities.agent_instruct
+                || crate::platform::observe_process(std::process::id()).is_ok()
+        );
     }
 
     #[test]
@@ -1533,6 +1548,33 @@ mod tests {
     }
 
     #[test]
+    fn agent_instruct_dispatch_preserves_guards_and_mutation_classification() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id":"guarded-dispatch", "method":"agent.instruct", "params":{
+                "target":"w1:p1", "text":"Report status", "expected_terminal_id":"term-1", "expected_name":"director",
+                "expected_agent":"omp", "expected_session":"/fixture/session.jsonl", "expected_runtime_id":"process-1", "expected_workspace_id":"w1", "expected_cwd":"/fixture/project"
+            }
+        })).unwrap();
+        assert!(crate::api::request_changes_ui(&request));
+        assert_eq!(api_method_name(&request.method), "agent.instruct");
+        let original = request.clone();
+        let worker = std::thread::spawn(move || handle_request(request, &tx, None, None, None));
+        let message = rx.blocking_recv().unwrap();
+        assert_eq!(message.request, original);
+        message
+            .respond_to
+            .send(error_response_json(
+                original.id,
+                "agent_identity_changed",
+                "fixture response".into(),
+            ))
+            .unwrap();
+        let response: ErrorResponse = serde_json::from_str(&worker.join().unwrap()).unwrap();
+        assert_eq!(response.error.code, "agent_identity_changed");
+    }
+
+    #[test]
     fn dispatched_request_reports_response_write_completion() {
         let (api_tx, mut api_rx) = mpsc::unbounded_channel();
         let (mut client, server, _path) = local_stream_pair("write-ack");
@@ -1568,6 +1610,42 @@ mod tests {
             .expect("response write completion");
         let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response.id, "req_write");
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn socket_instruct_requests_carry_their_receive_time() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+        let (mut client, server, _path) = local_stream_pair("instruct-stamp");
+        client
+            .write_all(br#"{"id":"stamped","method":"agent.instruct","params":{"target":"w1:p1","text":"Report status","expected_terminal_id":"term-1","expected_agent":"omp","expected_session":"/s.jsonl","expected_runtime_id":"r","expected_workspace_id":"w1","expected_cwd":"/p"}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let before = std::time::Instant::now();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+        });
+
+        let msg = api_rx.blocking_recv().unwrap();
+        let Method::AgentInstruct(params) = &msg.request.method else {
+            panic!("unexpected request: {:?}", msg.request.method);
+        };
+        // The app loop refuses an instruction that waited too long in its queue.
+        assert!(params
+            .received_at
+            .is_some_and(|received| received >= before && received <= std::time::Instant::now()));
+        msg.respond_to
+            .send(error_response_json(
+                msg.request.id,
+                "agent_not_ready",
+                "fixture".into(),
+            ))
+            .unwrap();
+        assert!(read_line(&mut client).contains("agent_not_ready"));
         server_thread.join().unwrap().unwrap();
     }
 
