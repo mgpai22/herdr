@@ -1614,7 +1614,7 @@ async function installOmpForActions(name: string) {
   const details = () =>
     harness.requests
       .filter((request) => isRecord(request) && request.method === "pane.report_omp_detail")
-      .map((request) => (request as { params: { omp: Record<string, unknown> } }).params.omp);
+      .map((request) => (request as { params: { omp: Record<string, any> } }).params.omp);
   let n = 0;
   // Sends one action block; returns its id and the first ack (keys for an answer, else final).
   const act = async (body: unknown) => {
@@ -1623,17 +1623,17 @@ async function installOmpForActions(name: string) {
     await waitFor(() => acks().some((ack) => ack.action_id === id));
     return { id, ack: acks().find((ack) => ack.action_id === id)! };
   };
-  const finalAck = async (id: string) => {
-    await waitFor(() => acks().filter((ack) => ack.action_id === id && !ack.keys).length === 1);
+  const finalAck = async (id: string, timeout = 2_000) => {
+    await waitFor(() => acks().filter((ack) => ack.action_id === id && !ack.keys).length === 1, timeout);
     return acks().find((ack) => ack.action_id === id && !ack.keys)!;
   };
-  // Feeds herdr's keys to OMP one key at a time, as OMP's stdin buffer splits them; returns what
-  // the listener let through.
-  const type = (keys: string) => {
+  // Feeds herdr's key blocks to OMP one paste at a time, as OMP's stdin buffer splits them;
+  // returns the input each one became (nothing for a dropped block).
+  const type = (chunks: unknown) => {
     const passed: string[] = [];
-    for (const key of keys.match(/\x1b\[[A-D]|[\s\S]/g) ?? []) {
-      const result = listener?.(key);
-      if (!result?.consume) passed.push(key);
+    for (const block of (chunks as string[]).join("").match(/\x1b\[200~herdr-key:[\s\S]*?\x1b\[201~/g) ?? []) {
+      const result = listener?.(block);
+      if (result?.data !== undefined) passed.push(result.data);
     }
     return passed;
   };
@@ -1641,6 +1641,12 @@ async function installOmpForActions(name: string) {
     await harness.handlers.get("tool_call")?.({ toolCallId: id, toolName: "bash", input: { command } }, harness.context);
     await harness.handlers.get("tool_approval_requested")?.({ toolCallId: id, toolName: "bash" }, harness.context);
   };
+  const ask = (id: string, questions: unknown[]) =>
+    harness.handlers.get("tool_execution_start")?.({ toolCallId: id, toolName: "ask", args: { questions } }, harness.context);
+  const resolved = (id: string, approved: boolean) =>
+    harness.handlers.get("tool_approval_resolved")?.({ toolCallId: id, approved }, harness.context);
+  const askEnded = (id: string) =>
+    harness.handlers.get("tool_execution_end")?.({ toolCallId: id, toolName: "ask" }, harness.context);
   return {
     harness,
     acks,
@@ -1649,6 +1655,9 @@ async function installOmpForActions(name: string) {
     finalAck,
     type,
     approval,
+    ask,
+    resolved,
+    askEnded,
     listener: (data: string) => listener?.(data),
     aborted: () => aborted,
     editor: () => editor,
@@ -1667,12 +1676,14 @@ function pickedRow(keys: string[], rows: number, start: number) {
   return undefined;
 }
 
+const options = (count: number) => Array.from({ length: count }, (_, i) => ({ label: `o${i}` }));
+
 test("Oh My Pi answers the approval OMP shows, and only after it closes", async () => {
   const omp = await installOmpForActions("omp-answer-queue");
   // Two parallel tool calls: OMP shows the first and queues the second.
   await omp.approval("call1", "echo FIRST");
   await omp.approval("call2", "echo SECOND");
-  await waitFor(() => isRecord(omp.details().at(-1)?.dialog) && omp.details().at(-1)?.dialog.queued === 1);
+  await waitFor(() => omp.details().at(-1)?.dialog?.queued === 1);
   expect(omp.details().at(-1)?.dialog).toMatchObject({ id: "call1", summary: "bash echo FIRST", queued: 1 });
   expect((await omp.act({ op: "answer", args: { dialog_id: "call2", approve: true } })).ack.error).toStartWith("dialog_queued:");
   // abort cannot end a turn that waits on an approval.
@@ -1681,99 +1692,151 @@ test("Oh My Pi answers the approval OMP shows, and only after it closes", async 
 
   const { id, ack } = await omp.act({ op: "answer", args: { dialog_id: "call1", approve: false } });
   expect(ack.ok).toBe(true);
-  const keys = ack.keys as string[];
-  // The keys pick Deny wherever the cursor is, and all reach the dialog.
-  for (const start of [0, 1]) {
-    expect(pickedRow(keys.join("").match(/\x1b\[[A-D]|[\s\S]/g)!, 2, start)).toBe(1);
-  }
-  expect(omp.type(keys.join("")).join("")).toBe(keys.join(""));
-  // No final result before the dialog closes.
+  const keys = omp.type(ack.keys);
+  // Every key reaches the dialog as its own input and picks Deny.
+  expect(pickedRow(keys, 2, 0)).toBe(1);
+  // No final result before the dialog closes; then the result follows the detail without it.
   await Bun.sleep(30);
   expect(omp.acks().filter((entry) => entry.action_id === id)).toHaveLength(1);
-  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call1", approved: false }, omp.harness.context);
+  await omp.resolved("call1", false);
   expect(await omp.finalAck(id)).toMatchObject({ ok: true, data: { dialog_id: "call1" } });
-  await waitFor(() => omp.details().at(-1)?.dialog?.id === "call2");
+  // The detail herdr holds when the result arrives already shows the next dialog.
+  const requests = omp.harness.requests.filter(isRecord) as { method: string; params: Record<string, any> }[];
+  const result = requests.findIndex((request) => request.method === "pane.ack_action" && request.params.action_id === id && !request.params.keys);
+  const before = requests.slice(0, result).filter((request) => request.method === "pane.report_omp_detail").at(-1);
+  expect(before?.params.omp.dialog?.id).toBe("call2");
+  // A replayed key block of a finished answer is dropped.
+  expect(omp.type(ack.keys)).toEqual([]);
 });
 
-test("Oh My Pi never lets answer keys reach OMP after a person moved the dialog", async () => {
+test("Oh My Pi never takes a person's keys for herdr's answer keys", async () => {
   const omp = await installOmpForActions("omp-answer-race");
-  await omp.approval("call1", "echo THIRD");
+  // A person presses exactly herdr's keys (Up, Enter) before herdr's arrive: they pass to OMP
+  // and approve; herdr's own keys then reach nothing, not even the queued approval behind it.
+  await omp.approval("call1", "echo Q1");
+  await omp.approval("call2", "echo Q2");
   const { id, ack } = await omp.act({ op: "answer", args: { dialog_id: "call1", approve: true } });
-  // A person presses Enter first: it approves, and OMP's editor has focus again before the
-  // resolved event arrives.
-  expect(omp.listener("\r")).toBeUndefined();
-  // herdr's keys then arrive; none of them may reach the editor (Up would recall, Enter resend).
-  expect(omp.type((ack.keys as string[]).join(""))).toEqual([]);
-  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call1", approved: true }, omp.harness.context);
-  expect((await omp.finalAck(id)).error).toStartWith("answered_by_other:");
-  // A person's later keys reach the editor again.
   expect(omp.listener("\x1b[A")).toBeUndefined();
+  expect(omp.listener("\r")).toBeUndefined();
+  await omp.resolved("call1", true);
+  expect(omp.type(ack.keys)).toEqual([]);
+  expect((await omp.finalAck(id)).error).toStartWith("answered_by_other:");
+  await omp.resolved("call2", false);
 
-  // A person's key that only moves the dialog: herdr's keys are swallowed, the answer says so at
-  // once, and the next answer is not blocked.
-  await omp.approval("call9", "echo NINTH");
-  const moved = await omp.act({ op: "answer", args: { dialog_id: "call9", approve: true } });
+  // A person's key between herdr's keys: the rest of herdr's are dropped, the dialog stays as the
+  // person left it, and the answer says so.
+  await omp.approval("call3", "echo THIRD");
+  const moved = await omp.act({ op: "answer", args: { dialog_id: "call3", approve: true } });
+  const blocks = (moved.ack.keys as string[]).join("").match(/\x1b\[200~herdr-key:[\s\S]*?\x1b\[201~/g)!;
+  expect(omp.listener(blocks[0])?.data).toBe("\x1b[A");
   expect(omp.listener("\x1b[B")).toBeUndefined();
-  expect(omp.type((moved.ack.keys as string[]).join(""))).toEqual([]);
+  expect(omp.listener(blocks[1])).toEqual({ consume: true });
   expect((await omp.finalAck(moved.id)).error).toStartWith("dialog_touched:");
-  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call9", approved: false }, omp.harness.context);
+  // A person's later keys always reach OMP.
+  expect(omp.listener("\r")).toBeUndefined();
+  await omp.resolved("call3", false);
 
-  // An ask a person already used is not answered by position.
-  await omp.harness.handlers.get("tool_execution_start")?.(
-    { toolCallId: "ask2", toolName: "ask", args: { questions: [{ question: "Q?", options: [{ label: "a" }, { label: "b" }] }] } },
-    omp.harness.context,
-  );
-  expect(omp.listener("\x1b[B")).toBeUndefined();
-  expect((await omp.act({ op: "answer", args: { dialog_id: "ask2", option_index: 0 } })).ack.error).toStartWith("dialog_touched:");
-  await omp.harness.handlers.get("tool_execution_end")?.({ toolCallId: "ask2", toolName: "ask" }, omp.harness.context);
-  // An approval answer does not depend on the cursor.
-  await omp.approval("call2", "echo FOURTH");
-  expect(omp.listener("\x1b[B")).toBeUndefined();
-  expect((await omp.act({ op: "answer", args: { dialog_id: "call2", approve: true } })).ack.ok).toBe(true);
-  omp.type("\x1b[A\r");
-  // Focus reports do not count.
-  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call2", approved: true }, omp.harness.context);
-  await omp.approval("call3", "echo FIFTH");
-  omp.listener("\x1b[I");
-  expect((await omp.act({ op: "answer", args: { dialog_id: "call3", approve: true } })).ack.ok).toBe(true);
+  // A block with another runtime's token is a person's paste, not a key.
+  await omp.approval("call4", "echo FOURTH");
+  const forged = await omp.act({ op: "answer", args: { dialog_id: "call4", approve: true } });
+  const block = (forged.ack.keys as string[])[0].match(/\x1b\[200~herdr-key:[\s\S]*?\x1b\[201~/)![0];
+  expect(omp.listener(block.replace(runtimeToken()!, "not-the-token"))).toBeUndefined();
+  expect(omp.type(forged.ack.keys)).toEqual([]);
+  expect((await omp.finalAck(forged.id)).error).toStartWith("dialog_touched:");
 });
+
+test("Oh My Pi ends an answer whose keys never arrive", async () => {
+  const omp = await installOmpForActions("omp-answer-lost");
+  await omp.approval("call1", "echo LOST");
+  const lost = await omp.act({ op: "answer", args: { dialog_id: "call1", approve: false } });
+  expect((await omp.finalAck(lost.id, 7_000)).error).toStartWith("failed:");
+  // Nothing stays armed: the person's keys reach OMP, a new answer is taken, and the old keys
+  // that come late are dropped.
+  expect(omp.listener("\x1b[B")).toBeUndefined();
+  expect(omp.type(lost.ack.keys)).toEqual([]);
+  const retry = await omp.act({ op: "answer", args: { dialog_id: "call1", approve: false } });
+  expect(retry.ack.ok).toBe(true);
+}, 15_000);
 
 test("Oh My Pi answers an ask dialog only where its keys are exact", async () => {
   const omp = await installOmpForActions("omp-answer-ask");
-  const ask = (id: string, questions: unknown[]) =>
-    omp.harness.handlers.get("tool_execution_start")?.({ toolCallId: id, toolName: "ask", args: { questions } }, omp.harness.context);
-  const options = (count: number) => Array.from({ length: count }, (_, i) => ({ label: `o${i}` }));
-
-  await ask("big", [{ question: "Many?", options: options(25) }]);
+  await omp.ask("big", [{ question: "Many?", options: options(25) }]);
+  await waitFor(() => omp.details().at(-1)?.dialog?.id === "big");
+  expect(omp.details().at(-1)?.dialog.truncated).toBe(true);
   expect((await omp.act({ op: "answer", args: { dialog_id: "big", option_index: 0 } })).ack.error).toStartWith("dialog_truncated:");
-  // Cancel needs no position, so it works on any ask.
+  // abort ends a turn that waits only on an ask (OMP's ask closes on the turn's abort signal).
+  expect((await omp.act({ op: "abort", args: {} })).ack.ok).toBe(true);
+  expect(omp.aborted()).toBe(1);
+  // Cancel needs no position, so it works on an untouched truncated ask, and skips the draft.
+  omp.setEditor("draft [Paste #1, +12 lines]");
   const cancel = await omp.act({ op: "answer", args: { dialog_id: "big", cancel: true } });
-  expect(omp.type((cancel.ack.keys as string[]).join(""))).toEqual(["\x1b"]);
-  await omp.harness.handlers.get("tool_execution_end")?.({ toolCallId: "big", toolName: "ask" }, omp.harness.context);
+  expect(omp.type(cancel.ack.keys)).toEqual(["\x1b"]);
+  await omp.askEnded("big");
   expect((await omp.finalAck(cancel.id)).ok).toBe(true);
+  expect(omp.editor()).toBe("draft [Paste #1, +12 lines]");
+  omp.setEditor("");
 
-  await ask("two", [
+  // A person used the ask (for example typing a custom answer): no cancel, no option answer.
+  await omp.ask("used", [{ question: "Bird?", options: options(2) }]);
+  expect(omp.listener("\x1b[B")).toBeUndefined();
+  expect((await omp.act({ op: "answer", args: { dialog_id: "used", cancel: true } })).ack.error).toStartWith("dialog_touched:");
+  expect((await omp.act({ op: "answer", args: { dialog_id: "used", option_index: 0 } })).ack.error).toStartWith("dialog_touched:");
+  await omp.askEnded("used");
+
+  await omp.ask("two", [
     { question: "Pet?", options: options(2) },
-    { question: "Color?", options: options(3) },
+    { question: "Color?", options: options(3), recommended: 2 },
   ]);
   // A custom text with more keys after it would lose them while OMP's text editor opens.
   expect(
     (await omp.act({ op: "answer", args: { dialog_id: "two", answers: [{ text: "Bob" }, { option_index: 1 }] } })).ack.error,
   ).toStartWith("invalid_args:");
-  const two = await omp.act({ op: "answer", args: { dialog_id: "two", answers: [{ option_index: 1 }, { option_index: 2 }] } });
-  const keys = (two.ack.keys as string[]).join("").match(/\x1b\[[A-D]|[\s\S]/g)!;
-  // Question 1 picks row 1, question 2 picks row 2, and one Enter submits the review tab.
+  const two = await omp.act({ op: "answer", args: { dialog_id: "two", answers: [{ option_index: 1 }, { option_index: 0 }] } });
+  const keys = omp.type(two.ack.keys);
+  // Question 1 starts on row 0 and picks row 1; question 2 starts on its recommended row 2 and
+  // picks row 0; one Enter then submits the review tab.
   const second = keys.indexOf("\r") + 1;
-  expect(pickedRow(keys, 3, 2)).toBe(1);
-  expect(pickedRow(keys.slice(second), 4, 0)).toBe(2);
-  expect(keys.slice(keys.lastIndexOf("\r", keys.length - 2) + 1)).toEqual(["\r"]);
-  omp.type(keys.join(""));
-  await omp.harness.handlers.get("tool_execution_end")?.({ toolCallId: "two", toolName: "ask" }, omp.harness.context);
+  expect(pickedRow(keys, 3, 0)).toBe(1);
+  expect(pickedRow(keys.slice(second), 4, 2)).toBe(0);
+  expect(keys.at(-1)).toBe("\r");
+  expect(keys.at(-2)).toBe("\r");
+  await omp.askEnded("two");
   expect((await omp.finalAck(two.id)).ok).toBe(true);
 
   // One multi-select question submits on its confirming Enter: no extra Enter for the editor.
-  await ask("multi", [{ question: "Fruit?", options: options(3), multi: true }]);
-  const multi = await omp.act({ op: "answer", args: { dialog_id: "multi", selections: [0, 2] } });
-  const multiKeys = (multi.ack.keys as string[]).join("");
-  expect(multiKeys.endsWith("\r") && !multiKeys.endsWith("\r\r")).toBe(true);
+  await omp.ask("multi", [{ question: "Fruit?", options: options(3), multi: true }]);
+  const multi = omp.type((await omp.act({ op: "answer", args: { dialog_id: "multi", selections: [0, 2] } })).ack.keys);
+  expect(multi.filter((key) => key === "\r")).toHaveLength(1);
+  expect(multi.filter((key) => key === " ")).toHaveLength(2);
+  await omp.askEnded("multi");
+
+  // A custom text goes in a second chunk, as one paste.
+  await omp.ask("pet", [{ question: "Name a pet", options: options(2) }]);
+  const text = await omp.act({ op: "answer", args: { dialog_id: "pet", text: "a ferret 🦦" } });
+  expect(text.ack.keys).toHaveLength(2);
+  expect(omp.type(text.ack.keys).slice(-2)).toEqual(["\x1b[200~a ferret 🦦\x1b[201~", "\r"]);
+});
+
+test("Oh My Pi reports the input OMP runs and keeps the detail under herdr's limit", async () => {
+  const omp = await installOmpForActions("omp-detail-limits");
+  // Another extension revised the call: OMP prompts for, and runs, the revised input that
+  // `tool_execution_start` carries.
+  await omp.harness.handlers.get("tool_call")?.({ toolCallId: "rw", toolName: "bash", input: { command: "echo SAFE" } }, omp.harness.context);
+  await omp.harness.handlers.get("tool_execution_start")?.({ toolCallId: "rw", toolName: "bash", args: { command: "echo REWRITTEN" } }, omp.harness.context);
+  await omp.harness.handlers.get("tool_approval_requested")?.({ toolCallId: "rw", toolName: "bash" }, omp.harness.context);
+  await waitFor(() => omp.details().at(-1)?.dialog?.id === "rw");
+  expect(omp.details().at(-1)?.dialog.summary).toBe("bash echo REWRITTEN");
+  await omp.resolved("rw", false);
+
+  // A huge ask still fits: herdr would refuse the whole report. No string ends in half a
+  // surrogate pair.
+  const long = "🦦".repeat(400);
+  await omp.ask("huge", Array.from({ length: 10 }, () => ({ question: long, options: Array.from({ length: 20 }, () => ({ label: long })) })));
+  await waitFor(() => omp.details().at(-1)?.dialog?.id === "huge");
+  const request = omp.harness.requests.filter((entry) => isRecord(entry) && entry.method === "pane.report_omp_detail").at(-1);
+  expect(Buffer.byteLength(JSON.stringify((request as { params: { omp: unknown } }).params.omp), "utf8")).toBeLessThanOrEqual(16 * 1024);
+  const dialog = omp.details().at(-1)?.dialog;
+  for (const value of [dialog.questions[0].text, ...dialog.questions[0].options]) {
+    expect(value.isWellFormed()).toBe(true);
+  }
 });

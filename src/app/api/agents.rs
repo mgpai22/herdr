@@ -115,8 +115,36 @@ fn listener_block(kind: &str, block_id: &str, body: &str, runtime: &str) -> Stri
     )
 }
 
+/// The latest action per terminal and until when `AgentInfo.last_action` shows it.
+pub(crate) type LastActions = std::collections::HashMap<
+    crate::terminal::TerminalId,
+    (crate::api::schema::LastActionInfo, Instant),
+>;
+
+/// Sets the outcome of `action_id` as the terminal's latest action, shown for the outcome TTL.
+pub(super) fn record_action_outcome(
+    last: &mut LastActions,
+    terminal_id: &crate::terminal::TerminalId,
+    action_id: &str,
+    op: crate::api::schema::AgentActionOp,
+    outcome: crate::api::schema::ActionOutcome,
+) {
+    last.insert(
+        terminal_id.clone(),
+        (
+            crate::api::schema::LastActionInfo {
+                action_id: action_id.to_string(),
+                op,
+                outcome,
+            },
+            Instant::now() + INSTRUCTION_OUTCOME_TTL,
+        ),
+    );
+}
+
 /// An `agent.action` block written to the PTY whose result has not come back.
 pub(crate) struct PendingActionAck {
+    pub(super) op: crate::api::schema::AgentActionOp,
     pub(super) terminal_id: crate::terminal::TerminalId,
     pub(super) owner: crate::platform::OwnerProcessIncarnation,
     pub(super) runtime: Option<String>,
@@ -485,9 +513,17 @@ impl App {
         self.write_listener_block(&id, ws_idx, pane_id, block)?;
         let deadline = Instant::now() + INSTRUCTION_ACK_TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
+        record_action_outcome(
+            &mut self.last_actions,
+            &terminal_id,
+            &action_id,
+            params.op,
+            crate::api::schema::ActionOutcome::Written,
+        );
         self.pending_action_acks.insert(
             action_id.clone(),
             PendingActionAck {
+                op: params.op,
                 terminal_id,
                 owner,
                 runtime: listener_runtime,
@@ -720,9 +756,20 @@ impl App {
             }
         }
         // A dropped sender tells the action's waiter that no result will come.
-        self.pending_action_acks.retain(|_, pending| {
-            pending.terminal_id != *terminal_id
-                || (pending.owner == *owner && pending.runtime.as_deref() == runtime)
+        let last_actions = &mut self.last_actions;
+        self.pending_action_acks.retain(|action_id, pending| {
+            let keep = pending.terminal_id != *terminal_id
+                || (pending.owner == *owner && pending.runtime.as_deref() == runtime);
+            if !keep {
+                record_action_outcome(
+                    last_actions,
+                    &pending.terminal_id,
+                    action_id,
+                    pending.op,
+                    crate::api::schema::ActionOutcome::Unconfirmed,
+                );
+            }
+            keep
         });
     }
 
@@ -743,10 +790,18 @@ impl App {
                 false
             });
         // An action block nobody acked may mean the listener is gone, as for an instruction.
-        self.pending_action_acks.retain(|_, pending| {
+        let last_actions = &mut self.last_actions;
+        self.pending_action_acks.retain(|action_id, pending| {
             if pending.deadline > now {
                 return true;
             }
+            record_action_outcome(
+                last_actions,
+                &pending.terminal_id,
+                action_id,
+                pending.op,
+                crate::api::schema::ActionOutcome::Unconfirmed,
+            );
             if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
                 pending.withdraws_listener
                     && terminal.instruction_listener.as_ref() == Some(&pending.owner)
@@ -755,6 +810,8 @@ impl App {
             }
             false
         });
+        last_actions
+            .retain(|terminal_id, (_, until)| *until > now && terminals.contains_key(terminal_id));
         recent.retain(|terminal_id, entries| {
             entries.retain(|entry| entry.until > now);
             !entries.is_empty() && terminals.contains_key(terminal_id)
@@ -2857,6 +2914,16 @@ mod tests {
             (action_id.as_str(), AgentActionOp::Answer)
         );
         assert_eq!(data["dialog_id"], "c1");
+        let outcome = |app: &App| {
+            app.agent_info_for_target(&target)
+                .unwrap()
+                .last_action
+                .map(|last| (last.action_id, last.outcome))
+        };
+        assert_eq!(
+            outcome(&app),
+            Some((action_id.clone(), crate::api::schema::ActionOutcome::Done))
+        );
         // A late ack for a settled action is not found.
         let late = ack_action(
             &mut app,
@@ -2886,18 +2953,34 @@ mod tests {
         let refused = error_code(response.recv_timeout(Duration::from_secs(1)).unwrap());
         assert_eq!(refused.code, "agent_action_refused");
         assert!(refused.message.starts_with("dialog_changed:"));
+        assert_eq!(
+            outcome(&app),
+            Some((action_id, crate::api::schema::ActionOutcome::Refused))
+        );
 
         // No result in time: unconfirmed, and the listener counts as gone until it reports again.
         let response = start_action(
             &mut app,
             action_params(&instruct, AgentActionOp::Abort, serde_json::json!({})),
         );
-        sent_action(&mut rx);
+        let (action_id, _) = sent_action(&mut rx);
+        assert_eq!(
+            outcome(&app),
+            Some((
+                action_id.clone(),
+                crate::api::schema::ActionOutcome::Written
+            ))
+        );
         let unconfirmed = error_code(response.recv_timeout(Duration::from_secs(2)).unwrap());
         assert_eq!(unconfirmed.code, "action_unconfirmed");
         app.expire_instruction_acks();
         let info = app.agent_info_for_target(&target).unwrap();
         assert!(!info.accepts_instructions && !info.accepts_actions);
+        // A caller can tell this withdrawal from an integration without action support.
+        assert_eq!(
+            outcome(&app),
+            Some((action_id, crate::api::schema::ActionOutcome::Unconfirmed))
+        );
     }
 
     #[cfg(target_os = "linux")]

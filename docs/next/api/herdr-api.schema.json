@@ -2887,7 +2887,7 @@
               ]
             },
             "keys": {
-              "description": "Key input Herdr writes to the pane after this ack, one chunk at a time with a short pause\nbetween chunks, so each reaches the dialog that the previous one opened.",
+              "description": "Key input Herdr writes to the pane after this ack (one token-marked paste per key, which\nthe integration turns back into the key), one chunk at a time with a short pause between\nchunks, so each reaches the dialog that the previous one opened. An ack with keys is not\nfinal; the integration sends the result in a later ack.",
               "items": {
                 "type": "string"
               },
@@ -7222,6 +7222,31 @@
     },
     "success_response": {
       "$defs": {
+        "ActionOutcome": {
+          "description": "What became of an `agent.action`, as `AgentInfo.last_action` shows it.",
+          "oneOf": [
+            {
+              "const": "written",
+              "description": "Written to the terminal; no result yet.",
+              "type": "string"
+            },
+            {
+              "const": "done",
+              "description": "The integration reported the op done.",
+              "type": "string"
+            },
+            {
+              "const": "refused",
+              "description": "The integration refused it, or Herdr could not write its keys.",
+              "type": "string"
+            },
+            {
+              "const": "unconfirmed",
+              "description": "No result came in time; the action may have run, and the listener counts as gone until\nthe integration reports again.",
+              "type": "string"
+            }
+          ]
+        },
         "AgentActionOp": {
           "description": "What `agent.action` asks the OMP integration to do.",
           "oneOf": [
@@ -7318,6 +7343,17 @@
             },
             "interactive_ready": {
               "type": "boolean"
+            },
+            "last_action": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/LastActionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The latest `agent.action` to this agent and its outcome so far, kept for two minutes after\nits outcome last changed."
             },
             "last_instruction": {
               "anyOf": [
@@ -8498,6 +8534,26 @@
           },
           "required": [
             "messages"
+          ],
+          "type": "object"
+        },
+        "LastActionInfo": {
+          "description": "The latest `agent.action` to an agent and its outcome so far.",
+          "properties": {
+            "action_id": {
+              "type": "string"
+            },
+            "op": {
+              "$ref": "#/schemas/success_response/$defs/AgentActionOp"
+            },
+            "outcome": {
+              "$ref": "#/schemas/success_response/$defs/ActionOutcome"
+            }
+          },
+          "required": [
+            "action_id",
+            "op",
+            "outcome"
           ],
           "type": "object"
         },

@@ -298,6 +298,29 @@ pub enum AgentActionOp {
     Command,
 }
 
+/// What became of an `agent.action`, as `AgentInfo.last_action` shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionOutcome {
+    /// Written to the terminal; no result yet.
+    Written,
+    /// The integration reported the op done.
+    Done,
+    /// The integration refused it, or Herdr could not write its keys.
+    Refused,
+    /// No result came in time; the action may have run, and the listener counts as gone until
+    /// the integration reports again.
+    Unconfirmed,
+}
+
+/// The latest `agent.action` to an agent and its outcome so far.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LastActionInfo {
+    pub action_id: String,
+    pub op: AgentActionOp,
+    pub outcome: ActionOutcome,
+}
+
 /// A structured action for the exact OMP agent incarnation read by a caller, with the same
 /// identity guards as `agent.instruct`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -480,6 +503,10 @@ pub struct AgentInfo {
     /// open dialog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omp: Option<OmpDetail>,
+    /// The latest `agent.action` to this agent and its outcome so far, kept for two minutes after
+    /// its outcome last changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_action: Option<LastActionInfo>,
     /// The agent's OMP integration had an instruction listener and withdrew it when OMP shut
     /// its session down (`/restart`, extension reload); it registers again within seconds.
     /// False for an agent that never registered one. Shown for at most 30 seconds.

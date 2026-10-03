@@ -30,8 +30,9 @@ use super::super::api_helpers::{
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
-/// The most key input one `pane.ack_action` may ask Herdr to write.
-const ACTION_KEYS_MAX: usize = 8192;
+/// The most key input one `pane.ack_action` may ask Herdr to write: one token-marked paste per
+/// key, so an ask with several questions needs some room.
+const ACTION_KEYS_MAX: usize = 64 * 1024;
 /// The pause between an action's two key chunks: long enough for the dialog the first chunk
 /// opened (OMP's custom answer editor) to take focus.
 const ACTION_KEYS_PAUSE: std::time::Duration = std::time::Duration::from_millis(150);
@@ -2010,6 +2011,13 @@ impl App {
             };
             if let Some(reason) = refusal {
                 if let Some(pending) = self.pending_action_acks.remove(&params.action_id) {
+                    super::agents::record_action_outcome(
+                        &mut self.last_actions,
+                        &pending.terminal_id,
+                        &params.action_id,
+                        pending.op,
+                        crate::api::schema::ActionOutcome::Refused,
+                    );
                     let _ = pending.tx.send(ActionResult::Refused(reason.into()));
                 }
                 return encode_error(id, "keys_not_written", reason);
@@ -2019,6 +2027,17 @@ impl App {
         let Some(pending) = self.pending_action_acks.remove(&params.action_id) else {
             return encode_success(id, ResponseResult::Ok {});
         };
+        super::agents::record_action_outcome(
+            &mut self.last_actions,
+            &pending.terminal_id,
+            &params.action_id,
+            pending.op,
+            if params.ok {
+                crate::api::schema::ActionOutcome::Done
+            } else {
+                crate::api::schema::ActionOutcome::Refused
+            },
+        );
         let result = if params.ok {
             let Some(agent) = self.agent_info(ws_idx, pane_id) else {
                 return encode_success(id, ResponseResult::Ok {});

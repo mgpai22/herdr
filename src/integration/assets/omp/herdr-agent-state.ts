@@ -172,8 +172,11 @@ function ackInstruction(
 function ackAction(
   actionId: string,
   result: { ok: boolean; error?: string; data?: Record<string, unknown>; keys?: string[] },
+  // A final result goes through the report queue, behind the detail report sent just before it,
+  // so the `agent` herdr answers with shows the action's effect.
+  queued = false,
 ): Promise<boolean> {
-  return sendRequestNow(() => ({
+  return (queued ? sendRequest : sendRequestNow)(() => ({
     id: `${source}:action:${actionId}:${Date.now()}`,
     method: "pane.ack_action",
     params: {
@@ -188,9 +191,12 @@ function ackAction(
   }));
 }
 
+// Cuts by code point, so a cap never splits a surrogate pair (herdr refuses a lone surrogate).
 function cap(text: unknown, max = 500): string {
   const value = typeof text === "string" ? text : String(text ?? "");
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+  if (value.length <= max) return value;
+  const points = Array.from(value);
+  return points.length > max ? `${points.slice(0, max - 1).join("")}…` : value;
 }
 
 // Mirrors OMP's getLatestTodoPhasesFromEntries (tools/todo.ts): the newest todo tool result, or
@@ -260,13 +266,26 @@ const THINKING_LEVELS: Record<string, true> = {
 // A collapsed large paste in OMP's editor; its text lives outside the editor buffer, so a draft
 // that holds one cannot be saved and restored as text.
 const PASTE_MARKER = /\[Paste #\d+(?:, (?:\+\d+ lines|\d+ chars))?\]/;
-const KEY_UP = "\x1b[A";
-const KEY_DOWN = "\x1b[B";
-const KEY_ENTER = "\r";
-const KEY_ESC = "\x1b";
+// A herdr answer key: one bracketed paste per key, which the listener replaces with that key's
+// bytes. The header carries the action id, the key's place in the answer, an expiry and this
+// runtime's token, so no key a person types is ever taken for herdr's. The body is one key code,
+// or `T` and a custom answer text.
+const KEY_BLOCK =
+  /^\x1b\[200~herdr-key:v1:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+const KEY_BYTES: Record<string, string> = { U: "\x1b[A", D: "\x1b[B", E: "\r", S: " ", X: "\x1b" };
+// The detail herdr keeps is at most 16 KiB; a dialog report shrinks to stay under this.
+const detailBudgetBytes = 15 * 1024;
+// Dialog report sizes, largest first: questions, options per question, characters per text.
+const DIALOG_TIERS = [
+  { questions: 10, options: 20, text: 500, label: 200 },
+  { questions: 10, options: 20, text: 160, label: 60 },
+  { questions: 10, options: 20, text: 60, label: 24 },
+  { questions: 5, options: 10, text: 40, label: 16 },
+  { questions: 1, options: 5, text: 40, label: 12 },
+];
 // How long an answer waits for its dialog to close; herdr waits 8 s for the final ack.
 const answerWaitMs = 5000;
-// How long OMP may take to report that a dialog closed after its last key.
+// How long OMP may take to report that a dialog closed after a person's key.
 const closeReportWaitMs = 300;
 
 // Matches the text of the user message OMP starts the turn with: the delivered text, with each
@@ -653,39 +672,74 @@ export default function (pi) {
   let lastDetailAt = 0;
   // Tools the root session started and has not finished, oldest first.
   const runningTools = new Map<string, { name: string; call_id: string; started_ms: number }>();
-  // `tool_call` input by call id: OMP asks for approval after it and names only the call id.
+  // The input each tool call runs with, by call id. OMP asks for approval after
+  // `tool_execution_start`, whose `args` hold the input after every extension's `tool_call`
+  // revision; `tool_call` input (before revisions) is kept only for calls the agent loop did not
+  // start (nested dispatches emit no `tool_execution_start`).
   const toolInputs = new Map<string, unknown>();
-  // Open approval and `ask` dialogs, oldest first. OMP shows one dialog at a time and queues the
-  // rest first in, first out, so the head is the one on screen.
-  let dialogs: {
-    report: Record<string, unknown>;
-    // The real counts; the report caps them.
-    questions: { options: number; multi: boolean }[];
+  type OpenDialog = {
+    id: string;
+    kind: "approval" | "ask";
+    tool: string;
+    summary?: string;
+    questions: { text: string; options: string[]; multi: boolean; recommended: number }[];
+    // The last report showed fewer questions or options than the ask has.
     truncated: boolean;
     // A key that was not herdr's reached OMP while this dialog was on screen.
     touched: boolean;
-  }[] = [];
+  };
+  // Open approval and `ask` dialogs, oldest first. OMP shows one dialog at a time and queues the
+  // rest first in, first out, so the head is the one on screen.
+  let dialogs: OpenDialog[] = [];
   // Dialogs that closed lately, so a late answer says it lost the race.
   const closedDialogs: string[] = [];
-  // A person's draft cleared so an `ask` dialog takes keys; restored when the dialog closes.
+  // A person's draft cleared so an `ask` dialog takes keys; restored when the answer ends.
   let dialogDraft: { id: string; text: string } | undefined;
-  // The answer in progress: the keys herdr writes after the first ack, and the final ack, sent
-  // when the dialog closes.
-  let armed:
+  // The answer in progress. herdr writes its key blocks after the first ack; each one reaches
+  // OMP only in order, while the dialog is still the head and no person key came first. The
+  // final ack goes out when the dialog closes, or when the answer can no longer finish.
+  let answering:
     | {
+        actionId: string;
         dialogId: string;
-        rest: string;
-        // A key that was not herdr's arrived meanwhile, or the dialog closed early: the remaining
-        // keys are swallowed.
+        codes: string[];
+        next: number;
         spoiled: boolean;
-        closed: boolean;
         approve?: boolean;
-        finish?: (result: { ok: boolean; error?: string; data?: Record<string, unknown> }) => void;
+        finish: (result: { ok: boolean; error?: string; data?: Record<string, unknown> }) => void;
         timer: ReturnType<typeof setTimeout>;
       }
     | undefined;
   // Keys OMP passes to extension listeners that never act on a dialog: focus reports and mouse.
   const TERMINAL_NOISE = /^\x1b\[(?:I|O|<[\d;]+[mM])$/;
+
+  function dialogReport(open: OpenDialog, tier: (typeof DIALOG_TIERS)[number]) {
+    const truncated =
+      open.questions.length > tier.questions ||
+      open.questions.some((question) => question.options.length > tier.options);
+    return {
+      truncated,
+      report: {
+        id: open.id,
+        kind: open.kind,
+        tool: open.tool,
+        ...(open.summary !== undefined ? { summary: cap(open.summary, tier.text) } : {}),
+        ...(open.kind === "ask"
+          ? {
+              questions: open.questions.slice(0, tier.questions).map((question) => ({
+                text: cap(question.text, tier.text),
+                options: question.options.slice(0, tier.options).map((option) => cap(option, tier.label)),
+                multi: question.multi,
+                // OMP 18.4.4 always offers "Other (type your own)".
+                other_allowed: true,
+              })),
+            }
+          : {}),
+        ...(truncated ? { truncated: true } : {}),
+        ...(dialogs.length > 1 ? { queued: dialogs.length - 1 } : {}),
+      },
+    };
+  }
 
   function buildDetail() {
     const ctx = detailCtx;
@@ -712,11 +766,13 @@ export default function (pi) {
     if (todos) detail.todos = todos;
     const head = dialogs[0];
     if (head) {
-      detail.dialog = {
-        ...head.report,
-        ...(head.truncated ? { truncated: true } : {}),
-        ...(dialogs.length > 1 ? { queued: dialogs.length - 1 } : {}),
-      };
+      // The smallest report that fits herdr's limit; an answer refuses what it had to cut.
+      for (const tier of DIALOG_TIERS) {
+        const { truncated, report } = dialogReport(head, tier);
+        detail.dialog = report;
+        head.truncated = truncated;
+        if (Buffer.byteLength(JSON.stringify(detail), "utf8") <= detailBudgetBytes) break;
+      }
     }
     return detail;
   }
@@ -750,96 +806,119 @@ export default function (pi) {
     detailTimer.unref?.();
   }
 
-  function openDialog(next: (typeof dialogs)[number]) {
+  function openDialog(next: OpenDialog) {
     dialogs.push(next);
     scheduleDetail(undefined, true);
   }
 
-  // Ends the answer in progress for `id`: done only when every key of it reached the dialog, no
-  // other key did, and the dialog closed the way the answer chose.
-  function settleAnswer(id: string, approved?: boolean) {
-    if (armed?.dialogId !== id || !armed.finish) return;
-    const finish = armed.finish;
-    armed.finish = undefined;
-    armed.closed = true;
-    clearTimeout(armed.timer);
-    if (armed.rest || armed.spoiled) {
-      armed.spoiled = true;
-      finish({ ok: false, error: "answered_by_other: a person answered or moved the dialog first" });
-    } else if (armed.approve !== undefined && approved !== undefined && approved !== armed.approve) {
-      finish({ ok: false, error: "answered_by_other: the dialog closed with the other choice" });
-    } else {
-      finish({ ok: true, data: { dialog_id: id } });
+  // Ends the answer in progress with its final result. Later key blocks of it are dropped.
+  function endAnswer(result: { ok: boolean; error?: string; data?: Record<string, unknown> }) {
+    const current = answering;
+    if (!current) return;
+    answering = undefined;
+    clearTimeout(current.timer);
+    if (dialogDraft?.id === current.dialogId && dialogs.some((open) => open.id === current.dialogId)) {
+      restoreDraft();
     }
-    if (!armed.rest) {
-      armed = undefined;
-    }
+    current.finish(result);
+  }
+
+  function restoreDraft() {
+    const ui = detailCtx?.ui;
+    if (dialogDraft && !(ui?.getEditorText?.() ?? "")) ui?.setEditorText?.(dialogDraft.text);
+    dialogDraft = undefined;
+  }
+
+  // A person's key reached the dialog before all of herdr's: herdr's remaining keys are dropped.
+  // Wait a moment for OMP to report a close the person's key caused.
+  function spoilAnswer() {
+    if (!answering || answering.spoiled) return;
+    answering.spoiled = true;
+    clearTimeout(answering.timer);
+    answering.timer = setTimeout(
+      () =>
+        endAnswer({
+          ok: false,
+          error: "dialog_touched: a person used the dialog while the answer was on the way; herdr did not answer it",
+        }),
+      closeReportWaitMs,
+    );
+    answering.timer.unref?.();
   }
 
   function closeDialog(id: string | undefined, approved?: boolean) {
-    const index = dialogs.findIndex((open) => open.report.id === id);
+    const index = dialogs.findIndex((open) => open.id === id);
     if (!id || index < 0) return;
     dialogs.splice(index, 1);
     closedDialogs.push(id);
     closedDialogs.splice(0, closedDialogs.length - 16);
-    if (dialogDraft?.id === id) {
-      const ui = detailCtx?.ui;
-      if (!(ui?.getEditorText?.() ?? "")) ui?.setEditorText?.(dialogDraft.text);
-      dialogDraft = undefined;
+    if (dialogDraft?.id === id) restoreDraft();
+    if (answering?.dialogId === id) {
+      const all = !answering.spoiled && answering.next === answering.codes.length;
+      endAnswer(
+        !all
+          ? { ok: false, error: "answered_by_other: the dialog closed before herdr's answer reached it" }
+          : answering.approve !== undefined && approved !== undefined && approved !== answering.approve
+            ? { ok: false, error: "answered_by_other: the dialog closed with the other choice" }
+            : { ok: true, data: { dialog_id: id } },
+      );
+      // The result was sent behind a detail report without this dialog.
+      return;
     }
-    settleAnswer(id, approved);
     scheduleDetail(undefined, true);
   }
 
-  // Keys that choose the answer in OMP 18.4.4's dialogs. Cursor moves stop at the first and last
-  // rows (no wrap), so moving up past the top first makes each answer independent of where the
-  // cursor is; that holds only for a dialog no person touched, which `answerDialog` checks.
-  // Approval: Approve, Deny. Ask: each question lists its options, then "Other"; Enter picks
+  // Key codes that choose the answer in OMP 18.4.4's dialogs, for a dialog no person touched (so
+  // the cursor is where OMP put it). Cursor moves stop at the first and last rows (no wrap), so
+  // one more Up than needed lands on the first row. Approval: Approve, Deny. Ask: each question
+  // lists its options, then "Other"; its cursor starts on the recommended option. Enter picks
   // (single) or confirms (multi, Space toggles) and moves to the next question, or submits a
   // one-question dialog; a dialog with several questions ends on a review tab that Enter submits.
   // Esc cancels. "Other" opens an editor that takes focus a moment later, so a custom text goes in
   // a second chunk, and only where nothing follows it: a one-question single-select dialog.
-  function answerKeys(open: (typeof dialogs)[number], args: any): { keys: string[] } | { error: string } {
-    if (open.report.kind === "approval") {
+  function answerCodes(open: OpenDialog, args: any): { chunks: string[][] } | { error: string } {
+    if (open.kind === "approval") {
       if (typeof args.approve !== "boolean") {
         return { error: "invalid_args: an approval answer needs approve: true or false" };
       }
-      return { keys: [args.approve ? KEY_UP + KEY_ENTER : KEY_DOWN + KEY_ENTER] };
+      return { chunks: [args.approve ? ["U", "E"] : ["D", "E"]] };
     }
-    if (args.cancel === true) return { keys: [KEY_ESC] };
+    if (args.cancel === true) return { chunks: [["X"]] };
     const questions = open.questions;
     const answers =
       questions.length === 1 && !Array.isArray(args.answers) ? [args] : args.answers;
     if (!Array.isArray(answers) || answers.length !== questions.length) {
       return { error: `invalid_args: give answers, one per question (${questions.length})` };
     }
-    const chunks = [""];
+    const chunks: string[][] = [[]];
     for (const [index, question] of questions.entries()) {
       const answer = answers[index] ?? {};
-      const count = question.options;
+      const count = question.options.length;
       const kinds = ["option_index", "selections", "text"].filter((key) => answer[key] !== undefined);
       if (kinds.length !== 1) {
         return {
           error: `invalid_args: question ${index + 1} needs exactly one of option_index, selections, text`,
         };
       }
-      const top = KEY_UP.repeat(count + 1);
+      const start = Math.min(Math.max(question.recommended, 0), Math.max(count - 1, 0));
+      const top = Array(start + 1).fill("U");
+      const down = (rows: number) => Array(rows).fill("D");
       if (answer.text !== undefined) {
         const text = answer.text;
         if (questions.length !== 1 || question.multi) {
           return { error: "invalid_args: a text answer fits only a one-question single-select dialog" };
         }
-        if (typeof text !== "string" || !text.trim() || text.length > 2000 || /[\x00-\x1f\x7f]/.test(text)) {
-          return { error: "invalid_args: text must be one line of 1-2000 characters" };
+        if (typeof text !== "string" || !text.trim() || Array.from(text).length > 1000 || /[\x00-\x1f\x7f]/.test(text)) {
+          return { error: "invalid_args: text must be one line of 1-1000 characters" };
         }
-        chunks[0] += KEY_DOWN.repeat(count + 1) + KEY_ENTER;
-        chunks.push(text + KEY_ENTER);
+        chunks[0].push(...down(count - start), "E");
+        chunks.push([`T${text}`, "E"]);
       } else if (answer.option_index !== undefined) {
         const option = answer.option_index;
         if (question.multi || !Number.isInteger(option) || option < 0 || option >= count) {
           return { error: `invalid_args: question ${index + 1} takes option_index 0-${count - 1} only when single-select` };
         }
-        chunks[0] += top + KEY_DOWN.repeat(option) + KEY_ENTER;
+        chunks[0].push(...top, ...down(option), "E");
       } else {
         const picked = answer.selections;
         if (
@@ -852,45 +931,43 @@ export default function (pi) {
           return { error: `invalid_args: question ${index + 1} takes distinct selections 0-${count - 1} only when multi-select` };
         }
         const last = Math.max(...picked);
-        let keys = top;
+        chunks[0].push(...top);
         for (let row = 0; row <= last; row += 1) {
-          if (picked.includes(row)) keys += " ";
-          keys += row < last ? KEY_DOWN : KEY_ENTER;
+          if (picked.includes(row)) chunks[0].push("S");
+          chunks[0].push(row < last ? "D" : "E");
         }
-        chunks[0] += keys;
       }
     }
-    if (questions.length > 1) chunks[0] += KEY_ENTER;
-    return { keys: chunks };
+    if (questions.length > 1) chunks[0].push("E");
+    return { chunks };
   }
 
-  // Sorts one terminal input while an answer is armed. herdr's keys come in order, so a key that
-  // is the next part of them is herdr's: it reaches the dialog only while the dialog is still the
-  // head and untouched, and is swallowed otherwise, so it can never move the editor's history or
-  // submit a draft. Any other key is a person's: it passes, and spoils the answer.
-  function armedKey(data: string): "pass" | "consume" | undefined {
-    if (!armed) return undefined;
-    if (armed.rest && armed.rest.startsWith(data)) {
-      armed.rest = armed.rest.slice(data.length);
-      const live = !armed.spoiled && !armed.closed && dialogs[0]?.report.id === armed.dialogId;
-      if (!live) armed.spoiled = true;
-      if (!armed.rest && armed.spoiled && armed.finish && !armed.closed) {
-        // OMP reports a close a moment after it happened: wait that long before saying that the
-        // dialog is still open and herdr did not answer it.
-        clearTimeout(armed.timer);
-        armed.timer = setTimeout(() => {
-          if (!armed?.finish) return;
-          const finish = armed.finish;
-          armed = undefined;
-          finish({ ok: false, error: "dialog_touched: a person used the dialog while the answer was on the way; herdr did not answer it" });
-        }, closeReportWaitMs);
-        armed.timer.unref?.();
-      }
-      if (!armed.rest && !armed.finish) armed = undefined;
-      return live ? "pass" : "consume";
+  // Takes a herdr key block. A block of the answer in progress becomes its key, in order, while
+  // the dialog is still the head and no person key came first; every other block with this
+  // runtime's token is dropped. A person's Enter read together with the block passes on, and
+  // counts as the person's key.
+  function takeKey(data: string) {
+    const match = KEY_BLOCK.exec(data);
+    if (!match) return undefined;
+    const [, actionId, seq, expiresMs, token, code, enter] = match;
+    if (token !== runtimeInstance) return undefined;
+    const current = answering?.actionId === actionId ? answering : undefined;
+    const usable =
+      current &&
+      !current.spoiled &&
+      !enter &&
+      Number(seq) === current.next &&
+      Date.now() <= Number(expiresMs) &&
+      dialogs[0]?.id === current.dialogId &&
+      current.codes[current.next] === code;
+    if (!usable) {
+      if (current && current.next < current.codes.length) spoilAnswer();
+      if (enter && dialogs[0]) dialogs[0].touched = true;
+      return enter ? { data: enter } : { consume: true };
     }
-    if (!TERMINAL_NOISE.test(data)) armed.spoiled = true;
-    return undefined;
+    current.next += 1;
+    const bytes = code.startsWith("T") ? `\x1b[200~${code.slice(1)}\x1b[201~` : KEY_BYTES[code];
+    return { data: bytes };
   }
 
   // Runs an `agent.action` block. Returns the input result for OMP: the block is consumed, and an
@@ -909,17 +986,12 @@ export default function (pi) {
       void reportSession();
       return rest;
     }
-    const finish = (result: {
-      ok: boolean;
-      error?: string;
-      data?: Record<string, unknown>;
-      keys?: string[];
-    }) => {
-      void ackAction(actionId, result).then((acked) => {
+    const finish = (result: { ok: boolean; error?: string; data?: Record<string, unknown> }) => {
+      scheduleDetail(ctx, true);
+      void ackAction(actionId, result, true).then((acked) => {
         // A lost ack withdraws the listener in herdr until the next session report.
         if (!acked) void reportSession();
       });
-      scheduleDetail(ctx);
     };
     const refuse = (error: string) => {
       finish({ ok: false, error });
@@ -936,10 +1008,11 @@ export default function (pi) {
     switch (request?.op) {
       case "abort": {
         // OMP's approval prompt has no abort signal: the turn stays blocked until someone answers.
-        const head = dialogs[0];
-        if (head) {
+        // An ask takes the tool's signal and closes when the turn aborts.
+        const approval = dialogs.find((open) => open.kind === "approval");
+        if (approval) {
           return refuse(
-            `dialog_open: ${head.report.kind} ${head.report.id} is open; answer it first (approve: false denies an approval, cancel: true cancels an ask)`,
+            `dialog_open: approval ${approval.id} is open; deny it first (answer with approve: false)`,
           );
         }
         ctx?.abort?.();
@@ -1001,24 +1074,37 @@ export default function (pi) {
     const id = args.dialog_id;
     if (typeof id !== "string" || !id) return refuse("invalid_args: answer needs dialog_id");
     const head = dialogs[0];
-    if (head?.report.id !== id) {
-      if (dialogs.some((open) => open.report.id === id)) {
+    if (head?.id !== id) {
+      if (dialogs.some((open) => open.id === id)) {
         return refuse("dialog_queued: OMP shows an earlier dialog first; answer the head dialog");
       }
       if (closedDialogs.includes(id)) return refuse("answered_by_other: the dialog closed before this answer");
       return refuse(head ? "dialog_changed: another dialog is open now" : "no_dialog: no dialog is open");
     }
-    if (armed) return refuse("busy: an earlier answer is still being typed");
-    // Approve, deny and cancel do not depend on where the cursor is; an ask choice does.
-    const positional = head.report.kind === "ask" && args.cancel !== true;
-    if (positional && head.truncated) {
+    if (answering) return refuse("busy: an earlier answer is still in progress");
+    // Approve and deny do not depend on where the cursor is. An ask choice does, and a cancel
+    // (Esc) on a touched ask may only close the custom-answer editor a person is typing in.
+    if (head.kind === "ask" && head.touched) {
+      return refuse("dialog_touched: a person already used this dialog");
+    }
+    const cancel = head.kind === "ask" && args.cancel === true;
+    if (head.kind === "ask" && !cancel && head.truncated) {
       return refuse("dialog_truncated: the dialog has more questions or options than reported");
     }
-    if (positional && head.touched) return refuse("dialog_touched: a person already used this dialog");
-    const answer = answerKeys(head, args);
+    const answer = answerCodes(head, args);
     if ("error" in answer) return refuse(answer.error);
-    // OMP sends every key to a person's unfinished draft while an `ask` dialog is open.
-    if (head.report.kind === "ask") {
+    const expires = Date.now() + answerWaitMs;
+    let seq = 0;
+    const keys = answer.chunks.map((chunk) =>
+      chunk
+        .map(
+          (code) =>
+            `\x1b[200~herdr-key:v1:${actionId}:${seq++}:${expires}:${runtimeInstance}\n${code}\x1b[201~`,
+        )
+        .join(""),
+    );
+    // While an `ask` dialog is open, OMP sends every key but Esc to a person's unfinished draft.
+    if (head.kind === "ask" && !cancel) {
       const draft = ctx?.ui?.getEditorText?.() ?? "";
       if (draft && PASTE_MARKER.test(draft)) {
         return refuse("draft_open: the person's draft holds a collapsed paste; it must be sent or cleared first");
@@ -1029,25 +1115,33 @@ export default function (pi) {
       }
     }
     const timer = setTimeout(() => {
-      if (armed?.dialogId !== id || !armed.finish) return;
-      const pending = armed.finish;
-      armed.finish = undefined;
-      armed.spoiled = true;
-      pending({ ok: false, error: "answer_unconfirmed: the dialog did not close; check agent.get" });
-      if (!armed.rest) armed = undefined;
+      if (answering?.actionId !== actionId) return;
+      const sent = answering.next === answering.codes.length;
+      endAnswer({
+        ok: false,
+        error: sent
+          ? "answer_unconfirmed: herdr's keys reached the dialog but it did not close; check agent.get"
+          : "failed: herdr's answer keys did not arrive; nothing was answered",
+      });
     }, answerWaitMs);
     timer.unref?.();
-    armed = {
+    answering = {
+      actionId,
       dialogId: id,
-      rest: answer.keys.join(""),
+      codes: answer.chunks.flat(),
+      next: 0,
       spoiled: false,
-      closed: false,
-      ...(head.report.kind === "approval" ? { approve: args.approve } : {}),
+      ...(head.kind === "approval" ? { approve: args.approve } : {}),
       finish,
       timer,
     };
-    // The first ack only hands herdr the keys; the result follows when the dialog closes.
-    void ackAction(actionId, { ok: true, keys: answer.keys });
+    // The first ack hands herdr the keys; the result follows when the dialog closes. If herdr
+    // refused or never got them, nothing will arrive.
+    void ackAction(actionId, { ok: true, keys }).then((acked) => {
+      if (!acked && answering?.actionId === actionId) {
+        endAnswer({ ok: false, error: "failed: herdr did not write the answer keys; nothing was answered" });
+      }
+    });
     return rest;
   }
 
@@ -1077,11 +1171,15 @@ export default function (pi) {
     // registers a fresh one.
     unsubscribeInstructions?.();
     unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => {
-      const herdrKey = armedKey(data);
-      if (herdrKey === "consume") return { consume: true };
-      if (herdrKey === "pass") return undefined;
+      const key = takeKey(data);
+      if (key) return key;
       const taken = takeAction(ctx, data) ?? takeInstruction(ctx, data);
-      if (!taken && dialogs[0] && !TERMINAL_NOISE.test(data)) dialogs[0].touched = true;
+      if (!taken && !TERMINAL_NOISE.test(data)) {
+        // A person's input. It always reaches OMP; while a dialog is open it makes positions
+        // unknown, and it stops an answer whose keys have not all arrived.
+        if (dialogs[0]) dialogs[0].touched = true;
+        if (answering && answering.next < answering.codes.length) spoilAnswer();
+      }
       return taken;
     });
     instructionListener = typeof unsubscribeInstructions === "function";
@@ -1249,12 +1347,11 @@ export default function (pi) {
       detail = typeof input?.command === "string" ? input.command : JSON.stringify(input) ?? "";
     } catch {}
     openDialog({
-      report: {
-        id: event.toolCallId,
-        kind: "approval",
-        tool: cap(event.toolName || "tool", 120),
-        summary: cap(`${event.toolName ?? "tool"} ${detail}`.trim()),
-      },
+      id: event.toolCallId,
+      kind: "approval",
+      tool: cap(event.toolName || "tool", 120),
+      // The input after every extension's revision, as OMP's prompt shows it (see `toolInputs`).
+      summary: cap(`${event.toolName ?? "tool"} ${detail}`.trim(), 2000),
       questions: [],
       truncated: false,
       touched: false,
@@ -1272,6 +1369,7 @@ export default function (pi) {
   pi.on("tool_execution_start", (event, ctx) => {
     if (event?.toolName !== "ask") {
       if (rootSession && event?.toolCallId) {
+        toolInputs.set(event.toolCallId, event.args);
         runningTools.set(event.toolCallId, {
           name: cap(event.toolName || "tool", 120),
           call_id: event.toolCallId,
@@ -1289,25 +1387,16 @@ export default function (pi) {
     detailCtx = ctx ?? detailCtx;
     const options = (question: any) => (Array.isArray(question?.options) ? question.options : []);
     openDialog({
-      report: {
-        id: event.toolCallId,
-        kind: "ask",
-        tool: "ask",
-        questions: questions.slice(0, 10).map((question: any) => ({
-          text: cap(question?.question),
-          options: options(question)
-            .slice(0, 20)
-            .map((option: any) => cap(option?.label, 200)),
-          multi: question?.multi === true,
-          // OMP 18.4.4 always offers "Other (type your own)".
-          other_allowed: true,
-        })),
-      },
+      id: event.toolCallId,
+      kind: "ask",
+      tool: "ask",
       questions: questions.map((question: any) => ({
-        options: options(question).length,
+        text: cap(question?.question, 2000),
+        options: options(question).map((option: any) => cap(option?.label, 200)),
         multi: question?.multi === true,
+        recommended: Number.isInteger(question?.recommended) ? question.recommended : 0,
       })),
-      truncated: questions.length > 10 || questions.some((question: any) => options(question).length > 20),
+      truncated: false,
       touched: false,
     });
   });
@@ -1379,8 +1468,8 @@ export default function (pi) {
     clearPendingTimers();
     clearTimeout(detailTimer);
     detailTimer = undefined;
-    if (armed) clearTimeout(armed.timer);
-    armed = undefined;
+    if (answering) clearTimeout(answering.timer);
+    answering = undefined;
     dialogs = [];
     unsubscribeInstructions?.();
     unsubscribeInstructions = undefined;

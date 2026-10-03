@@ -490,8 +490,10 @@ pub struct PaneAckActionParams {
     /// The op's result data.
     #[serde(default)]
     pub data: serde_json::Map<String, serde_json::Value>,
-    /// Key input Herdr writes to the pane after this ack, one chunk at a time with a short pause
-    /// between chunks, so each reaches the dialog that the previous one opened.
+    /// Key input Herdr writes to the pane after this ack (one token-marked paste per key, which
+    /// the integration turns back into the key), one chunk at a time with a short pause between
+    /// chunks, so each reaches the dialog that the previous one opened. An ack with keys is not
+    /// final; the integration sends the result in a later ack.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
     #[serde(skip)]
