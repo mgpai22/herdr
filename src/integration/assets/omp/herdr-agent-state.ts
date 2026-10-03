@@ -5,6 +5,7 @@
 // HERDR_INTEGRATION_VERSION=14
 // @ts-nocheck
 
+import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
@@ -993,6 +994,8 @@ export default function (pi) {
       case "switch_session": {
         const target = sub.path;
         if (!isAbsoluteSessionPath(target)) return refuse("invalid_args: switch_session needs an absolute path");
+        // OMP starts a new session at a path that does not exist instead of refusing.
+        if (!fs.existsSync(target)) return refuse("invalid_args: no session file at that path");
         run = (cctx) => cctx.switchSession(target);
         break;
       }
@@ -1077,6 +1080,9 @@ export default function (pi) {
       } catch (error) {
         result = { ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` };
       }
+      // OMP drops every input listener before a session change and registers none back when the
+      // change fails or is cancelled (no session event follows), so register again here.
+      registerInstructionListener(cctx);
       // A branch puts the branched prompt into the editor; keep it.
       if (job.draft && !(cctx?.ui?.getEditorText?.() ?? "")) cctx?.ui?.setEditorText?.(job.draft);
       job.finish(result);

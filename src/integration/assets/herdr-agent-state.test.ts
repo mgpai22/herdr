@@ -1670,3 +1670,47 @@ test("Oh My Pi runs herdr actions and answers only the dialog they name", async 
     (await act({ op: "answer", args: { dialog_id: "ask1", answers: [{ selections: [0] }, { option_index: 0 }] } })).error,
   ).toStartWith("invalid_args:");
 });
+
+test("Oh My Pi listens again after a session command fails", async () => {
+  const requests = await startRecordingServer("omp-command-failed");
+  const { handlers, pi } = createExtensionHarness();
+  const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install({ ...pi, registerCommand: (name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) => commands.set(name, options.handler) });
+  let listener: TerminalInputHandler | undefined;
+  let editor = "";
+  const ui = {
+    onTerminalInput(handler: TerminalInputHandler) {
+      listener = handler;
+      return () => {
+        if (listener === handler) listener = undefined;
+      };
+    },
+    getEditorText: () => editor,
+    setEditorText: (text: string) => (editor = text),
+  };
+  const context = {
+    hasUI: true,
+    isIdle: () => true,
+    ui,
+    sessionManager: { getSessionFile: () => "/tmp/omp-command.jsonl", getSessionId: () => "omp-command" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.report_agent_session_v2"));
+  const id = "c".repeat(32);
+  expect(listener?.(actionBlock(id, { op: "command", args: { name: "branch", args: { entry_id: "e1" } } }))).toEqual({ data: "\r" });
+  expect(editor).toBe(`/herdr-action ${id}`);
+  // OMP clears input listeners before the branch, which then throws: no session event follows.
+  listener = undefined;
+  editor = "";
+  await commands.get("herdr-action")?.(id, {
+    ...context,
+    branch: async () => {
+      throw new Error("Invalid entry ID for branching");
+    },
+  });
+  expect(listener).toBeDefined();
+  await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.ack_action"));
+  const ack = requests.find((request) => isRecord(request) && request.method === "pane.ack_action") as { params: Record<string, unknown> };
+  expect(ack.params.error).toStartWith("failed: Invalid entry ID");
+});
