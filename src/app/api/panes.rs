@@ -1811,6 +1811,11 @@ impl App {
                 pending.withdraws_listener = false;
             }
         }
+        for pending in self.pending_action_acks.values_mut() {
+            if pending.terminal_id == terminal_id {
+                pending.withdraws_listener = false;
+            }
+        }
         if let Some(requested) = self
             .state
             .terminals
@@ -1911,8 +1916,9 @@ impl App {
     }
 
     /// Accepts the OMP integration's result for a pending `agent.action` only from the exact
-    /// process incarnation the block was written to. Key input the result carries (a dialog
-    /// answer) is written before the caller hears of it.
+    /// process incarnation the block was written to. An ack with keys (a dialog answer) is not
+    /// final: Herdr writes the keys, once, and the caller hears the result from a later ack the
+    /// integration sends when the dialog closed.
     pub(super) fn handle_pane_ack_action(
         &mut self,
         id: String,
@@ -1966,42 +1972,67 @@ impl App {
                 "the acknowledging process is not the OMP process the action was written to",
             );
         }
+        let Some(pending) = self.pending_action_acks.get_mut(&params.action_id) else {
+            return encode_success(id, ResponseResult::Ok {});
+        };
+        // The listener took the block, so it exists.
+        pending.withdraws_listener = false;
+        if !params.keys.is_empty() {
+            if std::mem::replace(&mut pending.keys_written, true) {
+                return encode_error(
+                    id,
+                    "invalid_request",
+                    "an action's keys were already written",
+                );
+            }
+            let owner_pid = pending.owner.pid;
+            let refusal = match self.lookup_runtime_sender(ws_idx, pane_id) {
+                // OMP may have handed the terminal to another program since it took the block.
+                Some(runtime) if !super::super::agents::owner_in_foreground_job(runtime, owner_pid) => {
+                    Some("failed: the OMP process is no longer the pane foreground job; no keys were written")
+                }
+                #[cfg(target_os = "linux")]
+                Some(runtime) if super::super::agents::owner_child_reads_tty(runtime, owner_pid) => {
+                    Some("failed: another program reads the pane terminal now; no keys were written")
+                }
+                Some(runtime) => {
+                    let mut keys = params.keys.into_iter().map(Bytes::from);
+                    let written = match (keys.next(), keys.next()) {
+                        (Some(first), None) => runtime.try_send_bytes(first).is_ok(),
+                        (Some(first), Some(second)) => runtime
+                            .queue_user_input_submission(first, second, ACTION_KEYS_PAUSE, None)
+                            .is_ok(),
+                        (None, _) => true,
+                    };
+                    (!written).then_some("failed: herdr could not write the answer keys to the pane")
+                }
+                None => Some("failed: the pane is gone"),
+            };
+            if let Some(reason) = refusal {
+                if let Some(pending) = self.pending_action_acks.remove(&params.action_id) {
+                    let _ = pending.tx.send(ActionResult::Refused(reason.into()));
+                }
+                return encode_error(id, "keys_not_written", reason);
+            }
+            return encode_success(id, ResponseResult::Ok {});
+        }
         let Some(pending) = self.pending_action_acks.remove(&params.action_id) else {
             return encode_success(id, ResponseResult::Ok {});
         };
-        let mut keys = params.keys.into_iter().map(bytes::Bytes::from);
-        let written = match (keys.next(), keys.next()) {
-            (None, _) => Ok(()),
-            (Some(keys), None) => self
-                .lookup_runtime_sender(ws_idx, pane_id)
-                .ok_or(())
-                .and_then(|runtime| runtime.try_send_bytes(keys).map_err(|_| ())),
-            (Some(first), Some(second)) => self
-                .lookup_runtime_sender(ws_idx, pane_id)
-                .ok_or(())
-                .and_then(|runtime| {
-                    runtime
-                        .queue_user_input_submission(first, second, ACTION_KEYS_PAUSE, None)
-                        .map(drop)
-                        .map_err(|_| ())
-                }),
-        };
-        let result = match (params.ok, written) {
-            (true, Ok(())) => ActionResult::Done {
-                agent: Box::new(match self.agent_info(ws_idx, pane_id) {
-                    Some(agent) => agent,
-                    None => return encode_success(id, ResponseResult::Ok {}),
-                }),
+        let result = if params.ok {
+            let Some(agent) = self.agent_info(ws_idx, pane_id) else {
+                return encode_success(id, ResponseResult::Ok {});
+            };
+            ActionResult::Done {
+                agent: Box::new(agent),
                 data: params.data,
-            },
-            (true, Err(())) => ActionResult::Refused(
-                "failed: herdr could not write the answer keys to the pane".into(),
-            ),
-            (false, _) => ActionResult::Refused(
+            }
+        } else {
+            ActionResult::Refused(
                 params
                     .error
                     .unwrap_or_else(|| "failed: no reason given".into()),
-            ),
+            )
         };
         let _ = pending.tx.send(result);
         encode_success(id, ResponseResult::Ok {})

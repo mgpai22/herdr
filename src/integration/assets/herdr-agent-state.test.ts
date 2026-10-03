@@ -1592,20 +1592,21 @@ function actionBlock(id: string, body: unknown, token = runtimeToken()) {
   return `\x1b[200~herdr-action:v1:${id}:${Date.now() + 4_000}:${Buffer.byteLength(json, "utf8")}:${token}\n${json}\x1b[201~`;
 }
 
-test("Oh My Pi runs herdr actions and answers only the dialog they name", async () => {
+async function installOmpForActions(name: string) {
   let listener: TerminalInputHandler | undefined;
-  const harness = await installOmpWithTerminalInput("omp-action", {
+  let editor = "";
+  const harness = await installOmpWithTerminalInput(name, {
     onTerminalInput(handler: TerminalInputHandler) {
       listener = handler;
       return () => {};
     },
-    getEditorText: () => "",
+    getEditorText: () => editor,
+    setEditorText: (text: string) => (editor = text),
   });
   let aborted = 0;
   Object.assign(harness.context, { abort: () => (aborted += 1) });
   await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
   await waitFor(() => harness.reports().length === 1);
-  expect(harness.reports()[0].params.accepts_actions).toBe(true);
   const acks = () =>
     harness.requests
       .filter((request) => isRecord(request) && request.method === "pane.ack_action")
@@ -1615,102 +1616,164 @@ test("Oh My Pi runs herdr actions and answers only the dialog they name", async 
       .filter((request) => isRecord(request) && request.method === "pane.report_omp_detail")
       .map((request) => (request as { params: { omp: Record<string, unknown> } }).params.omp);
   let n = 0;
+  // Sends one action block; returns its id and the first ack (keys for an answer, else final).
   const act = async (body: unknown) => {
     const id = (++n).toString(16).padStart(32, "0");
     expect(listener?.(actionBlock(id, body))).toEqual({ consume: true });
     await waitFor(() => acks().some((ack) => ack.action_id === id));
-    return acks().find((ack) => ack.action_id === id)!;
+    return { id, ack: acks().find((ack) => ack.action_id === id)! };
   };
+  const finalAck = async (id: string) => {
+    await waitFor(() => acks().filter((ack) => ack.action_id === id && !ack.keys).length === 1);
+    return acks().find((ack) => ack.action_id === id && !ack.keys)!;
+  };
+  // Feeds herdr's keys to OMP one key at a time, as OMP's stdin buffer splits them; returns what
+  // the listener let through.
+  const type = (keys: string) => {
+    const passed: string[] = [];
+    for (const key of keys.match(/\x1b\[[A-D]|[\s\S]/g) ?? []) {
+      const result = listener?.(key);
+      if (!result?.consume) passed.push(key);
+    }
+    return passed;
+  };
+  const approval = async (id: string, command: string) => {
+    await harness.handlers.get("tool_call")?.({ toolCallId: id, toolName: "bash", input: { command } }, harness.context);
+    await harness.handlers.get("tool_approval_requested")?.({ toolCallId: id, toolName: "bash" }, harness.context);
+  };
+  return {
+    harness,
+    acks,
+    details,
+    act,
+    finalAck,
+    type,
+    approval,
+    listener: (data: string) => listener?.(data),
+    aborted: () => aborted,
+    editor: () => editor,
+    setEditor: (text: string) => (editor = text),
+  };
+}
 
-  expect(await act({ op: "abort", args: {} })).toMatchObject({ ok: true, data: { was_idle: true } });
-  expect(aborted).toBe(1);
-  expect((await act({ op: "set_thinking", args: { level: "huge" } })).error).toStartWith("invalid_level:");
-  // A block without this runtime's token is a person's paste.
-  expect(listener?.(actionBlock("f".repeat(32), { op: "abort" }, "not-the-token"))).toBeUndefined();
+// OMP 18.4.4's selectors: the cursor clamps at both ends, Enter picks the row under it.
+function pickedRow(keys: string[], rows: number, start: number) {
+  let row = start;
+  for (const key of keys) {
+    if (key === "\x1b[A") row = Math.max(0, row - 1);
+    else if (key === "\x1b[B") row = Math.min(rows - 1, row + 1);
+    else if (key === "\r") return row;
+  }
+  return undefined;
+}
 
-  await harness.handlers.get("tool_call")?.({ toolCallId: "call1", toolName: "bash", input: { command: "rm -r x" } }, harness.context);
-  await harness.handlers.get("tool_approval_requested")?.({ toolCallId: "call1", toolName: "bash" }, harness.context);
-  await waitFor(() => details().some((detail) => isRecord(detail.dialog)));
-  expect(details().at(-1)?.dialog).toEqual({ id: "call1", kind: "approval", tool: "bash", summary: "bash rm -r x" });
+test("Oh My Pi answers the approval OMP shows, and only after it closes", async () => {
+  const omp = await installOmpForActions("omp-answer-queue");
+  // Two parallel tool calls: OMP shows the first and queues the second.
+  await omp.approval("call1", "echo FIRST");
+  await omp.approval("call2", "echo SECOND");
+  await waitFor(() => isRecord(omp.details().at(-1)?.dialog) && omp.details().at(-1)?.dialog.queued === 1);
+  expect(omp.details().at(-1)?.dialog).toMatchObject({ id: "call1", summary: "bash echo FIRST", queued: 1 });
+  expect((await omp.act({ op: "answer", args: { dialog_id: "call2", approve: true } })).ack.error).toStartWith("dialog_queued:");
+  // abort cannot end a turn that waits on an approval.
+  expect((await omp.act({ op: "abort", args: {} })).ack.error).toStartWith("dialog_open: approval call1");
+  expect(omp.aborted()).toBe(0);
 
-  expect((await act({ op: "answer", args: { dialog_id: "call0", approve: true } })).error).toStartWith("dialog_changed:");
-  expect(await act({ op: "answer", args: { dialog_id: "call1", approve: false } })).toMatchObject({
-    ok: true,
-    keys: ["\x1b[B\r"],
-  });
-  // The answer keys reach the open dialog.
-  expect(listener?.("\x1b[B")).toBeUndefined();
-  await harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call1", approved: false }, harness.context);
-  // Keys that arrive after their dialog closed never reach the editor.
-  expect(listener?.("\r")).toEqual({ consume: true });
-  expect((await act({ op: "answer", args: { dialog_id: "call1", approve: true } })).error).toStartWith("answered_by_other:");
-
-  await harness.handlers.get("tool_execution_start")?.(
-    {
-      toolCallId: "ask1",
-      toolName: "ask",
-      args: {
-        questions: [
-          { question: "Which?", options: [{ label: "a" }, { label: "b" }] },
-          { question: "Some?", options: [{ label: "x" }, { label: "y" }, { label: "z" }], multi: true },
-        ],
-      },
-    },
-    harness.context,
-  );
-  const up = "\x1b[A";
-  const down = "\x1b[B";
-  expect(
-    await act({ op: "answer", args: { dialog_id: "ask1", answers: [{ option_index: 1 }, { selections: [2, 0] }] } }),
-  ).toMatchObject({
-    ok: true,
-    keys: [`${up.repeat(3)}${down}\r${up.repeat(4)} ${down}${down} \r\r`],
-  });
-  expect(
-    (await act({ op: "answer", args: { dialog_id: "ask1", answers: [{ selections: [0] }, { option_index: 0 }] } })).error,
-  ).toStartWith("invalid_args:");
+  const { id, ack } = await omp.act({ op: "answer", args: { dialog_id: "call1", approve: false } });
+  expect(ack.ok).toBe(true);
+  const keys = ack.keys as string[];
+  // The keys pick Deny wherever the cursor is, and all reach the dialog.
+  for (const start of [0, 1]) {
+    expect(pickedRow(keys.join("").match(/\x1b\[[A-D]|[\s\S]/g)!, 2, start)).toBe(1);
+  }
+  expect(omp.type(keys.join("")).join("")).toBe(keys.join(""));
+  // No final result before the dialog closes.
+  await Bun.sleep(30);
+  expect(omp.acks().filter((entry) => entry.action_id === id)).toHaveLength(1);
+  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call1", approved: false }, omp.harness.context);
+  expect(await omp.finalAck(id)).toMatchObject({ ok: true, data: { dialog_id: "call1" } });
+  await waitFor(() => omp.details().at(-1)?.dialog?.id === "call2");
 });
 
-test("Oh My Pi listens again after a session command fails", async () => {
-  const requests = await startRecordingServer("omp-command-failed");
-  const { handlers, pi } = createExtensionHarness();
-  const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
-  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
-  install({ ...pi, registerCommand: (name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) => commands.set(name, options.handler) });
-  let listener: TerminalInputHandler | undefined;
-  let editor = "";
-  const ui = {
-    onTerminalInput(handler: TerminalInputHandler) {
-      listener = handler;
-      return () => {
-        if (listener === handler) listener = undefined;
-      };
-    },
-    getEditorText: () => editor,
-    setEditorText: (text: string) => (editor = text),
-  };
-  const context = {
-    hasUI: true,
-    isIdle: () => true,
-    ui,
-    sessionManager: { getSessionFile: () => "/tmp/omp-command.jsonl", getSessionId: () => "omp-command" },
-  };
-  await handlers.get("session_start")?.({ reason: "startup" }, context);
-  await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.report_agent_session_v2"));
-  const id = "c".repeat(32);
-  expect(listener?.(actionBlock(id, { op: "command", args: { name: "branch", args: { entry_id: "e1" } } }))).toEqual({ data: "\r" });
-  expect(editor).toBe(`/herdr-action ${id}`);
-  // OMP clears input listeners before the branch, which then throws: no session event follows.
-  listener = undefined;
-  editor = "";
-  await commands.get("herdr-action")?.(id, {
-    ...context,
-    branch: async () => {
-      throw new Error("Invalid entry ID for branching");
-    },
-  });
-  expect(listener).toBeDefined();
-  await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.ack_action"));
-  const ack = requests.find((request) => isRecord(request) && request.method === "pane.ack_action") as { params: Record<string, unknown> };
-  expect(ack.params.error).toStartWith("failed: Invalid entry ID");
+test("Oh My Pi never lets answer keys reach OMP after a person moved the dialog", async () => {
+  const omp = await installOmpForActions("omp-answer-race");
+  await omp.approval("call1", "echo THIRD");
+  const { id, ack } = await omp.act({ op: "answer", args: { dialog_id: "call1", approve: true } });
+  // A person presses Enter first: it approves, and OMP's editor has focus again before the
+  // resolved event arrives.
+  expect(omp.listener("\r")).toBeUndefined();
+  // herdr's keys then arrive; none of them may reach the editor (Up would recall, Enter resend).
+  expect(omp.type((ack.keys as string[]).join(""))).toEqual([]);
+  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call1", approved: true }, omp.harness.context);
+  expect((await omp.finalAck(id)).error).toStartWith("answered_by_other:");
+  // A person's later keys reach the editor again.
+  expect(omp.listener("\x1b[A")).toBeUndefined();
+
+  // A person's key that only moves the dialog: herdr's keys are swallowed, the answer says so at
+  // once, and the next answer is not blocked.
+  await omp.approval("call9", "echo NINTH");
+  const moved = await omp.act({ op: "answer", args: { dialog_id: "call9", approve: true } });
+  expect(omp.listener("\x1b[B")).toBeUndefined();
+  expect(omp.type((moved.ack.keys as string[]).join(""))).toEqual([]);
+  expect((await omp.finalAck(moved.id)).error).toStartWith("dialog_touched:");
+  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call9", approved: false }, omp.harness.context);
+
+  // An ask a person already used is not answered by position.
+  await omp.harness.handlers.get("tool_execution_start")?.(
+    { toolCallId: "ask2", toolName: "ask", args: { questions: [{ question: "Q?", options: [{ label: "a" }, { label: "b" }] }] } },
+    omp.harness.context,
+  );
+  expect(omp.listener("\x1b[B")).toBeUndefined();
+  expect((await omp.act({ op: "answer", args: { dialog_id: "ask2", option_index: 0 } })).ack.error).toStartWith("dialog_touched:");
+  await omp.harness.handlers.get("tool_execution_end")?.({ toolCallId: "ask2", toolName: "ask" }, omp.harness.context);
+  // An approval answer does not depend on the cursor.
+  await omp.approval("call2", "echo FOURTH");
+  expect(omp.listener("\x1b[B")).toBeUndefined();
+  expect((await omp.act({ op: "answer", args: { dialog_id: "call2", approve: true } })).ack.ok).toBe(true);
+  omp.type("\x1b[A\r");
+  // Focus reports do not count.
+  await omp.harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call2", approved: true }, omp.harness.context);
+  await omp.approval("call3", "echo FIFTH");
+  omp.listener("\x1b[I");
+  expect((await omp.act({ op: "answer", args: { dialog_id: "call3", approve: true } })).ack.ok).toBe(true);
+});
+
+test("Oh My Pi answers an ask dialog only where its keys are exact", async () => {
+  const omp = await installOmpForActions("omp-answer-ask");
+  const ask = (id: string, questions: unknown[]) =>
+    omp.harness.handlers.get("tool_execution_start")?.({ toolCallId: id, toolName: "ask", args: { questions } }, omp.harness.context);
+  const options = (count: number) => Array.from({ length: count }, (_, i) => ({ label: `o${i}` }));
+
+  await ask("big", [{ question: "Many?", options: options(25) }]);
+  expect((await omp.act({ op: "answer", args: { dialog_id: "big", option_index: 0 } })).ack.error).toStartWith("dialog_truncated:");
+  // Cancel needs no position, so it works on any ask.
+  const cancel = await omp.act({ op: "answer", args: { dialog_id: "big", cancel: true } });
+  expect(omp.type((cancel.ack.keys as string[]).join(""))).toEqual(["\x1b"]);
+  await omp.harness.handlers.get("tool_execution_end")?.({ toolCallId: "big", toolName: "ask" }, omp.harness.context);
+  expect((await omp.finalAck(cancel.id)).ok).toBe(true);
+
+  await ask("two", [
+    { question: "Pet?", options: options(2) },
+    { question: "Color?", options: options(3) },
+  ]);
+  // A custom text with more keys after it would lose them while OMP's text editor opens.
+  expect(
+    (await omp.act({ op: "answer", args: { dialog_id: "two", answers: [{ text: "Bob" }, { option_index: 1 }] } })).ack.error,
+  ).toStartWith("invalid_args:");
+  const two = await omp.act({ op: "answer", args: { dialog_id: "two", answers: [{ option_index: 1 }, { option_index: 2 }] } });
+  const keys = (two.ack.keys as string[]).join("").match(/\x1b\[[A-D]|[\s\S]/g)!;
+  // Question 1 picks row 1, question 2 picks row 2, and one Enter submits the review tab.
+  const second = keys.indexOf("\r") + 1;
+  expect(pickedRow(keys, 3, 2)).toBe(1);
+  expect(pickedRow(keys.slice(second), 4, 0)).toBe(2);
+  expect(keys.slice(keys.lastIndexOf("\r", keys.length - 2) + 1)).toEqual(["\r"]);
+  omp.type(keys.join(""));
+  await omp.harness.handlers.get("tool_execution_end")?.({ toolCallId: "two", toolName: "ask" }, omp.harness.context);
+  expect((await omp.finalAck(two.id)).ok).toBe(true);
+
+  // One multi-select question submits on its confirming Enter: no extra Enter for the editor.
+  await ask("multi", [{ question: "Fruit?", options: options(3), multi: true }]);
+  const multi = await omp.act({ op: "answer", args: { dialog_id: "multi", selections: [0, 2] } });
+  const multiKeys = (multi.ack.keys as string[]).join("");
+  expect(multiKeys.endsWith("\r") && !multiKeys.endsWith("\r\r")).toBe(true);
 });

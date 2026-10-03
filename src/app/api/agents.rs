@@ -122,6 +122,11 @@ pub(crate) struct PendingActionAck {
     pub(super) runtime: Option<String>,
     pub(super) tx: std::sync::mpsc::Sender<ActionResult>,
     pub(super) deadline: Instant,
+    /// Cleared once the listener proved it exists after the block was written (an ack, or a
+    /// session report), as for an instruction.
+    pub(super) withdraws_listener: bool,
+    /// The answer keys of the first ack were written; a second set is refused.
+    pub(super) keys_written: bool,
 }
 
 pub(crate) enum ActionResult {
@@ -488,6 +493,8 @@ impl App {
                 runtime: listener_runtime,
                 tx,
                 deadline,
+                withdraws_listener: true,
+                keys_written: false,
             },
         );
         let op = params.op;
@@ -604,7 +611,7 @@ impl App {
         let terminal_id = terminal.id.clone();
         let launch_pending = terminal.managed_agent_launch_pending();
         self.settle_stale_deliveries(&terminal_id, &owner, listener_runtime.as_deref());
-        // One block per agent until the listener proved it took the last one: while a block is
+        // One block per agent until the last one has its result: while a block is
         // unconfirmed the listener may be gone, and a second block would land in the editor.
         // An instruction also waits for its final outcome, so `last_instruction` keeps following
         // a taken delivery that waits for its turn.
@@ -740,10 +747,10 @@ impl App {
             if pending.deadline > now {
                 return true;
             }
-            if let Some(terminal) = terminals
-                .get_mut(&pending.terminal_id)
-                .filter(|terminal| terminal.instruction_listener.as_ref() == Some(&pending.owner))
-            {
+            if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
+                pending.withdraws_listener
+                    && terminal.instruction_listener.as_ref() == Some(&pending.owner)
+            }) {
                 terminal.instruction_listener = None;
             }
             false
@@ -2811,8 +2818,29 @@ mod tests {
             vec!["\x1b[B\r".into()],
         );
         assert!(ok.contains("\"ok\""), "{ok}");
-        // The answer keys are written before the caller hears of the result.
+        // The answer keys are written, once; the caller waits for the dialog to close.
         assert_eq!(&rx.try_recv().unwrap()[..], b"\x1b[B\r");
+        let again = ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            true,
+            None,
+            vec!["\r".into()],
+        );
+        assert!(again.contains("invalid_request"), "{again}");
+        assert!(rx.try_recv().is_err());
+        assert!(response.recv_timeout(Duration::from_millis(50)).is_err());
+        ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            true,
+            None,
+            vec![],
+        );
         let done: SuccessResponse =
             serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
         let ResponseResult::AgentActionDone {
@@ -2919,5 +2947,117 @@ mod tests {
         let info = app.agent_info_for_target(&target).unwrap();
         assert!(info.accepts_actions);
         assert_eq!(info.omp, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unconfirmed_action_keeps_a_listener_that_reported_since() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::Abort, serde_json::json!({})),
+        );
+        sent_action(&mut rx);
+        // The integration reports again (a session change) before the result is due.
+        report_session(&mut app, &target, 60, true);
+        response.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.expire_instruction_acks();
+        assert!(app.agent_info_for_target(&target).unwrap().accepts_actions);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn answer_keys_are_not_written_once_another_program_reads_the_terminal() {
+        use crate::api::schema::AgentActionOp;
+        let pane_id = app_with_agent().state.workspaces[0].tabs[0].root_pane;
+        let (events, _events_rx) = tokio::sync::mpsc::channel(32);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            0,
+            Default::default(),
+            None,
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        let owner_pid = runtime.child_pid().unwrap();
+        // The "agent" reads one line (the block header) itself, then starts `cat`, which reads
+        // the terminal in its place, as OMP's external editor does.
+        runtime
+            .try_send_bytes(Bytes::from_static(
+                b"printf '\\033[?2004h'; exec sh -c 'read line; cat; exec sleep 30'\n",
+            ))
+            .unwrap();
+        let job_size =
+            || crate::detect::foreground_job(owner_pid).map_or(0, |job| job.processes.len());
+        let execed = || {
+            std::fs::read_to_string(format!("/proc/{owner_pid}/cmdline"))
+                .is_ok_and(|cmd| cmd.contains("read line"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(execed() && job_size() == 1 && runtime.bracketed_paste_enabled())
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let owner = crate::platform::observe_process(owner_pid)
+            .unwrap()
+            .unwrap();
+        let (mut app, instruct) = guarded_app(AgentState::Blocked, owner, runtime);
+        let target = instruct.target.clone();
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::Answer,
+                serde_json::json!({ "dialog_id": "c1", "approve": true }),
+            ),
+        );
+        let action_id = app.pending_action_acks.keys().next().unwrap().clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job_size() != 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(job_size(), 2, "the agent and its tty-reading child");
+        let ack = app.handle_pane_ack_action(
+            "ack".into(),
+            crate::api::schema::PaneAckActionParams {
+                pane_id: target,
+                action_id,
+                agent_pid: owner_pid,
+                ok: true,
+                error: None,
+                data: Default::default(),
+                keys: vec!["\x1b[A\r".into()],
+                peer_pid: Some(owner_pid),
+            },
+        );
+        assert!(ack.contains("keys_not_written"), "{ack}");
+        let refused: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert_eq!(refused.error.code, "agent_action_refused");
+        assert!(
+            refused.error.message.contains("another program reads"),
+            "{}",
+            refused.error.message
+        );
     }
 }

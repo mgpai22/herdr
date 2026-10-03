@@ -341,8 +341,8 @@ impl AgentActionParams {
     }
 }
 
-/// Live state the OMP integration reports for its root session. A missing field is unknown; a
-/// `null` one is known to be none.
+/// Live state the OMP integration reports for its root session. A missing field is unknown or
+/// none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OmpDetail {
     /// The session model, `provider/id`.
@@ -360,7 +360,7 @@ pub struct OmpDetail {
     /// A summary of the session's todo list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todos: Option<OmpTodos>,
-    /// The approval or `ask` dialog waiting for an answer.
+    /// The approval or `ask` dialog OMP shows now (the oldest open one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialog: Option<OmpDialog>,
     /// When the integration built the report, unix ms.
@@ -415,9 +415,19 @@ pub struct OmpDialog {
     /// For an approval, a summary of the tool's arguments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// For `ask`, its questions in order.
+    /// For `ask`, its questions in order, at most 10 with at most 20 options each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<OmpQuestion>,
+    /// The ask has more questions or options than `questions` shows; `answer` refuses it.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub truncated: bool,
+    /// How many more dialogs OMP shows after this one. Only this one can be answered.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub queued: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -2598,7 +2598,7 @@
           "type": "object"
         },
         "OmpDetail": {
-          "description": "Live state the OMP integration reports for its root session. A missing field is unknown; a\n`null` one is known to be none.",
+          "description": "Live state the OMP integration reports for its root session. A missing field is unknown or\nnone.",
           "properties": {
             "context": {
               "anyOf": [
@@ -2620,7 +2620,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The approval or `ask` dialog waiting for an answer."
+              "description": "The approval or `ask` dialog OMP shows now (the oldest open one)."
             },
             "model": {
               "description": "The session model, `provider/id`.",
@@ -2680,11 +2680,17 @@
               "$ref": "#/schemas/request/$defs/OmpDialogKind"
             },
             "questions": {
-              "description": "For `ask`, its questions in order.",
+              "description": "For `ask`, its questions in order, at most 10 with at most 20 options each.",
               "items": {
                 "$ref": "#/schemas/request/$defs/OmpQuestion"
               },
               "type": "array"
+            },
+            "queued": {
+              "description": "How many more dialogs OMP shows after this one. Only this one can be answered.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             },
             "summary": {
               "description": "For an approval, a summary of the tool's arguments.",
@@ -2695,6 +2701,10 @@
             },
             "tool": {
               "type": "string"
+            },
+            "truncated": {
+              "description": "The ask has more questions or options than `questions` shows; `answer` refuses it.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -8649,7 +8659,7 @@
           "type": "object"
         },
         "OmpDetail": {
-          "description": "Live state the OMP integration reports for its root session. A missing field is unknown; a\n`null` one is known to be none.",
+          "description": "Live state the OMP integration reports for its root session. A missing field is unknown or\nnone.",
           "properties": {
             "context": {
               "anyOf": [
@@ -8671,7 +8681,7 @@
                   "type": "null"
                 }
               ],
-              "description": "The approval or `ask` dialog waiting for an answer."
+              "description": "The approval or `ask` dialog OMP shows now (the oldest open one)."
             },
             "model": {
               "description": "The session model, `provider/id`.",
@@ -8731,11 +8741,17 @@
               "$ref": "#/schemas/success_response/$defs/OmpDialogKind"
             },
             "questions": {
-              "description": "For `ask`, its questions in order.",
+              "description": "For `ask`, its questions in order, at most 10 with at most 20 options each.",
               "items": {
                 "$ref": "#/schemas/success_response/$defs/OmpQuestion"
               },
               "type": "array"
+            },
+            "queued": {
+              "description": "How many more dialogs OMP shows after this one. Only this one can be answered.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             },
             "summary": {
               "description": "For an approval, a summary of the tool's arguments.",
@@ -8746,6 +8762,10 @@
             },
             "tool": {
               "type": "string"
+            },
+            "truncated": {
+              "description": "The ask has more questions or options than `questions` shows; `answer` refuses it.",
+              "type": "boolean"
             }
           },
           "required": [
