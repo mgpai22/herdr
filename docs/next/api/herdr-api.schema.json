@@ -1228,6 +1228,95 @@
     },
     "request": {
       "$defs": {
+        "AgentActionOp": {
+          "description": "What `agent.action` asks the OMP integration to do.",
+          "oneOf": [
+            {
+              "const": "abort",
+              "description": "Abort the running turn.",
+              "type": "string"
+            },
+            {
+              "const": "set_model",
+              "description": "`args.spec`: a model OMP resolves (`provider/id`, bare id, role alias).",
+              "type": "string"
+            },
+            {
+              "const": "set_thinking",
+              "description": "`args.level`: an OMP thinking level.",
+              "type": "string"
+            },
+            {
+              "const": "compact",
+              "description": "`args.instructions` (optional): compact the session context.",
+              "type": "string"
+            },
+            {
+              "const": "answer",
+              "description": "`args.dialog_id` and the answer: answer the open approval or `ask` dialog.",
+              "type": "string"
+            },
+            {
+              "const": "command",
+              "description": "`args.name` and its `args.args`: run an allow-listed session command while idle.",
+              "type": "string"
+            }
+          ]
+        },
+        "AgentActionParams": {
+          "additionalProperties": false,
+          "description": "A structured action for the exact OMP agent incarnation read by a caller, with the same\nidentity guards as `agent.instruct`.",
+          "properties": {
+            "args": {
+              "additionalProperties": true,
+              "default": {},
+              "description": "The op's arguments: a JSON object of at most 4096 bytes.",
+              "type": "object"
+            },
+            "expected_agent": {
+              "type": "string"
+            },
+            "expected_cwd": {
+              "type": "string"
+            },
+            "expected_name": {
+              "description": "Must equal the agent name; omit only for an agent that has no name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expected_runtime_id": {
+              "type": "string"
+            },
+            "expected_session": {
+              "type": "string"
+            },
+            "expected_terminal_id": {
+              "type": "string"
+            },
+            "expected_workspace_id": {
+              "type": "string"
+            },
+            "op": {
+              "$ref": "#/schemas/request/$defs/AgentActionOp"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "op",
+            "expected_terminal_id",
+            "expected_agent",
+            "expected_session",
+            "expected_runtime_id",
+            "expected_workspace_id",
+            "expected_cwd"
+          ],
+          "type": "object"
+        },
         "AgentInstructParams": {
           "additionalProperties": false,
           "description": "A bounded instruction bound to the exact agent incarnation read by a caller.\nA separate method prevents older servers from silently ignoring the guards.",
@@ -2482,6 +2571,250 @@
           ],
           "type": "string"
         },
+        "OmpContext": {
+          "properties": {
+            "percent": {
+              "description": "Rounded percent of the window in use.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tokens": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "window": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "tokens",
+            "window",
+            "percent"
+          ],
+          "type": "object"
+        },
+        "OmpDetail": {
+          "description": "Live state the OMP integration reports for its root session. A missing field is unknown; a\n`null` one is known to be none.",
+          "properties": {
+            "context": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OmpContext"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Context usage of the active model."
+            },
+            "dialog": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OmpDialog"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The approval or `ask` dialog waiting for an answer."
+            },
+            "model": {
+              "description": "The session model, `provider/id`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thinking": {
+              "description": "The thinking level.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "todos": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OmpTodos"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A summary of the session's todo list."
+            },
+            "tool": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OmpTool"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The latest tool the root session started and has not finished."
+            },
+            "updated_ms": {
+              "description": "When the integration built the report, unix ms.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "updated_ms"
+          ],
+          "type": "object"
+        },
+        "OmpDialog": {
+          "properties": {
+            "id": {
+              "description": "The tool call that opened the dialog; `agent.action` `answer` names it as `dialog_id`.",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/request/$defs/OmpDialogKind"
+            },
+            "questions": {
+              "description": "For `ask`, its questions in order.",
+              "items": {
+                "$ref": "#/schemas/request/$defs/OmpQuestion"
+              },
+              "type": "array"
+            },
+            "summary": {
+              "description": "For an approval, a summary of the tool's arguments.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "tool"
+          ],
+          "type": "object"
+        },
+        "OmpDialogKind": {
+          "enum": [
+            "approval",
+            "ask"
+          ],
+          "type": "string"
+        },
+        "OmpQuestion": {
+          "properties": {
+            "multi": {
+              "type": "boolean"
+            },
+            "options": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "other_allowed": {
+              "description": "A custom text answer is allowed.",
+              "type": "boolean"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "options",
+            "multi",
+            "other_allowed"
+          ],
+          "type": "object"
+        },
+        "OmpTodoPhase": {
+          "properties": {
+            "done": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "total",
+            "done"
+          ],
+          "type": "object"
+        },
+        "OmpTodos": {
+          "properties": {
+            "current": {
+              "description": "The task in progress, else the first pending one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "done": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "phases": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/OmpTodoPhase"
+              },
+              "type": "array"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "total",
+            "done",
+            "phases"
+          ],
+          "type": "object"
+        },
+        "OmpTool": {
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "started_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "call_id",
+            "started_ms"
+          ],
+          "type": "object"
+        },
         "OutputMatch": {
           "oneOf": [
             {
@@ -2517,6 +2850,53 @@
               "type": "object"
             }
           ]
+        },
+        "PaneAckActionParams": {
+          "additionalProperties": false,
+          "description": "Sent by the OMP integration process that consumed an `agent.action` block: the action's\nfinal result.",
+          "properties": {
+            "action_id": {
+              "type": "string"
+            },
+            "agent_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "data": {
+              "additionalProperties": true,
+              "default": {},
+              "description": "The op's result data.",
+              "type": "object"
+            },
+            "error": {
+              "description": "Why the integration refused: a reason token, then `: ` and detail.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "keys": {
+              "description": "Key input Herdr writes to the pane after this ack, one chunk at a time with a short pause\nbetween chunks, so each reaches the dialog that the previous one opened.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "action_id",
+            "agent_pid",
+            "ok"
+          ],
+          "type": "object"
         },
         "PaneAckInstructionParams": {
           "additionalProperties": false,
@@ -3097,6 +3477,10 @@
         },
         "PaneReportAgentSessionV2Params": {
           "properties": {
+            "accepts_actions": {
+              "description": "The same listener also consumes `agent.action` blocks (OMP integration v14+).",
+              "type": "boolean"
+            },
             "accepts_instructions": {
               "description": "The integration consumes `agent.instruct` deliveries (OMP integration v13+).",
               "type": "boolean"
@@ -3245,6 +3629,34 @@
           "required": [
             "pane_id",
             "source"
+          ],
+          "type": "object"
+        },
+        "PaneReportOmpDetailParams": {
+          "additionalProperties": false,
+          "description": "Sent by the process that registered the pane's OMP instruction listener: its live detail.",
+          "properties": {
+            "agent_pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "omp": {
+              "$ref": "#/schemas/request/$defs/OmpDetail"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "runtime_instance": {
+              "description": "The listener's `runtime_instance`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "agent_pid",
+            "runtime_instance",
+            "omp"
           ],
           "type": "object"
         },
@@ -5600,6 +6012,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.action",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentActionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.wait",
               "type": "string"
             },
@@ -6165,6 +6593,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneAckInstructionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.ack_action",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneAckActionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.report_omp_detail",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportOmpDetailParams"
             }
           },
           "required": [
@@ -6752,8 +7212,47 @@
     },
     "success_response": {
       "$defs": {
+        "AgentActionOp": {
+          "description": "What `agent.action` asks the OMP integration to do.",
+          "oneOf": [
+            {
+              "const": "abort",
+              "description": "Abort the running turn.",
+              "type": "string"
+            },
+            {
+              "const": "set_model",
+              "description": "`args.spec`: a model OMP resolves (`provider/id`, bare id, role alias).",
+              "type": "string"
+            },
+            {
+              "const": "set_thinking",
+              "description": "`args.level`: an OMP thinking level.",
+              "type": "string"
+            },
+            {
+              "const": "compact",
+              "description": "`args.instructions` (optional): compact the session context.",
+              "type": "string"
+            },
+            {
+              "const": "answer",
+              "description": "`args.dialog_id` and the answer: answer the open approval or `ask` dialog.",
+              "type": "string"
+            },
+            {
+              "const": "command",
+              "description": "`args.name` and its `args.args`: run an allow-listed session command while idle.",
+              "type": "string"
+            }
+          ]
+        },
         "AgentInfo": {
           "properties": {
+            "accepts_actions": {
+              "description": "The live `runtime_id` process registered an OMP integration listener that also consumes\n`agent.action` (OMP integration v14+).",
+              "type": "boolean"
+            },
             "accepts_instructions": {
               "description": "The live `runtime_id` process registered the OMP integration listener that consumes\n`agent.instruct` deliveries.",
               "type": "boolean"
@@ -6845,6 +7344,17 @@
                 "string",
                 "null"
               ]
+            },
+            "omp": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Live detail the agent's OMP integration reports: model, running tool, context use, todos,\nopen dialog."
             },
             "pane_id": {
               "type": "string"
@@ -8111,6 +8621,250 @@
             "busy"
           ],
           "type": "string"
+        },
+        "OmpContext": {
+          "properties": {
+            "percent": {
+              "description": "Rounded percent of the window in use.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tokens": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "window": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "tokens",
+            "window",
+            "percent"
+          ],
+          "type": "object"
+        },
+        "OmpDetail": {
+          "description": "Live state the OMP integration reports for its root session. A missing field is unknown; a\n`null` one is known to be none.",
+          "properties": {
+            "context": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpContext"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Context usage of the active model."
+            },
+            "dialog": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpDialog"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The approval or `ask` dialog waiting for an answer."
+            },
+            "model": {
+              "description": "The session model, `provider/id`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "thinking": {
+              "description": "The thinking level.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "todos": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpTodos"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "A summary of the session's todo list."
+            },
+            "tool": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpTool"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The latest tool the root session started and has not finished."
+            },
+            "updated_ms": {
+              "description": "When the integration built the report, unix ms.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "updated_ms"
+          ],
+          "type": "object"
+        },
+        "OmpDialog": {
+          "properties": {
+            "id": {
+              "description": "The tool call that opened the dialog; `agent.action` `answer` names it as `dialog_id`.",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/OmpDialogKind"
+            },
+            "questions": {
+              "description": "For `ask`, its questions in order.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/OmpQuestion"
+              },
+              "type": "array"
+            },
+            "summary": {
+              "description": "For an approval, a summary of the tool's arguments.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "tool"
+          ],
+          "type": "object"
+        },
+        "OmpDialogKind": {
+          "enum": [
+            "approval",
+            "ask"
+          ],
+          "type": "string"
+        },
+        "OmpQuestion": {
+          "properties": {
+            "multi": {
+              "type": "boolean"
+            },
+            "options": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "other_allowed": {
+              "description": "A custom text answer is allowed.",
+              "type": "boolean"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "options",
+            "multi",
+            "other_allowed"
+          ],
+          "type": "object"
+        },
+        "OmpTodoPhase": {
+          "properties": {
+            "done": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "total",
+            "done"
+          ],
+          "type": "object"
+        },
+        "OmpTodos": {
+          "properties": {
+            "current": {
+              "description": "The task in progress, else the first pending one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "done": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "phases": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/OmpTodoPhase"
+              },
+              "type": "array"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "total",
+            "done",
+            "phases"
+          ],
+          "type": "object"
+        },
+        "OmpTool": {
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "started_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "call_id",
+            "started_ms"
+          ],
+          "type": "object"
         },
         "PaneDirection": {
           "enum": [
@@ -9847,6 +10601,37 @@
             },
             {
               "properties": {
+                "action_id": {
+                  "type": "string"
+                },
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo",
+                  "description": "The agent when the integration's result arrived."
+                },
+                "data": {
+                  "additionalProperties": true,
+                  "description": "The op's result, as the integration reported it.",
+                  "type": "object"
+                },
+                "op": {
+                  "$ref": "#/schemas/success_response/$defs/AgentActionOp"
+                },
+                "type": {
+                  "const": "agent_action_done",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent",
+                "action_id",
+                "op",
+                "data"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agents": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/AgentInfo"
@@ -10773,6 +11558,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_action": {
+              "default": false,
+              "description": "Supports `agent.action` structured OMP actions acknowledged by the OMP integration.",
+              "type": "boolean"
+            },
             "agent_instruct": {
               "default": false,
               "description": "Supports `agent.instruct` delivery acknowledged by the OMP integration.",

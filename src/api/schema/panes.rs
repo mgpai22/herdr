@@ -407,6 +407,9 @@ pub struct PaneReportAgentSessionV2Params {
     /// The integration consumes `agent.instruct` deliveries (OMP integration v13+).
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub accepts_instructions: bool,
+    /// The same listener also consumes `agent.action` blocks (OMP integration v14+).
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub accepts_actions: bool,
     /// Opaque id of the integration's JS runtime: the same across an extension reload, new after
     /// an exec restart of the same process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -467,6 +470,44 @@ pub struct PaneAckInstructionParams {
     pub agent_pid: u32,
     /// `pending`, `prompt`, `aside` or `dropped`.
     pub outcome: InstructionOutcome,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub peer_pid: Option<u32>,
+}
+
+/// Sent by the OMP integration process that consumed an `agent.action` block: the action's
+/// final result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneAckActionParams {
+    pub pane_id: String,
+    pub action_id: String,
+    pub agent_pid: u32,
+    pub ok: bool,
+    /// Why the integration refused: a reason token, then `: ` and detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The op's result data.
+    #[serde(default)]
+    pub data: serde_json::Map<String, serde_json::Value>,
+    /// Key input Herdr writes to the pane after this ack, one chunk at a time with a short pause
+    /// between chunks, so each reaches the dialog that the previous one opened.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub peer_pid: Option<u32>,
+}
+
+/// Sent by the process that registered the pane's OMP instruction listener: its live detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneReportOmpDetailParams {
+    pub pane_id: String,
+    pub agent_pid: u32,
+    /// The listener's `runtime_instance`.
+    pub runtime_instance: String,
+    pub omp: super::agents::OmpDetail,
     #[serde(skip)]
     #[schemars(skip)]
     pub peer_pid: Option<u32>,

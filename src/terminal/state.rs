@@ -35,6 +35,10 @@ pub(crate) struct HandoffAgentState {
     instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
     #[serde(default)]
     instruction_listener_runtime: Option<String>,
+    #[serde(default)]
+    action_listener: bool,
+    #[serde(default)]
+    omp_detail: Option<crate::api::schema::OmpDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +149,10 @@ pub struct TerminalState {
     pub(crate) instruction_listener: Option<crate::platform::OwnerProcessIncarnation>,
     /// The listener's JS runtime (`runtime_instance` of its report).
     pub(crate) instruction_listener_runtime: Option<String>,
+    /// The same listener also consumes `agent.action` blocks.
+    pub(crate) action_listener: bool,
+    /// The listener process's latest `pane.report_omp_detail`.
+    pub(crate) omp_detail: Option<crate::api::schema::OmpDetail>,
     /// The process whose listener a report without one withdrew (OMP `/restart`, extension
     /// reload), and when; shown as `AgentInfo.listener_withdrawn` until it registers again.
     pub(crate) instruction_listener_withdrawn:
@@ -191,6 +199,8 @@ impl TerminalState {
             persisted_agent_session: None,
             instruction_listener: None,
             instruction_listener_runtime: None,
+            action_listener: false,
+            omp_detail: None,
             instruction_listener_withdrawn: None,
             terminal_title: None,
             manual_label: None,
@@ -255,6 +265,8 @@ impl TerminalState {
             acquisition_pending: self.agent_process_acquisition_pending,
             instruction_listener: self.instruction_listener.clone(),
             instruction_listener_runtime: self.instruction_listener_runtime.clone(),
+            action_listener: self.action_listener,
+            omp_detail: self.omp_detail.clone(),
         })
     }
 
@@ -270,6 +282,8 @@ impl TerminalState {
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
         self.instruction_listener = snapshot.instruction_listener;
         self.instruction_listener_runtime = snapshot.instruction_listener_runtime;
+        self.action_listener = snapshot.action_listener;
+        self.omp_detail = snapshot.omp_detail;
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {

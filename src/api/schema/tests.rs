@@ -748,6 +748,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 agent_start_profile: true,
                 agent_instruct: true,
+                agent_action: true,
             }),
         },
     };

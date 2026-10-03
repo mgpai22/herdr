@@ -77,6 +77,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         // Where `agent.instruct` lacks its guards it refuses, so it is not advertised there and
         // callers keep using `agent.prompt`.
         agent_instruct: crate::app::INSTRUCTIONS_SUPPORTED,
+        agent_action: crate::app::INSTRUCTIONS_SUPPORTED,
     })
 }
 
@@ -280,7 +281,10 @@ fn handle_connection_with_stop(
     match &mut request.method {
         Method::PaneReportAgentSessionV2(params) => params.peer_pid = peer_pid,
         Method::PaneAckInstruction(params) => params.peer_pid = peer_pid,
+        Method::PaneAckAction(params) => params.peer_pid = peer_pid,
+        Method::PaneReportOmpDetail(params) => params.peer_pid = peer_pid,
         Method::AgentInstruct(params) => params.received_at = Some(std::time::Instant::now()),
+        Method::AgentAction(params) => params.received_at = Some(std::time::Instant::now()),
         _ => {}
     }
 
@@ -551,7 +555,10 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentInstruct(_) => "agent.instruct",
+        Method::AgentAction(_) => "agent.action",
         Method::PaneAckInstruction(_) => "pane.ack_instruction",
+        Method::PaneAckAction(_) => "pane.ack_action",
+        Method::PaneReportOmpDetail(_) => "pane.report_omp_detail",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -1461,6 +1468,7 @@ mod tests {
                 ssh_agent_registration: false,
                 agent_start_profile: true,
                 agent_instruct: true,
+                agent_action: true,
             }),
             None,
             None,

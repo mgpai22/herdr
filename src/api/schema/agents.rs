@@ -229,30 +229,204 @@ impl AgentInstructParams {
         {
             return Err("invalid_instruction");
         }
-        if self.expected_terminal_id.is_empty()
-            || self.expected_agent.is_empty()
-            || self.expected_session.is_empty()
-            || self.expected_runtime_id.is_empty()
-            || self.expected_workspace_id.is_empty()
-            || self.expected_cwd.is_empty()
-            || agent.terminal_id != self.expected_terminal_id
-            || agent.name != self.expected_name
-            || agent.agent.as_deref() != Some(self.expected_agent.as_str())
-            || agent.workspace_id != self.expected_workspace_id
+        ExpectedAgent {
+            terminal_id: &self.expected_terminal_id,
+            name: self.expected_name.as_deref(),
+            agent: &self.expected_agent,
+            session: &self.expected_session,
+            runtime_id: &self.expected_runtime_id,
+            workspace_id: &self.expected_workspace_id,
+            cwd: &self.expected_cwd,
+        }
+        .check(agent)
+    }
+}
+
+/// The agent incarnation a caller read before a guarded write.
+struct ExpectedAgent<'a> {
+    terminal_id: &'a str,
+    name: Option<&'a str>,
+    agent: &'a str,
+    session: &'a str,
+    runtime_id: &'a str,
+    workspace_id: &'a str,
+    cwd: &'a str,
+}
+
+impl ExpectedAgent<'_> {
+    fn check(&self, agent: &AgentInfo) -> Result<(), &'static str> {
+        if self.terminal_id.is_empty()
+            || self.agent.is_empty()
+            || self.session.is_empty()
+            || self.runtime_id.is_empty()
+            || self.workspace_id.is_empty()
+            || self.cwd.is_empty()
+            || agent.terminal_id != self.terminal_id
+            || agent.name.as_deref() != self.name
+            || agent.agent.as_deref() != Some(self.agent)
+            || agent.workspace_id != self.workspace_id
             || agent
                 .foreground_cwd
                 .as_deref()
                 .filter(|cwd| !cwd.is_empty())
                 .or(agent.cwd.as_deref())
-                != Some(self.expected_cwd.as_str())
-            || agent.runtime_id.as_deref() != Some(self.expected_runtime_id.as_str())
-            || agent.agent_session.as_ref().map(|s| s.value.as_str())
-                != Some(self.expected_session.as_str())
+                != Some(self.cwd)
+            || agent.runtime_id.as_deref() != Some(self.runtime_id)
+            || agent.agent_session.as_ref().map(|s| s.value.as_str()) != Some(self.session)
         {
             return Err("agent_identity_changed");
         }
         Ok(())
     }
+}
+
+/// What `agent.action` asks the OMP integration to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActionOp {
+    /// Abort the running turn.
+    Abort,
+    /// `args.spec`: a model OMP resolves (`provider/id`, bare id, role alias).
+    SetModel,
+    /// `args.level`: an OMP thinking level.
+    SetThinking,
+    /// `args.instructions` (optional): compact the session context.
+    Compact,
+    /// `args.dialog_id` and the answer: answer the open approval or `ask` dialog.
+    Answer,
+    /// `args.name` and its `args.args`: run an allow-listed session command while idle.
+    Command,
+}
+
+/// A structured action for the exact OMP agent incarnation read by a caller, with the same
+/// identity guards as `agent.instruct`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentActionParams {
+    pub target: String,
+    pub op: AgentActionOp,
+    /// The op's arguments: a JSON object of at most 4096 bytes.
+    #[serde(default)]
+    pub args: serde_json::Map<String, serde_json::Value>,
+    pub expected_terminal_id: String,
+    /// Must equal the agent name; omit only for an agent that has no name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_name: Option<String>,
+    pub expected_agent: String,
+    pub expected_session: String,
+    pub expected_runtime_id: String,
+    pub expected_workspace_id: String,
+    pub expected_cwd: String,
+    /// When the socket server read the request; set by the server, never by the caller.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub received_at: Option<std::time::Instant>,
+}
+
+impl AgentActionParams {
+    pub(crate) fn validate(&self, agent: &AgentInfo) -> Result<(), &'static str> {
+        if serde_json::to_string(&self.args).map_or(true, |args| args.len() > 4096) {
+            return Err("invalid_request");
+        }
+        ExpectedAgent {
+            terminal_id: &self.expected_terminal_id,
+            name: self.expected_name.as_deref(),
+            agent: &self.expected_agent,
+            session: &self.expected_session,
+            runtime_id: &self.expected_runtime_id,
+            workspace_id: &self.expected_workspace_id,
+            cwd: &self.expected_cwd,
+        }
+        .check(agent)
+    }
+}
+
+/// Live state the OMP integration reports for its root session. A missing field is unknown; a
+/// `null` one is known to be none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpDetail {
+    /// The session model, `provider/id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The thinking level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// The latest tool the root session started and has not finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<OmpTool>,
+    /// Context usage of the active model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<OmpContext>,
+    /// A summary of the session's todo list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todos: Option<OmpTodos>,
+    /// The approval or `ask` dialog waiting for an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<OmpDialog>,
+    /// When the integration built the report, unix ms.
+    pub updated_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpTool {
+    pub name: String,
+    pub call_id: String,
+    pub started_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpContext {
+    pub tokens: u64,
+    pub window: u64,
+    /// Rounded percent of the window in use.
+    pub percent: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpTodos {
+    pub total: u32,
+    pub done: u32,
+    /// The task in progress, else the first pending one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    pub phases: Vec<OmpTodoPhase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpTodoPhase {
+    pub name: String,
+    pub total: u32,
+    pub done: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OmpDialogKind {
+    Approval,
+    Ask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpDialog {
+    /// The tool call that opened the dialog; `agent.action` `answer` names it as `dialog_id`.
+    pub id: String,
+    pub kind: OmpDialogKind,
+    pub tool: String,
+    /// For an approval, a summary of the tool's arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// For `ask`, its questions in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<OmpQuestion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpQuestion {
+    pub text: String,
+    pub options: Vec<String>,
+    pub multi: bool,
+    /// A custom text answer is allowed.
+    pub other_allowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -288,6 +462,14 @@ pub struct AgentInfo {
     /// `agent.instruct` deliveries.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub accepts_instructions: bool,
+    /// The live `runtime_id` process registered an OMP integration listener that also consumes
+    /// `agent.action` (OMP integration v14+).
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub accepts_actions: bool,
+    /// Live detail the agent's OMP integration reports: model, running tool, context use, todos,
+    /// open dialog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp: Option<OmpDetail>,
     /// The agent's OMP integration had an instruction listener and withdrew it when OMP shut
     /// its session down (`/restart`, extension reload); it registers again within seconds.
     /// False for an agent that never registered one. Shown for at most 30 seconds.
