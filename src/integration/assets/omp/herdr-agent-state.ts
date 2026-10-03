@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=13
+// HERDR_INTEGRATION_VERSION=14
 // @ts-nocheck
 
 import net from "node:net";
@@ -18,9 +18,15 @@ const source = "herdr:omp";
 // a parent session's shell inherits it, so that process is not the pane's root
 // agent and must not report its short-lived session over the parent's.
 const nestedOmpSession = process.env.OMPCODE === "1";
+// herdr sets TERM_PROGRAM=herdr in its panes. A terminal or multiplexer started inside a pane
+// (tern, tmux) inherits the HERDR_* variables but sets its own TERM_PROGRAM, and an OMP running
+// there is not the agent of the pane those variables name.
+const inHerdrPane = process.env.TERM_PROGRAM === "herdr";
 
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId && !nestedOmpSession;
+  return (
+    HERDR_ENV === "1" && !!socketPath && !!paneId && !nestedOmpSession && inHerdrPane
+  );
 }
 
 let requestQueue: Promise<boolean> = Promise.resolve(true);
@@ -115,6 +121,9 @@ const runtimeInstance = (runtimeSlot[RUNTIME_KEY] ??= crypto.randomUUID());
 // paste to input listeners as one string, plus an Enter typed in the same read.
 const INSTRUCTION =
   /^\x1b\[200~herdr-instruction:v3:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+// A herdr `agent.action` block: the same framing and token rules, around `{"op","args"}` JSON.
+const ACTION =
+  /^\x1b\[200~herdr-action:v1:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
 // herdr sets the expiry a few seconds ahead; a block claiming a later one is not herdr's.
 const instructionExpiryCapMs = 10_000;
 // herdr follows a taken delivery this long; a later ack only gets instruction_not_found.
@@ -156,6 +165,114 @@ function ackInstruction(
     },
   }));
 }
+
+// The final result of an `agent.action`. `error` starts with a reason token. `keys`: input herdr
+// writes after this ack (a dialog answer), at most two chunks with a short pause between them.
+function ackAction(
+  actionId: string,
+  result: { ok: boolean; error?: string; data?: Record<string, unknown>; keys?: string[] },
+): Promise<boolean> {
+  return sendRequestNow(() => ({
+    id: `${source}:action:${actionId}:${Date.now()}`,
+    method: "pane.ack_action",
+    params: {
+      pane_id: paneId,
+      action_id: actionId,
+      agent_pid: process.pid,
+      ok: result.ok,
+      ...(result.error ? { error: result.error } : {}),
+      data: result.data ?? {},
+      ...(result.keys?.length ? { keys: result.keys } : {}),
+    },
+  }));
+}
+
+function cap(text: unknown, max = 500): string {
+  const value = typeof text === "string" ? text : String(text ?? "");
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+// Mirrors OMP's getLatestTodoPhasesFromEntries (tools/todo.ts): the newest todo tool result, or
+// the `user_todo_edit` entry the eval bridge persists for `tool.todo`.
+function entryPhases(entry: any): unknown[] | undefined {
+  if (entry?.type === "custom" && entry.customType === "user_todo_edit") {
+    return Array.isArray(entry.data?.phases) ? entry.data.phases : undefined;
+  }
+  const message = entry?.type === "message" ? entry.message : undefined;
+  if (
+    message?.role !== "toolResult" ||
+    message.toolName !== "todo" ||
+    message.isError ||
+    message.details?.op === "view"
+  ) {
+    return undefined;
+  }
+  return Array.isArray(message.details?.phases) ? message.details.phases : undefined;
+}
+
+function sessionEntries(ctx: any): any[] {
+  try {
+    const entries = ctx?.sessionManager?.getBranch?.() ?? ctx?.sessionManager?.getEntries?.();
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+}
+
+function todoSummary(ctx: any) {
+  const entries = sessionEntries(ctx);
+  let phases: any[] | undefined;
+  for (let i = entries.length - 1; i >= 0 && !phases; i -= 1) {
+    phases = entryPhases(entries[i]) as any[] | undefined;
+  }
+  if (!phases) return undefined;
+  const tasksOf = (phase: any) => (Array.isArray(phase?.tasks) ? phase.tasks : []);
+  const counted = (tasks: any[]) => tasks.filter((task) => task?.status !== "abandoned");
+  const done = (tasks: any[]) => tasks.filter((task) => task?.status === "completed").length;
+  const tasks = phases.flatMap(tasksOf);
+  const current =
+    tasks.find((task) => task?.status === "in_progress") ??
+    tasks.find((task) => task?.status === "pending");
+  return {
+    total: counted(tasks).length,
+    done: done(tasks),
+    ...(typeof current?.content === "string" ? { current: cap(current.content) } : {}),
+    phases: phases.slice(0, 20).map((phase) => ({
+      name: cap(phase?.name, 120),
+      total: counted(tasksOf(phase)).length,
+      done: done(tasksOf(phase)),
+    })),
+  };
+}
+
+// Plan mode as the session file records it: OMP gives extensions no other view of it.
+function planMode(ctx: any): "plan" | "paused" | "off" {
+  const entries = sessionEntries(ctx);
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    if (entries[i]?.type !== "mode_change") continue;
+    const mode = entries[i].mode;
+    return mode === "plan" ? "plan" : mode === "plan_paused" ? "paused" : "off";
+  }
+  return "off";
+}
+
+// OMP's thinking selectors (`auto`, `off` and the effort levels).
+const THINKING_LEVELS: Record<string, true> = {
+  auto: true,
+  off: true,
+  minimal: true,
+  low: true,
+  medium: true,
+  high: true,
+  xhigh: true,
+  max: true,
+};
+// A collapsed large paste in OMP's editor; its text lives outside the editor buffer, so a draft
+// that holds one cannot be saved and restored as text.
+const PASTE_MARKER = /\[Paste #\d+(?:, (?:\+\d+ lines|\d+ chars))?\]/;
+const KEY_UP = "\x1b[A";
+const KEY_DOWN = "\x1b[B";
+const KEY_ENTER = "\r";
 
 // Matches the text of the user message OMP starts the turn with: the delivered text, with each
 // model mention allowed to have been rewritten.
@@ -256,11 +373,15 @@ function sessionReport(sessionStartSource: string, sessionRef: Record<string, un
       launch_profile: launchProfile,
       agent_pid: process.pid,
       accepts_instructions: instructionListener,
+      accepts_actions: instructionListener,
       runtime_instance: runtimeInstance,
       ...sessionRef,
     },
   };
 }
+
+// Set by the root session's binding: queues an `omp` detail report (at once when `now`).
+let reportDetailSoon: ((now?: boolean) => void) | undefined;
 
 async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
   const sessionRef = currentSessionRef();
@@ -278,6 +399,8 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
   const delivered = await sendRequest(() => sessionReport(sessionStartSource, sessionRef));
   if (delivered && currentSessionKey() === sessionKey) {
     registeredSessionKey = sessionKey;
+    // herdr drops the detail of a listener it replaces.
+    if (instructionListener) reportDetailSoon?.(true);
   } else if (!delivered && currentSessionKey() === sessionKey && attempt < sessionRetryLimit) {
     sessionRetryTimer = setTimeout(() => {
       sessionRetryTimer = undefined;
@@ -527,6 +650,439 @@ export default function (pi) {
     admissionTimer.unref?.();
   }
 
+  // ---- Live detail (`AgentInfo.omp`) and structured actions (`agent.action`). ----
+
+  // The latest root-session context, for the detail fields an event does not carry.
+  let detailCtx: any;
+  let detailTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastDetailAt = 0;
+  // Tools the root session started and has not finished, oldest first.
+  const runningTools = new Map<string, { name: string; call_id: string; started_ms: number }>();
+  // `tool_call` input by call id: OMP asks for approval after it and names only the call id.
+  const toolInputs = new Map<string, unknown>();
+  // The approval or `ask` dialog on screen, as `AgentInfo.omp.dialog` shows it.
+  let dialog: any;
+  // Dialogs that closed lately, so a late answer says it lost the race.
+  const closedDialogs: string[] = [];
+  // A person's draft cleared so an `ask` dialog takes keys; restored when the dialog closes.
+  let dialogDraft: { id: string; text: string } | undefined;
+  // Answer keys herdr writes after the ack; they reach the dialog only while it is still open.
+  let armedKeys: { dialogId: string; rest: string; until: number } | undefined;
+  // A session command waiting for the editor to submit `/herdr-action <id>`.
+  let pendingCommand:
+    | {
+        id: string;
+        run: (cctx: any) => Promise<{ cancelled?: boolean } | undefined>;
+        draft: string;
+        finish: (result: { ok: boolean; error?: string; data?: Record<string, unknown> }) => void;
+        timer: ReturnType<typeof setTimeout>;
+      }
+    | undefined;
+
+  function buildDetail() {
+    const ctx = detailCtx;
+    const detail: Record<string, unknown> = { updated_ms: Date.now() };
+    const model = ctx?.model;
+    if (model?.provider && model?.id) detail.model = cap(`${model.provider}/${model.id}`, 200);
+    try {
+      const thinking = pi.getThinkingLevel?.();
+      if (typeof thinking === "string") detail.thinking = thinking;
+    } catch {}
+    const tool = [...runningTools.values()].at(-1);
+    if (tool) detail.tool = tool;
+    try {
+      const usage = ctx?.getContextUsage?.();
+      if (Number.isFinite(usage?.tokens) && Number.isFinite(usage?.contextWindow)) {
+        detail.context = {
+          tokens: Math.max(0, Math.round(usage.tokens)),
+          window: Math.max(0, Math.round(usage.contextWindow)),
+          percent: Math.max(0, Math.round(Number(usage.percent) || 0)),
+        };
+      }
+    } catch {}
+    const todos = todoSummary(ctx);
+    if (todos) detail.todos = todos;
+    if (dialog) detail.dialog = dialog;
+    return detail;
+  }
+
+  function sendDetail() {
+    clearTimeout(detailTimer);
+    detailTimer = undefined;
+    if (!rootSession || !instructionListener || !detailCtx) return;
+    lastDetailAt = Date.now();
+    void sendRequest(() => ({
+      id: `${source}:detail:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      method: "pane.report_omp_detail",
+      params: {
+        pane_id: paneId,
+        agent_pid: process.pid,
+        runtime_instance: runtimeInstance,
+        omp: buildDetail(),
+      },
+    }));
+  }
+
+  // At most one report a second for usage and tool churn; a dialog reports at once.
+  function scheduleDetail(ctx?: any, now = false) {
+    if (ctx) detailCtx = ctx;
+    if (now) {
+      sendDetail();
+      return;
+    }
+    if (detailTimer) return;
+    detailTimer = setTimeout(sendDetail, Math.max(0, 1000 - (Date.now() - lastDetailAt)));
+    detailTimer.unref?.();
+  }
+
+  function openDialog(next: any) {
+    dialog = next;
+    scheduleDetail(undefined, true);
+  }
+
+  function closeDialog(id: string | undefined) {
+    if (!id || dialog?.id !== id) return;
+    dialog = undefined;
+    closedDialogs.push(id);
+    closedDialogs.splice(0, closedDialogs.length - 16);
+    if (dialogDraft?.id === id) {
+      const ui = detailCtx?.ui;
+      if (!(ui?.getEditorText?.() ?? "")) ui?.setEditorText?.(dialogDraft.text);
+      dialogDraft = undefined;
+    }
+    scheduleDetail(undefined, true);
+  }
+
+  // Keys that choose the answer in OMP 18.4.4's dialogs. Cursor moves stop at the first and last
+  // rows (no wrap), so moving up past the top first makes each answer independent of where the
+  // cursor is. Approval: Approve, Deny. Ask: each question lists its options, then "Other";
+  // Enter picks (single) or confirms (multi, Space toggles) and moves to the next question; a
+  // dialog with several questions or a multi-select one ends on a review tab that Enter submits.
+  // "Other" opens an editor for the custom text, so the text goes in a second chunk.
+  function answerKeys(open: any, args: any): { keys: string[] } | { error: string } {
+    if (open.kind === "approval") {
+      if (typeof args.approve !== "boolean") {
+        return { error: "invalid_args: an approval answer needs approve: true or false" };
+      }
+      return { keys: [args.approve ? KEY_UP + KEY_ENTER : KEY_DOWN + KEY_ENTER] };
+    }
+    const questions = open.questions;
+    const answers =
+      questions.length === 1 && !Array.isArray(args.answers) ? [args] : args.answers;
+    if (!Array.isArray(answers) || answers.length !== questions.length) {
+      return { error: `invalid_args: give answers, one per question (${questions.length})` };
+    }
+    const chunks = [""];
+    for (const [index, question] of questions.entries()) {
+      const answer = answers[index] ?? {};
+      const count = question.options.length;
+      const kinds = ["option_index", "selections", "text"].filter((key) => answer[key] !== undefined);
+      if (kinds.length !== 1) {
+        return {
+          error: `invalid_args: question ${index + 1} needs exactly one of option_index, selections, text`,
+        };
+      }
+      const top = KEY_UP.repeat(count + 1);
+      if (answer.text !== undefined) {
+        const text = answer.text;
+        if (typeof text !== "string" || !text.trim() || text.length > 2000 || /[\x00-\x1f\x7f]/.test(text)) {
+          return { error: `invalid_args: question ${index + 1} text must be one line of 1-2000 characters` };
+        }
+        if (chunks.length > 1) {
+          return { error: "invalid_args: at most one text answer per action" };
+        }
+        chunks[0] += KEY_DOWN.repeat(count + 1) + KEY_ENTER;
+        chunks.push(text + KEY_ENTER);
+      } else if (answer.option_index !== undefined) {
+        const option = answer.option_index;
+        if (question.multi || !Number.isInteger(option) || option < 0 || option >= count) {
+          return { error: `invalid_args: question ${index + 1} takes option_index 0-${count - 1} only when single-select` };
+        }
+        chunks[chunks.length - 1] += top + KEY_DOWN.repeat(option) + KEY_ENTER;
+      } else {
+        const picked = answer.selections;
+        if (
+          !question.multi ||
+          !Array.isArray(picked) ||
+          picked.length === 0 ||
+          new Set(picked).size !== picked.length ||
+          picked.some((option) => !Number.isInteger(option) || option < 0 || option >= count)
+        ) {
+          return { error: `invalid_args: question ${index + 1} takes distinct selections 0-${count - 1} only when multi-select` };
+        }
+        const last = Math.max(...picked);
+        let keys = top;
+        for (let row = 0; row <= last; row += 1) {
+          if (picked.includes(row)) keys += " ";
+          keys += row < last ? KEY_DOWN : KEY_ENTER;
+        }
+        chunks[chunks.length - 1] += keys;
+      }
+    }
+    if (questions.length > 1 || questions.some((question) => question.multi)) {
+      chunks[chunks.length - 1] += KEY_ENTER;
+    }
+    return { keys: chunks.filter(Boolean) };
+  }
+
+  // Passes armed answer keys to the dialog they were made for, and swallows them once it has
+  // closed, so they never move through the editor's history or edit a draft.
+  function armedKey(data: string): "pass" | "consume" | undefined {
+    if (!armedKeys) return undefined;
+    if (Date.now() > armedKeys.until || !armedKeys.rest.startsWith(data)) {
+      armedKeys = undefined;
+      return undefined;
+    }
+    armedKeys.rest = armedKeys.rest.slice(data.length);
+    const open = dialog?.id === armedKeys.dialogId;
+    if (!armedKeys.rest) armedKeys = undefined;
+    return open ? "pass" : "consume";
+  }
+
+  // Runs an `agent.action` block. Returns the input result for OMP: the block is consumed, or
+  // replaced by an Enter that submits a session command the editor now holds.
+  function takeAction(ctx: any, data: string) {
+    const match = ACTION.exec(data);
+    if (!match) {
+      return undefined;
+    }
+    const [, actionId, expiresMs, byteLength, token, body, enter] = match;
+    if (token !== runtimeInstance || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
+      return undefined;
+    }
+    const rest = enter ? { data: enter } : { consume: true };
+    if (Date.now() > Number(expiresMs) || Buffer.byteLength(body, "utf8") !== Number(byteLength)) {
+      void reportSession();
+      return rest;
+    }
+    const finish = (result: {
+      ok: boolean;
+      error?: string;
+      data?: Record<string, unknown>;
+      keys?: string[];
+    }) => {
+      void ackAction(actionId, result).then((acked) => {
+        // A lost ack withdraws the listener in herdr until the next session report.
+        if (!acked) void reportSession();
+      });
+      scheduleDetail(ctx);
+    };
+    const refuse = (error: string) => {
+      finish({ ok: false, error });
+      return rest;
+    };
+    let request: any;
+    try {
+      request = JSON.parse(body);
+    } catch {
+      return refuse("invalid_args: the action body is not JSON");
+    }
+    const args = request?.args && typeof request.args === "object" ? request.args : {};
+    const idle = ctx?.isIdle?.() === true;
+    switch (request?.op) {
+      case "abort": {
+        ctx?.abort?.();
+        finish({ ok: true, data: { was_idle: idle } });
+        return rest;
+      }
+      case "set_model": {
+        const spec = args.spec;
+        if (typeof spec !== "string" || !spec.trim() || spec.length > 200) {
+          return refuse("invalid_args: set_model needs spec");
+        }
+        const model = ctx?.models?.resolve?.(spec.trim());
+        if (!model) return refuse(`unknown_model: no available model matches ${cap(spec, 200)}`);
+        Promise.resolve(pi.setModel(model)).then(
+          (applied) =>
+            finish(
+              applied
+                ? { ok: true, data: { model: `${model.provider}/${model.id}` } }
+                : { ok: false, error: `model_unavailable: ${model.provider}/${model.id} has no API key` },
+            ),
+          (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
+        );
+        return rest;
+      }
+      case "set_thinking": {
+        const level = args.level;
+        if (typeof level !== "string" || !Object.hasOwn(THINKING_LEVELS, level)) {
+          return refuse(`invalid_level: use one of ${Object.keys(THINKING_LEVELS).join(", ")}`);
+        }
+        try {
+          pi.setThinkingLevel(level);
+        } catch (error) {
+          return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+        }
+        finish({ ok: true, data: { thinking: pi.getThinkingLevel?.() ?? level } });
+        return rest;
+      }
+      case "compact": {
+        const instructions = args.instructions;
+        if (instructions !== undefined && (typeof instructions !== "string" || instructions.length > 2000)) {
+          return refuse("invalid_args: instructions must be a string of at most 2000 characters");
+        }
+        if (!idle || compacting) return refuse("not_idle: compact only an idle session");
+        // Compaction runs a model call; its end shows in the session, not in this result.
+        Promise.resolve(ctx?.compact?.(instructions || undefined)).catch(() => {});
+        finish({ ok: true, data: { started: true } });
+        return rest;
+      }
+      case "answer":
+        return answerDialog(ctx, args, finish, refuse, rest);
+      case "command":
+        return runCommand(ctx, args, actionId, idle, finish, refuse, rest);
+      default:
+        return refuse(`unsupported_op: ${cap(request?.op, 40)}`);
+    }
+  }
+
+  function answerDialog(ctx: any, args: any, finish: any, refuse: any, rest: any) {
+    const id = args.dialog_id;
+    if (typeof id !== "string" || !id) return refuse("invalid_args: answer needs dialog_id");
+    if (dialog?.id !== id) {
+      if (closedDialogs.includes(id)) return refuse("answered_by_other: the dialog closed before this answer");
+      return refuse(dialog ? "dialog_changed: another dialog is open now" : "no_dialog: no dialog is open");
+    }
+    const answer = answerKeys(dialog, args);
+    if ("error" in answer) return refuse(answer.error);
+    // OMP sends every key to a person's unfinished draft while an `ask` dialog is open.
+    if (dialog.kind === "ask") {
+      const draft = ctx?.ui?.getEditorText?.() ?? "";
+      if (draft && PASTE_MARKER.test(draft)) {
+        return refuse("draft_open: the person's draft holds a collapsed paste; it must be sent or cleared first");
+      }
+      if (draft) {
+        dialogDraft = { id, text: draft };
+        ctx.ui.setEditorText("");
+      }
+    }
+    armedKeys = { dialogId: id, rest: answer.keys.join(""), until: Date.now() + 5000 };
+    finish({ ok: true, data: { dialog_id: id }, keys: answer.keys });
+    return rest;
+  }
+
+  // Session commands run from an extension command handler, the only place OMP offers them:
+  // the editor submits `/herdr-action <id>` and the handler runs the command.
+  function runCommand(ctx: any, args: any, actionId: string, idle: boolean, finish: any, refuse: any, rest: any) {
+    const name = args.name;
+    const sub = args.args && typeof args.args === "object" ? args.args : {};
+    if (name === "name") {
+      const title = sub.title;
+      if (typeof title !== "string" || !title.trim() || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) {
+        return refuse("invalid_args: name needs a one-line title of at most 200 characters");
+      }
+      Promise.resolve(pi.setSessionName(title.trim())).then(
+        () => finish({ ok: true, data: { name: title.trim() } }),
+        (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
+      );
+      return rest;
+    }
+    if (!idle || compacting) return refuse("not_idle: session commands run only on an idle session");
+    if (dialog) return refuse("dialog_open: a dialog is open");
+    if (pendingCommand) return refuse("busy: another session command is running");
+    const ui = ctx?.ui;
+    const draft = ui?.getEditorText?.() ?? "";
+    if (PASTE_MARKER.test(draft)) {
+      return refuse("draft_open: the person's draft holds a collapsed paste; it must be sent or cleared first");
+    }
+    let run: (cctx: any) => Promise<{ cancelled?: boolean } | undefined>;
+    switch (name) {
+      case "new_session":
+        run = (cctx) => cctx.newSession();
+        break;
+      case "switch_session": {
+        const target = sub.path;
+        if (!isAbsoluteSessionPath(target)) return refuse("invalid_args: switch_session needs an absolute path");
+        run = (cctx) => cctx.switchSession(target);
+        break;
+      }
+      case "branch": {
+        const entry = sub.entry_id;
+        if (typeof entry !== "string" || !entry) return refuse("invalid_args: branch needs entry_id");
+        run = (cctx) => cctx.branch(entry);
+        break;
+      }
+      case "plan":
+        return setPlanMode(ctx, sub, draft, finish, refuse, rest);
+      default:
+        return refuse(`unsupported_op: command ${cap(name, 40)}`);
+    }
+    const submit = `/herdr-action ${actionId}`;
+    pendingCommand = {
+      id: actionId,
+      run,
+      draft,
+      finish,
+      // The Enter went elsewhere (a picker a person opened takes it): nothing ran.
+      timer: setTimeout(() => {
+        if (pendingCommand?.id !== actionId) return;
+        pendingCommand = undefined;
+        const text = ui?.getEditorText?.() ?? "";
+        if (text === submit || !text) ui?.setEditorText?.(draft);
+        finish({ ok: false, error: "not_submitted: OMP's editor did not submit the command" });
+      }, 2000),
+    };
+    pendingCommand.timer.unref?.();
+    ui?.setEditorText?.(submit);
+    return { data: KEY_ENTER };
+  }
+
+  // `/plan` toggles off -> on -> paused -> off, and leaving plan mode with a drafted plan opens a
+  // confirm dialog, so only entering plan mode from off is driven; the rest is a no-op or refused.
+  function setPlanMode(ctx: any, sub: any, draft: string, finish: any, refuse: any, rest: any) {
+    if (typeof sub.on !== "boolean") return refuse("invalid_args: plan needs on: true or false");
+    const mode = planMode(ctx);
+    if (sub.on ? mode === "plan" : mode !== "plan") {
+      finish({ ok: true, data: { mode } });
+      return rest;
+    }
+    if (!sub.on) {
+      return refuse("unsupported_op: leaving plan mode can open a confirm dialog in OMP 18.4.4");
+    }
+    if (mode === "paused") {
+      return refuse("plan_paused: plan mode is paused; resuming it needs a prompt");
+    }
+    const ui = ctx?.ui;
+    ui?.setEditorText?.("/plan");
+    const until = Date.now() + 3000;
+    const poll = setInterval(() => {
+      const now = planMode(ctx);
+      if (now !== "plan" && Date.now() < until) return;
+      clearInterval(poll);
+      if (draft && !(ui?.getEditorText?.() ?? "")) ui?.setEditorText?.(draft);
+      finish(
+        now === "plan"
+          ? { ok: true, data: { mode: now } }
+          : { ok: false, error: "failed: plan mode did not start (setting plan.enabled, goal or vibe mode)" },
+      );
+    }, 100);
+    poll.unref?.();
+    return { data: KEY_ENTER };
+  }
+
+  pi.registerCommand?.("herdr-action", {
+    description: "herdr remote control (internal; runs a pending agent.action)",
+    handler: async (args: string, cctx: any) => {
+      const job = pendingCommand;
+      if (!job || job.id !== String(args ?? "").trim()) return;
+      clearTimeout(job.timer);
+      pendingCommand = undefined;
+      let result: { ok: boolean; error?: string; data?: Record<string, unknown> };
+      try {
+        const outcome = await job.run(cctx);
+        const file = cctx?.sessionManager?.getSessionFile?.();
+        result = outcome?.cancelled
+          ? { ok: false, error: "cancelled: OMP or an extension cancelled the session change" }
+          : { ok: true, data: isAbsoluteSessionPath(file) ? { session_path: file } : {} };
+      } catch (error) {
+        result = { ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` };
+      }
+      // A branch puts the branched prompt into the editor; keep it.
+      if (job.draft && !(cctx?.ui?.getEditorText?.() ?? "")) cctx?.ui?.setEditorText?.(job.draft);
+      job.finish(result);
+    },
+  });
+
   function registerInstructionListener(ctx: {
     isIdle?: () => boolean;
     ui?: { onTerminalInput?: (handler: (data: string) => unknown) => unknown };
@@ -535,9 +1091,12 @@ export default function (pi) {
     // reload), sometimes without a session event, so each activation and each turn start
     // registers a fresh one.
     unsubscribeInstructions?.();
-    unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) =>
-      takeInstruction(ctx, data),
-    );
+    unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => {
+      const armed = armedKey(data);
+      if (armed === "consume") return { consume: true };
+      if (armed === "pass") return undefined;
+      return takeAction(ctx, data) ?? takeInstruction(ctx, data);
+    });
     instructionListener = typeof unsubscribeInstructions === "function";
   }
 
@@ -548,6 +1107,11 @@ export default function (pi) {
     rootSession = true;
     // A new or changed session has no compaction of its own running.
     compacting = false;
+    // A new or changed session has no running tool or open dialog of its own.
+    runningTools.clear();
+    dialog = undefined;
+    detailCtx = ctx;
+    reportDetailSoon = (now) => scheduleDetail(undefined, now);
     registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
@@ -682,6 +1246,7 @@ export default function (pi) {
     clearFailureState();
     agentActive = true;
     publishState();
+    scheduleDetail(ctx);
   });
 
   pi.on("tool_approval_requested", (event, ctx) => {
@@ -690,39 +1255,84 @@ export default function (pi) {
     }
     const label = event?.reason || `${event?.toolName || "Tool"} approval`;
     activateBlocked(label);
+    if (!event?.toolCallId) return;
+    const input: any = toolInputs.get(event.toolCallId) ?? {};
+    let detail = "";
+    try {
+      detail = typeof input?.command === "string" ? input.command : JSON.stringify(input) ?? "";
+    } catch {}
+    openDialog({
+      id: event.toolCallId,
+      kind: "approval",
+      tool: cap(event.toolName || "tool", 120),
+      summary: cap(`${event.toolName ?? "tool"} ${detail}`.trim()),
+    });
   });
 
-  pi.on("tool_approval_resolved", (_event, ctx) => {
+  pi.on("tool_approval_resolved", (event, ctx) => {
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
     deactivateBlocked();
+    closeDialog(event?.toolCallId);
   });
 
   pi.on("tool_execution_start", (event, ctx) => {
     if (event?.toolName !== "ask") {
+      if (rootSession && event?.toolCallId) {
+        runningTools.set(event.toolCallId, {
+          name: cap(event.toolName || "tool", 120),
+          call_id: event.toolCallId,
+          started_ms: Date.now(),
+        });
+        scheduleDetail(ctx);
+      }
       return;
     }
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
     activateBlocked(askBlockedMessage(event.args));
+    const questions = Array.isArray(event.args?.questions) ? event.args.questions : [];
+    detailCtx = ctx ?? detailCtx;
+    openDialog({
+      id: event.toolCallId,
+      kind: "ask",
+      tool: "ask",
+      questions: questions.slice(0, 10).map((question: any) => ({
+        text: cap(question?.question),
+        options: (Array.isArray(question?.options) ? question.options : [])
+          .slice(0, 20)
+          .map((option: any) => cap(option?.label, 200)),
+        multi: question?.multi === true,
+        // OMP 18.4.4 always offers "Other (type your own)".
+        other_allowed: true,
+      })),
+    });
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
     if (event?.toolName !== "ask") {
+      if (rootSession) {
+        runningTools.delete(event?.toolCallId);
+        toolInputs.delete(event?.toolCallId);
+        scheduleDetail(ctx);
+      }
       return;
     }
     if (!rootSession && !activateRootSession(ctx)) {
       return;
     }
     deactivateBlocked();
+    detailCtx = ctx ?? detailCtx;
+    closeDialog(event?.toolCallId);
   });
 
-  pi.on("agent_end", (event) => {
+  pi.on("agent_end", (event, ctx) => {
     if (!rootSession) {
       return;
     }
+    scheduleDetail(ctx);
     if (!agentActive) {
       // OMP can emit duplicate/late end events while auto-retry is already
       // holding the pane in Working. Do not let an unqualified duplicate end
@@ -746,11 +1356,29 @@ export default function (pi) {
     scheduleIdle();
   });
 
+  // Detail for `AgentInfo.omp` from events the state above does not need.
+  pi.on("tool_call", (event) => {
+    if (!rootSession || !event?.toolCallId) return;
+    toolInputs.set(event.toolCallId, event.input);
+    for (const key of toolInputs.keys()) {
+      if (toolInputs.size <= 32) break;
+      toolInputs.delete(key);
+    }
+  });
+  for (const event of ["turn_end", "tool_result"]) {
+    pi.on(event, (_event, ctx) => {
+      if (rootSession) scheduleDetail(ctx);
+    });
+  }
+
   pi.on("session_shutdown", async () => {
     if (!rootSession) {
       return;
     }
     clearPendingTimers();
+    clearTimeout(detailTimer);
+    detailTimer = undefined;
+    armedKeys = undefined;
     unsubscribeInstructions?.();
     unsubscribeInstructions = undefined;
     instructionListener = false;

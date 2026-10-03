@@ -9,6 +9,7 @@ const originalArgv = process.argv;
 const originalCreateConnection = net.createConnection;
 const originalEnvironment = {
   HERDR_ENV: process.env.HERDR_ENV,
+  TERM_PROGRAM: process.env.TERM_PROGRAM,
   HERDR_OMP_IDLE_DEBOUNCE_MS: process.env.HERDR_OMP_IDLE_DEBOUNCE_MS,
   HERDR_OMP_SESSION_RETRY_MS: process.env.HERDR_OMP_SESSION_RETRY_MS,
   HERDR_OMP_INSTRUCTION_POLL_MS: process.env.HERDR_OMP_INSTRUCTION_POLL_MS,
@@ -96,6 +97,7 @@ function configureIntegrationEnvironment(recordingSocketPath: string) {
   delete process.env.OMPCODE;
   delete process.env.OMP_PROFILE;
   delete process.env.PI_PROFILE;
+  process.env.TERM_PROGRAM = "herdr";
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = recordingSocketPath;
   process.env.HERDR_PANE_ID = "test:p1";
@@ -1571,4 +1573,100 @@ test("Oh My Pi without terminal input support reports no instruction listener", 
   await waitFor(() => harness.reports().length === 1);
 
   expect(harness.reports()[0].params.accepts_instructions).toBe(false);
+});
+
+test("OMP stays off in a terminal started inside a herdr pane", async () => {
+  const requests = await startRecordingServer("omp-nested-terminal");
+  // tern or tmux started from a herdr pane keep its HERDR_* variables but set TERM_PROGRAM.
+  process.env.TERM_PROGRAM = "tmux";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  expect(handlers.size).toBe(0);
+  await Bun.sleep(25);
+  expect(requests).toEqual([]);
+});
+
+function actionBlock(id: string, body: unknown, token = runtimeToken()) {
+  const json = JSON.stringify(body);
+  return `\x1b[200~herdr-action:v1:${id}:${Date.now() + 4_000}:${Buffer.byteLength(json, "utf8")}:${token}\n${json}\x1b[201~`;
+}
+
+test("Oh My Pi runs herdr actions and answers only the dialog they name", async () => {
+  let listener: TerminalInputHandler | undefined;
+  const harness = await installOmpWithTerminalInput("omp-action", {
+    onTerminalInput(handler: TerminalInputHandler) {
+      listener = handler;
+      return () => {};
+    },
+    getEditorText: () => "",
+  });
+  let aborted = 0;
+  Object.assign(harness.context, { abort: () => (aborted += 1) });
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  await waitFor(() => harness.reports().length === 1);
+  expect(harness.reports()[0].params.accepts_actions).toBe(true);
+  const acks = () =>
+    harness.requests
+      .filter((request) => isRecord(request) && request.method === "pane.ack_action")
+      .map((request) => (request as { params: Record<string, unknown> }).params);
+  const details = () =>
+    harness.requests
+      .filter((request) => isRecord(request) && request.method === "pane.report_omp_detail")
+      .map((request) => (request as { params: { omp: Record<string, unknown> } }).params.omp);
+  let n = 0;
+  const act = async (body: unknown) => {
+    const id = (++n).toString(16).padStart(32, "0");
+    expect(listener?.(actionBlock(id, body))).toEqual({ consume: true });
+    await waitFor(() => acks().some((ack) => ack.action_id === id));
+    return acks().find((ack) => ack.action_id === id)!;
+  };
+
+  expect(await act({ op: "abort", args: {} })).toMatchObject({ ok: true, data: { was_idle: true } });
+  expect(aborted).toBe(1);
+  expect((await act({ op: "set_thinking", args: { level: "huge" } })).error).toStartWith("invalid_level:");
+  // A block without this runtime's token is a person's paste.
+  expect(listener?.(actionBlock("f".repeat(32), { op: "abort" }, "not-the-token"))).toBeUndefined();
+
+  await harness.handlers.get("tool_call")?.({ toolCallId: "call1", toolName: "bash", input: { command: "rm -r x" } }, harness.context);
+  await harness.handlers.get("tool_approval_requested")?.({ toolCallId: "call1", toolName: "bash" }, harness.context);
+  await waitFor(() => details().some((detail) => isRecord(detail.dialog)));
+  expect(details().at(-1)?.dialog).toEqual({ id: "call1", kind: "approval", tool: "bash", summary: "bash rm -r x" });
+
+  expect((await act({ op: "answer", args: { dialog_id: "call0", approve: true } })).error).toStartWith("dialog_changed:");
+  expect(await act({ op: "answer", args: { dialog_id: "call1", approve: false } })).toMatchObject({
+    ok: true,
+    keys: ["\x1b[B\r"],
+  });
+  // The answer keys reach the open dialog.
+  expect(listener?.("\x1b[B")).toBeUndefined();
+  await harness.handlers.get("tool_approval_resolved")?.({ toolCallId: "call1", approved: false }, harness.context);
+  // Keys that arrive after their dialog closed never reach the editor.
+  expect(listener?.("\r")).toEqual({ consume: true });
+  expect((await act({ op: "answer", args: { dialog_id: "call1", approve: true } })).error).toStartWith("answered_by_other:");
+
+  await harness.handlers.get("tool_execution_start")?.(
+    {
+      toolCallId: "ask1",
+      toolName: "ask",
+      args: {
+        questions: [
+          { question: "Which?", options: [{ label: "a" }, { label: "b" }] },
+          { question: "Some?", options: [{ label: "x" }, { label: "y" }, { label: "z" }], multi: true },
+        ],
+      },
+    },
+    harness.context,
+  );
+  const up = "\x1b[A";
+  const down = "\x1b[B";
+  expect(
+    await act({ op: "answer", args: { dialog_id: "ask1", answers: [{ option_index: 1 }, { selections: [2, 0] }] } }),
+  ).toMatchObject({
+    ok: true,
+    keys: [`${up.repeat(3)}${down}\r${up.repeat(4)} ${down}${down} \r\r`],
+  });
+  expect(
+    (await act({ op: "answer", args: { dialog_id: "ask1", answers: [{ selections: [0] }, { option_index: 0 }] } })).error,
+  ).toStartWith("invalid_args:");
 });
