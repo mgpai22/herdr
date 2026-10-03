@@ -1840,3 +1840,116 @@ test("Oh My Pi reports the input OMP runs and keeps the detail under herdr's lim
     expect(value.isWellFormed()).toBe(true);
   }
 });
+
+// A server that drops every request while `outage` is on, as during a socket blip.
+async function startOutageServer(name: string) {
+  const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
+  socketPath = recordingSocketPath;
+  await rm(recordingSocketPath, { force: true });
+  const received: { method: string; params: Record<string, any> }[] = [];
+  const state = { outage: false };
+  const recordingServer = createServer((socket) => {
+    let input = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      const request = JSON.parse(input.slice(0, newline));
+      if (state.outage) {
+        socket.destroy();
+        return;
+      }
+      received.push(request);
+      socket.end(JSON.stringify({ id: request.id, result: { type: "ok" } }) + "\n");
+    });
+  });
+  server = recordingServer;
+  await new Promise<void>((resolve, reject) => {
+    recordingServer.once("error", reject);
+    recordingServer.listen(recordingSocketPath, resolve);
+  });
+  configureIntegrationEnvironment(recordingSocketPath);
+  process.env.HERDR_OMP_SESSION_RETRY_MS = "50";
+  process.env.HERDR_OMP_IDLE_DEBOUNCE_MS = "0";
+  return { received, state };
+}
+
+test("Oh My Pi sends state and detail again after herdr missed them", async () => {
+  const { received, state } = await startOutageServer("omp-lost-state");
+  let listener: TerminalInputHandler | undefined;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install({ ...pi, getThinkingLevel: () => "high" });
+  let idle = false;
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => idle,
+    ui: {
+      onTerminalInput(handler: TerminalInputHandler) {
+        listener = handler;
+        return () => {};
+      },
+    },
+    sessionManager: { getSessionFile: () => "/tmp/omp-lost.jsonl", getSessionId: () => "omp-lost" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await handlers.get("agent_start")?.({}, context);
+  await handlers.get("tool_execution_start")?.({ toolCallId: "t1", toolName: "bash", args: { command: "sleep 40" } }, context);
+  await waitFor(() => received.some((request) => request.params?.state === "working"));
+  await waitFor(() => received.some((request) => request.params?.omp?.tool?.call_id === "t1"), 3_000);
+
+  // The turn ends while herdr cannot be reached: both attempts of each report are lost.
+  state.outage = true;
+  idle = true;
+  await handlers.get("tool_execution_end")?.({ toolCallId: "t1", toolName: "bash" }, context);
+  await handlers.get("agent_end")?.({ messages: [] }, context);
+  await Bun.sleep(2_600);
+  const before = received.length;
+  state.outage = false;
+
+  // Once herdr answers again, the integration registers and sends the current state and detail.
+  await waitFor(() => received.slice(before).some((request) => request.params?.state === "idle"), 5_000);
+  await waitFor(
+    () => received.slice(before).some((request) => request.method === "pane.report_omp_detail" && !request.params.omp.tool),
+    5_000,
+  );
+  expect(received.slice(before).some((request) => request.method === "pane.report_agent_session_v2")).toBe(true);
+  expect(listener).toBeDefined();
+}, 20_000);
+
+test("Oh My Pi registers again when herdr missed an instruction ack", async () => {
+  const { received, state } = await startOutageServer("omp-lost-instruction-ack");
+  let listener: TerminalInputHandler | undefined;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install({ ...pi, sendUserMessage: () => {} });
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => false,
+    hasPendingMessages: () => false,
+    ui: {
+      onTerminalInput(handler: TerminalInputHandler) {
+        listener = handler;
+        return () => {};
+      },
+    },
+    sessionManager: { getSessionFile: () => "/tmp/omp-lost-ack.jsonl", getSessionId: () => "omp-lost-ack" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.method === "pane.report_agent_session_v2"));
+  // Let the start-up reports settle.
+  await Bun.sleep(500);
+  const sessions = () => received.filter((request) => request.method === "pane.report_agent_session_v2").length;
+  const registered = sessions();
+  state.outage = true;
+  // A busy session takes the instruction as an aside and acks at once; herdr misses the ack and
+  // withdraws the listener, so the integration must register it again.
+  expect(listener?.(instructionBlock("a".repeat(32), "status please"))).toEqual({ consume: true });
+  await Bun.sleep(2_200);
+  state.outage = false;
+  await waitFor(() => sessions() > registered, 5_000);
+  expect(received.filter((request) => request.method === "pane.report_agent_session_v2").at(-1)?.params.accepts_instructions).toBe(true);
+}, 15_000);

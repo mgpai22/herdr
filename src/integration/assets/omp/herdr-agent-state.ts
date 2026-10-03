@@ -163,7 +163,10 @@ function ackInstruction(
       agent_pid: process.pid,
       outcome,
     },
-  }));
+  })).then((acked) => {
+    // herdr withdraws a listener whose delivery it never heard back about.
+    if (!acked) reportLost();
+  });
 }
 
 // The result of an `agent.action`. `error` starts with a reason token. An ack with `keys` (a
@@ -394,8 +397,29 @@ function sessionReport(sessionStartSource: string, sessionRef: Record<string, un
   };
 }
 
-// Set by the root session's binding: queues an `omp` detail report (at once when `now`).
-let reportDetailSoon: ((now?: boolean) => void) | undefined;
+// Set by the root session's binding, called after herdr registered the session: sends the
+// detail again (herdr drops the detail of a listener it replaces), and after a lost report the
+// state too, because herdr keeps whatever it last received.
+let onRegistered: ((lost: boolean) => void) | undefined;
+// A state, detail or ack report that herdr never got. Each report gets two attempts, and a state
+// equal to the last one is not sent again, so a report lost in a socket outage would stay lost
+// until the next change. Recovery re-registers the session (with its own retries) and then sends
+// state and detail again. At most 3 recoveries in a row without a delivered report, so a herdr
+// that refuses a report does not start a loop.
+let reportsLost = false;
+let lossRecoveries = 0;
+
+function reportLost(): void {
+  if (reportsLost || lossRecoveries >= 3) return;
+  reportsLost = true;
+  lossRecoveries += 1;
+  void reportSession();
+}
+
+function reportDelivered(delivered: boolean): void {
+  if (delivered) lossRecoveries = 0;
+  else reportLost();
+}
 
 async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
   const sessionRef = currentSessionRef();
@@ -403,7 +427,10 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
   registeredSessionKey = undefined;
   clearTimeout(sessionRetryTimer);
   sessionRetryTimer = undefined;
-  if (!sessionRef || !sessionKey) return;
+  if (!sessionRef || !sessionKey) {
+    reportsLost = false;
+    return;
+  }
 
   // Each retry attempt mints a fresh id and sequence number. If the server
   // applied the first attempt but its reply was lost, an identical retry
@@ -413,8 +440,9 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
   const delivered = await sendRequest(() => sessionReport(sessionStartSource, sessionRef));
   if (delivered && currentSessionKey() === sessionKey) {
     registeredSessionKey = sessionKey;
-    // herdr drops the detail of a listener it replaces.
-    if (instructionListener) reportDetailSoon?.(true);
+    const lost = reportsLost;
+    reportsLost = false;
+    onRegistered?.(lost);
   } else if (!delivered && currentSessionKey() === sessionKey && attempt < sessionRetryLimit) {
     sessionRetryTimer = setTimeout(() => {
       sessionRetryTimer = undefined;
@@ -423,6 +451,9 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
       }
     }, Math.min(sessionRetryBaseMs * 2 ** attempt, 30_000));
     sessionRetryTimer.unref?.();
+  } else if (!delivered) {
+    // Out of retries, or the session changed: a later lost report may try again.
+    reportsLost = false;
   }
 }
 
@@ -434,7 +465,7 @@ async function sendState(state: AgentState, message?: string): Promise<void> {
   // before it. The session ref is fixed at the first attempt: a retry must
   // not drop a ref that was registered when this report was first sent.
   let params: Record<string, unknown> | undefined;
-  await sendRequest(() => {
+  const delivered = await sendRequest(() => {
     params ??= withRegisteredSessionRef({ pane_id: paneId, source, agent: "omp", state, message });
     return {
       id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
@@ -442,6 +473,7 @@ async function sendState(state: AgentState, message?: string): Promise<void> {
       params: { ...params, seq: nextReportSeq() },
     };
   });
+  reportDelivered(delivered);
 }
 
 let sendInFlight = false;
@@ -791,7 +823,7 @@ export default function (pi) {
         runtime_instance: runtimeInstance,
         omp: buildDetail(),
       },
-    }));
+    })).then(reportDelivered);
   }
 
   // At most one report a second for usage and tool churn; a dialog reports at once.
@@ -990,7 +1022,7 @@ export default function (pi) {
       scheduleDetail(ctx, true);
       void ackAction(actionId, result, true).then((acked) => {
         // A lost ack withdraws the listener in herdr until the next session report.
-        if (!acked) void reportSession();
+        if (!acked) reportLost();
       });
     };
     const refuse = (error: string) => {
@@ -1196,7 +1228,10 @@ export default function (pi) {
     runningTools.clear();
     dialogs = [];
     detailCtx = ctx;
-    reportDetailSoon = (now) => scheduleDetail(undefined, now);
+    onRegistered = (lost) => {
+      if (lost) publishState(true);
+      if (instructionListener) scheduleDetail(undefined, true);
+    };
     registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);

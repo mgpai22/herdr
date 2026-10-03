@@ -1979,12 +1979,9 @@ impl App {
         // The listener took the block, so it exists.
         pending.withdraws_listener = false;
         if !params.keys.is_empty() {
+            // The integration resends a keyed ack whose reply it missed; the keys went out once.
             if std::mem::replace(&mut pending.keys_written, true) {
-                return encode_error(
-                    id,
-                    "invalid_request",
-                    "an action's keys were already written",
-                );
+                return encode_success(id, ResponseResult::Ok {});
             }
             let owner_pid = pending.owner.pid;
             let refusal = match self.lookup_runtime_sender(ws_idx, pane_id) {

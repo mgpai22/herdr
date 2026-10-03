@@ -2886,7 +2886,8 @@ mod tests {
             None,
             vec!["\r".into()],
         );
-        assert!(again.contains("invalid_request"), "{again}");
+        // A resent keyed ack is answered ok, and the keys are not written twice.
+        assert!(again.contains("\"ok\""), "{again}");
         assert!(rx.try_recv().is_err());
         assert!(response.recv_timeout(Duration::from_millis(50)).is_err());
         ack_action(
