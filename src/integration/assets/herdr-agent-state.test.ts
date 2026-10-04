@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { afterEach, expect, setSystemTime, test } from "bun:test";
+import { afterEach, expect, mock, setSystemTime, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -1051,7 +1051,11 @@ type ReportRequest = {
 
 type TerminalInputHandler = (data: string) => { consume?: boolean; data?: string } | undefined;
 
-async function installOmpWithTerminalInput(name: string, ui: Record<string, unknown> | undefined) {
+async function installOmpWithTerminalInput(
+  name: string,
+  ui: Record<string, unknown> | undefined,
+  piExtras: Record<string, unknown> = {},
+) {
   const requests = await startRecordingServer(name);
   const { handlers, pi } = createExtensionHarness();
   const sent: unknown[][] = [];
@@ -1063,6 +1067,7 @@ async function installOmpWithTerminalInput(name: string, ui: Record<string, unkn
   let busyOnSend = true;
   install({
     ...pi,
+    ...piExtras,
     sendUserMessage: (...args: unknown[]) => {
       sent.push(args);
       if (busyOnSend) {
@@ -1597,17 +1602,22 @@ function actionBlock(id: string, body: unknown, token = runtimeToken()) {
   return `\x1b[200~herdr-action:v1:${id}:${Date.now() + 4_000}:${Buffer.byteLength(json, "utf8")}:${token}\n${json}\nherdr-end:${id}\x1b[201~`;
 }
 
-async function installOmpForActions(name: string) {
+async function installOmpForActions(name: string, piExtras: Record<string, unknown> = {}, uiExtras: Record<string, unknown> = {}) {
   let listener: TerminalInputHandler | undefined;
   let editor = "";
-  const harness = await installOmpWithTerminalInput(name, {
-    onTerminalInput(handler: TerminalInputHandler) {
-      listener = handler;
-      return () => {};
+  const harness = await installOmpWithTerminalInput(
+    name,
+    {
+      onTerminalInput(handler: TerminalInputHandler) {
+        listener = handler;
+        return () => {};
+      },
+      getEditorText: () => editor,
+      setEditorText: (text: string) => (editor = text),
+      ...uiExtras,
     },
-    getEditorText: () => editor,
-    setEditorText: (text: string) => (editor = text),
-  });
+    piExtras,
+  );
   let aborted = 0;
   Object.assign(harness.context, { abort: () => (aborted += 1) });
   await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
@@ -1841,7 +1851,7 @@ test("Oh My Pi reports the input OMP runs and keeps the detail under herdr's lim
   await omp.ask("huge", Array.from({ length: 10 }, () => ({ question: long, options: Array.from({ length: 20 }, () => ({ label: long })) })));
   await waitFor(() => omp.details().at(-1)?.dialog?.id === "huge");
   const request = omp.harness.requests.filter((entry) => isRecord(entry) && entry.method === "pane.report_omp_detail").at(-1);
-  expect(Buffer.byteLength(JSON.stringify((request as { params: { omp: unknown } }).params.omp), "utf8")).toBeLessThanOrEqual(16 * 1024);
+  expect(Buffer.byteLength(JSON.stringify((request as { params: { omp: unknown } }).params.omp), "utf8")).toBeLessThanOrEqual(32 * 1024);
   const dialog = omp.details().at(-1)?.dialog;
   for (const value of [dialog.questions[0].text, ...dialog.questions[0].options]) {
     expect(value.isWellFormed()).toBe(true);
@@ -2609,3 +2619,277 @@ test("Oh My Pi keeps a move report retrying when an older report fails after the
   state.outage = false;
   await waitFor(() => received.slice(before).some((request) => request.params?.agent_session_path === file), 9_000);
 }, 30_000);
+
+// OMP's registry and lifecycle modules as an extension imports them. `lifecycle.manager` is what
+// `AgentLifecycleManager.global()` returns in the test that runs.
+class FakeAgentRegistry {}
+const lifecycle: { manager: any } = { manager: undefined };
+mock.module("@oh-my-pi/pi-coding-agent/registry/agent-registry", () => ({ AgentRegistry: FakeAgentRegistry }));
+mock.module("@oh-my-pi/pi-coding-agent/registry/agent-lifecycle", () => ({
+  AgentLifecycleManager: { global: () => lifecycle.manager },
+}));
+
+// A process-wide agent registry like OMP's, with `refs` as its agents.
+function fakeRegistry(refs: any[]) {
+  const listeners = new Set<() => void>();
+  const registry = {
+    list: () => refs,
+    get: (id: string) => refs.find((ref) => ref.id === id),
+    onChange: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    changed: () => listeners.forEach((listener) => listener()),
+    listeners,
+  };
+  return { registry, pi: { AgentRegistry: Object.assign(FakeAgentRegistry, { global: () => registry }) } };
+}
+
+function subRef(id: string, fields: Record<string, unknown> = {}) {
+  return {
+    id,
+    displayName: id,
+    kind: "sub",
+    parentId: "Main",
+    status: "running",
+    session: null,
+    sessionFile: `/tmp/omp-instruct/${id}.jsonl`,
+    createdAt: 1000,
+    lastActivity: 1000,
+    ...fields,
+  };
+}
+
+test("Oh My Pi sets a session service tier per family and reports the overrides", async () => {
+  let tiers: Record<string, string> = {};
+  const calls: unknown[][] = [];
+  const omp = await installOmpForActions("omp-service-tier", {
+    getServiceTiers: () => ({ ...tiers }),
+    setServiceTier: (family: string, tier: string | undefined) => {
+      calls.push([family, tier]);
+      if (tier === undefined) delete tiers[family];
+      else tiers[family] = tier;
+    },
+  });
+  const set = await omp.act({ op: "set_service_tier", args: { family: "openai", tier: "flex" } });
+  expect(set.ack).toMatchObject({ ok: true, data: { service_tiers: { openai: "flex" } } });
+  await waitFor(() => omp.details().at(-1)?.service_tiers?.openai === "flex");
+  // Anthropic takes only priority; nothing is set.
+  const wrong = await omp.act({ op: "set_service_tier", args: { family: "anthropic", tier: "flex" } });
+  expect(wrong.ack.error).toBe("invalid_tier: anthropic takes priority");
+  expect((await omp.act({ op: "set_service_tier", args: { family: "azure", tier: "flex" } })).ack.error).toStartWith("invalid_args:");
+  expect((await omp.act({ op: "set_service_tier", args: { family: "openai" } })).ack.error).toStartWith("invalid_args:");
+  expect((await omp.act({ op: "set_service_tier", args: { family: "google", tier: "priority" } })).ack.ok).toBe(true);
+  // null clears the session override.
+  const cleared = await omp.act({ op: "set_service_tier", args: { family: "openai", tier: null } });
+  expect(cleared.ack).toMatchObject({ ok: true, data: { service_tiers: { google: "priority" } } });
+  expect(calls).toEqual([
+    ["openai", "flex"],
+    ["google", "priority"],
+    ["openai", undefined],
+  ]);
+});
+
+test("Oh My Pi changes tools against the set OMP has when the action runs", async () => {
+  let active = ["read", "bash", "task"];
+  const all = ["read", "bash", "task", "write", "browser"].map((name) => ({ name }));
+  const applied: string[][] = [];
+  const omp = await installOmpForActions("omp-set-tools", {
+    getActiveTools: () => [...active],
+    getAllTools: () => all,
+    setActiveTools: async (names: string[]) => {
+      applied.push(names);
+      active = names;
+    },
+  });
+  // OMP's own plan mode turned on `write` after the caller read the detail.
+  active = [...active, "write"];
+  const changed = await omp.act({ op: "set_tools", args: { enable: ["browser"], disable: ["bash"] } });
+  expect(changed.ack).toMatchObject({ ok: true, data: { active_tools: ["read", "task", "write", "browser"] } });
+  await waitFor(() => omp.details().at(-1)?.inactive_tools?.join() === "bash");
+  expect(omp.details().at(-1)?.active_tools).toEqual(["read", "task", "write", "browser"]);
+  // An unknown name changes nothing.
+  expect((await omp.act({ op: "set_tools", args: { enable: ["nope", "browser"] } })).ack.error).toBe("unknown_tool: nope");
+  expect((await omp.act({ op: "set_tools", args: { disable: ["read", "task", "write", "browser"] } })).ack.error).toBe(
+    "invalid_args: no tools would remain",
+  );
+  expect((await omp.act({ op: "set_tools", args: { enable: ["read"], disable: ["read"] } })).ack.error).toStartWith("invalid_args:");
+  expect((await omp.act({ op: "set_tools", args: {} })).ack.error).toStartWith("invalid_args:");
+  expect(applied).toEqual([["read", "task", "write", "browser"]]);
+});
+
+test("Oh My Pi shows a notice and a status, never an error notice", async () => {
+  const notices: unknown[][] = [];
+  const statuses: unknown[][] = [];
+  const omp = await installOmpForActions(
+    "omp-notify-status",
+    {},
+    {
+      notify: (...args: unknown[]) => notices.push(args),
+      setStatus: (...args: unknown[]) => statuses.push(args),
+    },
+  );
+  expect((await omp.act({ op: "notify", args: { text: "build done", level: "warning" } })).ack.ok).toBe(true);
+  expect((await omp.act({ op: "notify", args: { text: "hello" } })).ack.ok).toBe(true);
+  // OMP's error notice also clears the person's pending input.
+  expect((await omp.act({ op: "notify", args: { text: "boom", level: "error" } })).ack.error).toStartWith("invalid_args: level error");
+  expect((await omp.act({ op: "notify", args: { text: "two\nlines" } })).ack.error).toStartWith("invalid_args:");
+  expect(notices).toEqual([
+    ["build done", "warning"],
+    ["hello", "info"],
+  ]);
+  const set = await omp.act({ op: "status", args: { text: "sahur: reviewing" } });
+  expect(set.ack).toMatchObject({ ok: true, data: { status_text: "sahur: reviewing" } });
+  await waitFor(() => omp.details().at(-1)?.status_text === "sahur: reviewing");
+  expect((await omp.act({ op: "status", args: { text: "x".repeat(81) } })).ack.error).toStartWith("invalid_args:");
+  expect((await omp.act({ op: "status", args: { text: null } })).ack.ok).toBe(true);
+  await waitFor(() => omp.details().at(-1)?.status_text === undefined);
+  expect(statuses).toEqual([
+    ["herdr-sahur", "sahur: reviewing"],
+    ["herdr-sahur", undefined],
+  ]);
+});
+
+test("Oh My Pi lists the session's subagents, running first, within the roster cap", async () => {
+  const refs: any[] = [
+    { id: "Main", kind: "main", status: "running", sessionFile: "/tmp/omp-instruct.jsonl", createdAt: 1, lastActivity: 1 },
+    // An advisor, a subagent of another session and one without a file are not listed.
+    subRef("adv", { kind: "advisor" }),
+    // The same length as the session stem, so only the prefix check tells it apart.
+    subRef("other", { sessionFile: "/tmp/omp-sessionb/other.jsonl" }),
+    subRef("nofile", { sessionFile: null }),
+    subRef("prefix", { sessionFile: "/tmp/omp-instructx/prefix.jsonl" }),
+  ];
+  for (let i = 0; i < 35; i += 1) refs.push(subRef(`idle-${i}`, { status: "idle", createdAt: 10, lastActivity: 100 + i }));
+  for (let i = 0; i < 5; i += 1) {
+    refs.push(
+      subRef(`run-${i}`, {
+        createdAt: 500 + i,
+        lastActivity: 1,
+        activity: `step ${i}`,
+        parentId: i === 4 ? "run-0" : "Main",
+        session: { model: { provider: "anthropic", id: "claude-haiku-4-5" } },
+      }),
+    );
+  }
+  const { registry, pi } = fakeRegistry(refs);
+  const omp = await installOmpForActions("omp-roster", { pi });
+  // A subagent's own binding of the module adds its agent type and the tool it runs.
+  const sub = { hasUI: false, agent: { kind: "sub", id: "run-4", name: "explore", depth: 2, parentId: "run-0" } };
+  await omp.harness.handlers.get("session_start")?.({ reason: "startup" }, sub);
+  await omp.harness.handlers.get("tool_execution_start")?.({ toolCallId: "c1", toolName: "grep", args: {} }, sub);
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.tool?.name === "grep", 3_000);
+  const roster = omp.details().at(-1)?.subagents;
+  expect(roster).toMatchObject({ total: 40, running: 5, truncated: true });
+  expect(roster.items).toHaveLength(30);
+  expect(roster.items.slice(0, 6).map((item: any) => item.id)).toEqual(["run-4", "run-3", "run-2", "run-1", "run-0", "idle-34"]);
+  expect(roster.items[0]).toMatchObject({
+    id: "run-4",
+    type: "explore",
+    parent: "run-0",
+    status: "running",
+    activity: "step 4",
+    model: "anthropic/claude-haiku-4-5",
+    started_ms: 504,
+  });
+  expect(roster.items[1].parent).toBeUndefined();
+  // The root's own events never count as a subagent's.
+  expect(omp.details().at(-1)?.tool).toBeUndefined();
+  await omp.harness.handlers.get("tool_execution_end")?.({ toolCallId: "c1", toolName: "grep" }, sub);
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.tool === undefined, 3_000);
+  // The subscription ends with the session.
+  await omp.harness.handlers.get("session_shutdown")?.({}, omp.harness.context);
+  expect(registry.listeners.size).toBe(0);
+});
+
+test("Oh My Pi shrinks the roster, not the dialog, to stay under herdr's limit", async () => {
+  const refs = Array.from({ length: 30 }, (_, i) =>
+    subRef(`sub-${i}`, { displayName: "n".repeat(80), activity: "a".repeat(160), lastActivity: i }),
+  );
+  const { pi } = fakeRegistry(refs);
+  const omp = await installOmpForActions("omp-roster-budget", { pi });
+  const text = "q".repeat(100);
+  await omp.ask(
+    "big",
+    Array.from({ length: 10 }, () => ({ question: text, options: Array.from({ length: 20 }, () => ({ label: text })) })),
+  );
+  await waitFor(() => omp.details().at(-1)?.dialog?.id === "big");
+  const detail = omp.details().at(-1)!;
+  expect(Buffer.byteLength(JSON.stringify(detail), "utf8")).toBeLessThanOrEqual(30 * 1024);
+  expect(detail.dialog.truncated).toBeUndefined();
+  expect(detail.dialog.questions[9].options[19]).toBe(text);
+  expect(detail.subagents).toMatchObject({ total: 30, running: 30, truncated: true });
+  expect(detail.subagents.items).toHaveLength(10);
+});
+
+test("Oh My Pi steers only a subagent of its session that runs a turn", async () => {
+  const sent: unknown[][] = [];
+  const session = (streaming: boolean) => ({
+    isStreaming: streaming,
+    sendUserMessage: async (...args: unknown[]) => {
+      sent.push(args);
+    },
+  });
+  const { pi } = fakeRegistry([
+    subRef("busy", { session: session(true) }),
+    subRef("between", { session: session(false) }),
+    subRef("done", { status: "idle", session: session(false) }),
+    subRef("parked", { status: "parked" }),
+    subRef("other", { session: session(true), sessionFile: "/tmp/omp-sessionb/other.jsonl" }),
+  ]);
+  const omp = await installOmpForActions("omp-subagent-steer", { pi });
+  const steer = async (id: string, text = "[sahur] look at the tests too") =>
+    (await omp.act({ op: "subagent_steer", args: { subagent_id: id, text } })).ack;
+  expect(await steer("busy")).toMatchObject({ ok: true, data: { subagent_id: "busy", delivered: "aside" } });
+  expect(sent).toEqual([["[sahur] look at the tests too", { deliverAs: "aside" }]]);
+  expect((await steer("between")).error).toStartWith("subagent_busy:");
+  expect((await steer("done")).error).toBe("subagent_not_running: done is idle");
+  expect((await steer("parked")).error).toBe("subagent_not_running: parked is parked");
+  expect((await steer("other")).error).toBe("no_subagent: other is not a subagent of this session");
+  expect((await steer("../x")).error).toStartWith("invalid_args:");
+  expect((await steer("busy", "x".repeat(3001))).error).toStartWith("invalid_args:");
+  expect(sent).toHaveLength(1);
+});
+
+test("Oh My Pi cancels a subagent through OMP's own lifecycle manager", async () => {
+  const calls: string[] = [];
+  const session = { isStreaming: true, abort: async (options: unknown) => void calls.push(`abort ${JSON.stringify(options)}`) };
+  const ref = subRef("worker", { session });
+  const { pi } = fakeRegistry([ref, subRef("finished", { status: "idle" })]);
+  lifecycle.manager = {
+    release: async (id: string, expected: unknown, options: unknown) => {
+      calls.push(`release ${id} ${expected === ref} ${JSON.stringify(options)}`);
+      ref.status = "aborted";
+      ref.session = null;
+      return true;
+    },
+  };
+  const omp = await installOmpForActions("omp-subagent-cancel", { pi });
+  const cancel = async (id: string) => (await omp.act({ op: "subagent_cancel", args: { subagent_id: id } })).ack;
+  expect((await cancel("ghost")).error).toBe("no_subagent: ghost is not a subagent of this session");
+  expect((await cancel("finished")).error).toBe("subagent_not_running: finished is idle");
+  expect(calls).toEqual([]);
+  expect(await cancel("worker")).toMatchObject({ ok: true, data: { subagent_id: "worker", cancelled: true } });
+  // Release first, then the abort, as OMP's RPC cancel.
+  expect(calls).toEqual(['release worker true {"tombstone":true}', 'abort {"reason":"Interrupted by herdr"}']);
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.find((item: any) => item.id === "worker")?.status === "aborted");
+});
+
+test("Oh My Pi refuses a subagent cancel when the lifecycle module is not OMP's own", async () => {
+  const calls: string[] = [];
+  const registry = {
+    list: () => [ref],
+    get: () => ref,
+    onChange: () => () => {},
+  };
+  const ref = subRef("worker", { session: { isStreaming: true, abort: async () => void calls.push("abort") } });
+  // OMP's registry class is not the one the import resolved to: a copy, whose release would
+  // cancel nothing.
+  const omp = await installOmpForActions("omp-subagent-cancel-copy", { pi: { AgentRegistry: { global: () => registry } } });
+  lifecycle.manager = { release: async () => void calls.push("release") };
+  const ack = (await omp.act({ op: "subagent_cancel", args: { subagent_id: "worker" } })).ack;
+  expect(ack.error).toStartWith("unsupported_op:");
+  expect(calls).toEqual([]);
+});

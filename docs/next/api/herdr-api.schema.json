@@ -1260,6 +1260,36 @@
               "const": "command",
               "description": "`args.name` and its `args.args`: run an allow-listed session command while idle.",
               "type": "string"
+            },
+            {
+              "const": "set_service_tier",
+              "description": "`args.family` (`openai`, `anthropic`, `google`) and `args.tier` (`null` clears): set the\nsession's service tier for that provider family.",
+              "type": "string"
+            },
+            {
+              "const": "set_tools",
+              "description": "`args.enable` and `args.disable`: tool names to turn on and off, applied to the tools active\nwhen the action runs.",
+              "type": "string"
+            },
+            {
+              "const": "notify",
+              "description": "`args.text` (one line) and `args.level` (`info` or `warning`): show the person a notice.",
+              "type": "string"
+            },
+            {
+              "const": "status",
+              "description": "`args.text` (one line; `null` or omitted clears): set Herdr's status-line text in OMP.",
+              "type": "string"
+            },
+            {
+              "const": "subagent_steer",
+              "description": "`args.subagent_id` and `args.text`: send a running subagent of the session an aside.",
+              "type": "string"
+            },
+            {
+              "const": "subagent_cancel",
+              "description": "`args.subagent_id`: cancel a running subagent of the session.",
+              "type": "string"
             }
           ]
         },
@@ -2600,6 +2630,16 @@
         "OmpDetail": {
           "description": "Live state the OMP integration reports for its root session. A missing field is unknown or\nnone.",
           "properties": {
+            "active_tools": {
+              "description": "The tools the model can use now.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "context": {
               "anyOf": [
                 {
@@ -2622,12 +2662,51 @@
               ],
               "description": "The approval or `ask` dialog OMP shows now (the oldest open one)."
             },
+            "inactive_tools": {
+              "description": "OMP's other tools.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "model": {
               "description": "The session model, `provider/id`.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "service_tiers": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OmpServiceTiers"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's service tier overrides, per provider family."
+            },
+            "status_text": {
+              "description": "The status-line text the `status` op set.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "subagents": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OmpSubagents"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's subagents."
             },
             "thinking": {
               "description": "The thinking level.",
@@ -2745,6 +2824,147 @@
             "options",
             "multi",
             "other_allowed"
+          ],
+          "type": "object"
+        },
+        "OmpServiceTiers": {
+          "properties": {
+            "anthropic": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "google": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "openai": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "OmpSubagent": {
+          "properties": {
+            "active_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "activity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "description": "OMP's agent registry id; the `subagent_*` ops take it.",
+              "type": "string"
+            },
+            "model": {
+              "description": "The subagent's model, `provider/id`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "parent": {
+              "description": "The spawning subagent's id, when it is not the session's main agent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "description": "`running`, `idle`, `parked` or `aborted`.",
+              "type": "string"
+            },
+            "tool": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/OmpSubagentTool"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "description": "The agent definition name (`task`, `explore`, ...).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "status",
+            "started_ms",
+            "active_ms"
+          ],
+          "type": "object"
+        },
+        "OmpSubagentTool": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "started_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "started_ms"
+          ],
+          "type": "object"
+        },
+        "OmpSubagents": {
+          "properties": {
+            "items": {
+              "description": "Running first (newest first), then the rest by last activity.",
+              "items": {
+                "$ref": "#/schemas/request/$defs/OmpSubagent"
+              },
+              "type": "array"
+            },
+            "running": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "`items` shows fewer than `total`.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "total",
+            "running",
+            "items"
           ],
           "type": "object"
         },
@@ -7286,6 +7506,36 @@
               "const": "command",
               "description": "`args.name` and its `args.args`: run an allow-listed session command while idle.",
               "type": "string"
+            },
+            {
+              "const": "set_service_tier",
+              "description": "`args.family` (`openai`, `anthropic`, `google`) and `args.tier` (`null` clears): set the\nsession's service tier for that provider family.",
+              "type": "string"
+            },
+            {
+              "const": "set_tools",
+              "description": "`args.enable` and `args.disable`: tool names to turn on and off, applied to the tools active\nwhen the action runs.",
+              "type": "string"
+            },
+            {
+              "const": "notify",
+              "description": "`args.text` (one line) and `args.level` (`info` or `warning`): show the person a notice.",
+              "type": "string"
+            },
+            {
+              "const": "status",
+              "description": "`args.text` (one line; `null` or omitted clears): set Herdr's status-line text in OMP.",
+              "type": "string"
+            },
+            {
+              "const": "subagent_steer",
+              "description": "`args.subagent_id` and `args.text`: send a running subagent of the session an aside.",
+              "type": "string"
+            },
+            {
+              "const": "subagent_cancel",
+              "description": "`args.subagent_id`: cancel a running subagent of the session.",
+              "type": "string"
             }
           ]
         },
@@ -8724,6 +8974,16 @@
         "OmpDetail": {
           "description": "Live state the OMP integration reports for its root session. A missing field is unknown or\nnone.",
           "properties": {
+            "active_tools": {
+              "description": "The tools the model can use now.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "context": {
               "anyOf": [
                 {
@@ -8746,12 +9006,51 @@
               ],
               "description": "The approval or `ask` dialog OMP shows now (the oldest open one)."
             },
+            "inactive_tools": {
+              "description": "OMP's other tools.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "model": {
               "description": "The session model, `provider/id`.",
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "service_tiers": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpServiceTiers"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's service tier overrides, per provider family."
+            },
+            "status_text": {
+              "description": "The status-line text the `status` op set.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "subagents": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpSubagents"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session's subagents."
             },
             "thinking": {
               "description": "The thinking level.",
@@ -8869,6 +9168,147 @@
             "options",
             "multi",
             "other_allowed"
+          ],
+          "type": "object"
+        },
+        "OmpServiceTiers": {
+          "properties": {
+            "anthropic": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "google": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "openai": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "OmpSubagent": {
+          "properties": {
+            "active_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "activity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "description": "OMP's agent registry id; the `subagent_*` ops take it.",
+              "type": "string"
+            },
+            "model": {
+              "description": "The subagent's model, `provider/id`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "parent": {
+              "description": "The spawning subagent's id, when it is not the session's main agent.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "description": "`running`, `idle`, `parked` or `aborted`.",
+              "type": "string"
+            },
+            "tool": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/OmpSubagentTool"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "description": "The agent definition name (`task`, `explore`, ...).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "status",
+            "started_ms",
+            "active_ms"
+          ],
+          "type": "object"
+        },
+        "OmpSubagentTool": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "started_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "started_ms"
+          ],
+          "type": "object"
+        },
+        "OmpSubagents": {
+          "properties": {
+            "items": {
+              "description": "Running first (newest first), then the rest by last activity.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/OmpSubagent"
+              },
+              "type": "array"
+            },
+            "running": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "truncated": {
+              "description": "`items` shows fewer than `total`.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "total",
+            "running",
+            "items"
           ],
           "type": "object"
         },

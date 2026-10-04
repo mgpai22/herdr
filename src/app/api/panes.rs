@@ -37,7 +37,7 @@ const ACTION_KEYS_MAX: usize = 64 * 1024;
 /// opened (OMP's custom answer editor) to take focus.
 const ACTION_KEYS_PAUSE: std::time::Duration = std::time::Duration::from_millis(150);
 /// The largest `pane.report_omp_detail` detail Herdr keeps.
-const OMP_DETAIL_MAX: usize = 16 * 1024;
+const OMP_DETAIL_MAX: usize = 32 * 1024;
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {

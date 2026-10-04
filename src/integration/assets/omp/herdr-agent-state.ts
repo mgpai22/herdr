@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=14
+// HERDR_INTEGRATION_VERSION=15
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
@@ -341,8 +341,8 @@ const PASTE_MARKER = /\[Paste #\d+(?:, (?:\+\d+ lines|\d+ chars))?\]/;
 const KEY_BLOCK =
   /^\x1b\[200~herdr-key:v1:([0-9a-f]{32}):(\d+):(\d+):([0-9a-f]{32})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
 const KEY_BYTES: Record<string, string> = { U: "\x1b[A", D: "\x1b[B", E: "\r", S: " ", X: "\x1b" };
-// The detail herdr keeps is at most 16 KiB; a dialog report shrinks to stay under this.
-const detailBudgetBytes = 15 * 1024;
+// The detail herdr keeps is at most 32 KiB; a report shrinks to stay under this (see `buildDetail`).
+const detailBudgetBytes = 30 * 1024;
 // Dialog report sizes, largest first: questions, options per question, characters per text.
 const DIALOG_TIERS = [
   { questions: 10, options: 20, text: 500, label: 200 },
@@ -365,6 +365,58 @@ const switchPollMs = Math.max(parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000)
 const moveWatchMs = Math.max(parseDurationEnv("HERDR_OMP_MOVE_WATCH_MS", 3000), 10);
 // How long OMP may take to report that a dialog closed after a person's key.
 const closeReportWaitMs = 300;
+// The service tiers OMP 18.4.4 accepts per provider family (`ExtensionServiceTier`).
+const SERVICE_TIERS: Record<string, string[]> = {
+  openai: ["auto", "default", "flex", "scale", "priority", "ultrafast"],
+  anthropic: ["priority"],
+  google: ["flex", "priority"],
+};
+// The one status-line key the `status` op uses, so it never touches another extension's status.
+const STATUS_KEY = "herdr-sahur";
+const SUBAGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+const SUBAGENT_STATUSES = new Set(["running", "idle", "parked", "aborted"]);
+// Roster sizes, largest first; the detail uses the first that fits.
+const ROSTER_TIERS = [30, 10, 0];
+const toolListMax = 200;
+// How long a subagent cancel waits for OMP's release before it answers.
+const subagentCancelWaitMs = 5000;
+// What the `status` op set. OMP keeps statuses in memory, as this module keeps this: an OMP
+// restart or an extension reload clears both.
+let statusText: string | undefined;
+// What subagent bindings of this module add to OMP's agent registry: the agent type and the tool
+// the subagent runs. Keyed by registry id.
+const subagentInfo = new Map<
+  string,
+  { type?: string; tool?: { name: string; call_id?: string; started_ms: number } }
+>();
+// Set by the root binding: a subagent's binding saw a change.
+let onSubagentChange: (() => void) | undefined;
+// OMP's agent lifecycle manager, loaded once; undefined when it does not load as OMP's own.
+let lifecycleManager: Promise<any> | undefined;
+
+function loadLifecycleManager(registryClass: unknown): Promise<any> {
+  lifecycleManager ??= (async () => {
+    const [lifecycle, registry] = await Promise.all([
+      import("@oh-my-pi/pi-coding-agent/registry/agent-lifecycle"),
+      import("@oh-my-pi/pi-coding-agent/registry/agent-registry"),
+    ]);
+    // OMP maps `@oh-my-pi/*` imports to its own bundled modules; a copy would hold another
+    // registry, and a release there would cancel nothing.
+    if (registryClass === undefined || registry?.AgentRegistry !== registryClass) return undefined;
+    const manager = lifecycle?.AgentLifecycleManager;
+    return typeof manager?.global === "function" ? manager : undefined;
+  })().catch(() => undefined);
+  return lifecycleManager;
+}
+
+function isOneLine(text: unknown, max: number): text is string {
+  return typeof text === "string" && text.trim().length > 0 && text.length <= max && !/[\x00-\x1f\x7f]/.test(text);
+}
+
+function toolNames(names: unknown): string[] {
+  if (!Array.isArray(names)) return [];
+  return names.filter((name): name is string => typeof name === "string" && name.length > 0).slice(0, toolListMax).map((name) => cap(name, 128));
+}
 
 // Matches the text of the user message OMP starts the turn with: the delivered text, with each
 // model mention allowed to have been rewritten.
@@ -978,6 +1030,7 @@ export default function (pi) {
   // herdr refused a detail report; set until the next session event.
   let detailRefused = false;
   let moveWatch: ReturnType<typeof setInterval> | undefined;
+  let unsubscribeRegistry: (() => void) | undefined;
   // Counts activations and shutdowns, so a pending withdrawal undo sees that a session event came.
   let activations = 0;
   let lastDetailAt = 0;
@@ -1055,6 +1108,110 @@ export default function (pi) {
     };
   }
 
+  // OMP's process-wide agent registry (`pi.pi` is OMP's own package module); undefined when this
+  // OMP has none.
+  function agentRegistry(): any {
+    try {
+      const registry = pi.pi?.AgentRegistry?.global?.();
+      return typeof registry?.list === "function" && typeof registry?.get === "function" ? registry : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // A subagent of the root session: its transcript sits under the root session file's directory
+  // stem (`<session>/<id>.jsonl`, nested ones deeper). This leaves out advisors, agents of an
+  // earlier session of this process and agents without a file.
+  function isSessionSubagent(ref: any, stem: string | undefined): boolean {
+    const file = ref?.sessionFile;
+    return (
+      stem !== undefined &&
+      ref?.kind === "sub" &&
+      typeof ref.id === "string" &&
+      typeof ref.status === "string" &&
+      typeof file === "string" &&
+      file.length > stem.length + 1 &&
+      file.startsWith(stem) &&
+      (file[stem.length] === "/" || file[stem.length] === "\\")
+    );
+  }
+
+  function sessionStem(): string | undefined {
+    let file: unknown;
+    try {
+      file = detailCtx?.sessionManager?.getSessionFile?.();
+    } catch {
+      return undefined;
+    }
+    return isAbsoluteSessionPath(file) && file.endsWith(".jsonl") ? file.slice(0, -".jsonl".length) : undefined;
+  }
+
+  function sessionSubagent(registry: any, id: string): any {
+    let ref: any;
+    try {
+      ref = registry.get(id);
+    } catch {
+      return undefined;
+    }
+    return isSessionSubagent(ref, sessionStem()) ? ref : undefined;
+  }
+
+  // The root session's subagents, running first (newest first), then the rest by last activity.
+  function subagentRoster(): { total: number; running: number; items: Record<string, unknown>[] } | undefined {
+    const registry = agentRegistry();
+    if (!registry) return undefined;
+    let refs: any[];
+    try {
+      refs = registry.list();
+    } catch {
+      return undefined;
+    }
+    for (const id of subagentInfo.keys()) {
+      if (!refs.some((ref) => ref?.id === id)) subagentInfo.delete(id);
+    }
+    const stem = sessionStem();
+    const subs = refs.filter((ref) => isSessionSubagent(ref, stem));
+    if (subs.length === 0) return undefined;
+    const ms = (value: unknown) => (Number.isFinite(value) ? Math.max(0, Math.round(value as number)) : 0);
+    subs.sort((a, b) =>
+      (a.status === "running") !== (b.status === "running")
+        ? a.status === "running"
+          ? -1
+          : 1
+        : a.status === "running"
+          ? ms(b.createdAt) - ms(a.createdAt)
+          : ms(b.lastActivity) - ms(a.lastActivity),
+    );
+    const items = subs.slice(0, ROSTER_TIERS[0]).map((ref) => {
+      const info = subagentInfo.get(ref.id);
+      const model = ref.session?.model;
+      return {
+        id: ref.id,
+        name: cap(typeof ref.displayName === "string" && ref.displayName ? ref.displayName : ref.id, 80),
+        ...(info?.type ? { type: cap(info.type, 80) } : {}),
+        ...(typeof ref.parentId === "string" && ref.parentId !== "Main" ? { parent: cap(ref.parentId, 80) } : {}),
+        status: SUBAGENT_STATUSES.has(ref.status) ? ref.status : cap(ref.status, 20),
+        ...(typeof ref.activity === "string" && ref.activity ? { activity: cap(ref.activity, 160) } : {}),
+        ...(info?.tool ? { tool: { name: info.tool.name, started_ms: info.tool.started_ms } } : {}),
+        ...(model?.provider && model?.id ? { model: cap(`${model.provider}/${model.id}`, 200) } : {}),
+        started_ms: ms(ref.createdAt),
+        active_ms: ms(ref.lastActivity),
+      };
+    });
+    return { total: subs.length, running: subs.filter((ref) => ref.status === "running").length, items };
+  }
+
+  function serviceTiers(): Record<string, string> {
+    const tiers: Record<string, string> = {};
+    try {
+      const current = pi.getServiceTiers?.();
+      for (const family of Object.keys(SERVICE_TIERS)) {
+        if (typeof current?.[family] === "string") tiers[family] = current[family];
+      }
+    } catch {}
+    return tiers;
+  }
+
   function buildDetail() {
     const ctx = detailCtx;
     const detail: Record<string, unknown> = { updated_ms: Date.now() };
@@ -1078,6 +1235,10 @@ export default function (pi) {
     } catch {}
     const todos = todoSummary(ctx);
     if (todos) detail.todos = todos;
+    const tiers = serviceTiers();
+    if (Object.keys(tiers).length > 0) detail.service_tiers = tiers;
+    if (statusText !== undefined) detail.status_text = statusText;
+    const fits = () => Buffer.byteLength(JSON.stringify(detail), "utf8") <= detailBudgetBytes;
     const head = dialogs[0];
     if (head) {
       // The smallest report that fits herdr's limit; an answer refuses what it had to cut.
@@ -1085,8 +1246,39 @@ export default function (pi) {
         const { truncated, report } = dialogReport(head, tier);
         detail.dialog = report;
         head.truncated = truncated;
-        if (Buffer.byteLength(JSON.stringify(detail), "utf8") <= detailBudgetBytes) break;
+        if (fits()) break;
       }
+    }
+    // The dialog has its room; the roster and the tool lists take what is left, in that order of
+    // priority: fewer roster rows first, then no inactive tools, then no active tools.
+    let active: string[] = [];
+    let inactive: string[] = [];
+    try {
+      active = toolNames(pi.getActiveTools?.());
+      const on = new Set(pi.getActiveTools?.());
+      inactive = toolNames((pi.getAllTools?.() ?? []).map((tool: any) => tool?.name).filter((name: unknown) => !on.has(name)));
+    } catch {}
+    const roster = subagentRoster();
+    const candidates: [number, boolean, boolean][] = [
+      ...ROSTER_TIERS.map((rows): [number, boolean, boolean] => [rows, true, true]),
+      [0, true, false],
+      [0, false, false],
+    ];
+    for (const [rows, withActive, withInactive] of candidates) {
+      delete detail.subagents;
+      delete detail.active_tools;
+      delete detail.inactive_tools;
+      if (roster) {
+        detail.subagents = {
+          total: roster.total,
+          running: roster.running,
+          items: roster.items.slice(0, rows),
+          ...(roster.total > Math.min(rows, roster.items.length) ? { truncated: true } : {}),
+        };
+      }
+      if (withActive && active.length > 0) detail.active_tools = active;
+      if (withInactive && inactive.length > 0) detail.inactive_tools = inactive;
+      if (fits()) break;
     }
     return detail;
   }
@@ -1419,6 +1611,62 @@ export default function (pi) {
         return answerDialog(ctx, actionId, args, finish, refuse, rest);
       case "command":
         return runCommand(args, finish, refuse, rest);
+      case "set_service_tier": {
+        const { family, tier } = args;
+        if (typeof family !== "string" || !Object.hasOwn(SERVICE_TIERS, family)) {
+          return refuse("invalid_args: family must be one of openai, anthropic, google");
+        }
+        if (tier !== null && typeof tier !== "string") {
+          return refuse("invalid_args: tier must be a tier name, or null to clear the session's tier");
+        }
+        if (tier !== null && !SERVICE_TIERS[family].includes(tier)) {
+          return refuse(`invalid_tier: ${family} takes ${SERVICE_TIERS[family].join(", ")}`);
+        }
+        try {
+          pi.setServiceTier(family, tier ?? undefined);
+        } catch (error) {
+          return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+        }
+        finish({ ok: true, data: { service_tiers: serviceTiers() } });
+        return rest;
+      }
+      case "set_tools":
+        return setTools(args, finish, refuse, rest);
+      case "notify": {
+        const level = args.level ?? "info";
+        if (level === "error") {
+          return refuse("invalid_args: level error is refused: OMP's error notice also clears the person's pending input; use warning");
+        }
+        if (level !== "info" && level !== "warning") return refuse("invalid_args: level must be info or warning");
+        if (!isOneLine(args.text, 500)) return refuse("invalid_args: notify needs a one-line text of 1-500 characters");
+        if (typeof ctx?.ui?.notify !== "function") return refuse("unsupported_op: this OMP shows no notices");
+        try {
+          ctx.ui.notify(args.text, level);
+        } catch (error) {
+          return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+        }
+        finish({ ok: true, data: {} });
+        return rest;
+      }
+      case "status": {
+        const text = args.text;
+        if (text !== undefined && text !== null && !isOneLine(text, 80)) {
+          return refuse("invalid_args: status text must be one line of 1-80 characters, or null to clear it");
+        }
+        if (typeof ctx?.ui?.setStatus !== "function") return refuse("unsupported_op: this OMP has no status line");
+        const next = typeof text === "string" ? text : undefined;
+        try {
+          ctx.ui.setStatus(STATUS_KEY, next);
+        } catch (error) {
+          return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+        }
+        statusText = next;
+        finish({ ok: true, data: next === undefined ? {} : { status_text: next } });
+        return rest;
+      }
+      case "subagent_steer":
+      case "subagent_cancel":
+        return subagentAction(request.op, args, finish, refuse, rest);
       default:
         return refuse(`unsupported_op: ${cap(request?.op, 40)}`);
     }
@@ -1501,6 +1749,105 @@ export default function (pi) {
         endAnswer({ ok: false, error: "failed: herdr did not write the answer keys; nothing was answered" });
       }
     });
+    return rest;
+  }
+
+  // Computes the new set from OMP's active tools at apply time, so a caller's older read never
+  // undoes a change made since.
+  function setTools(args: any, finish: any, refuse: any, rest: any) {
+    const list = (value: unknown) =>
+      value === undefined ||
+      (Array.isArray(value) &&
+        value.length <= 64 &&
+        value.every((name) => typeof name === "string" && name.length >= 1 && name.length <= 128));
+    if (!list(args.enable) || !list(args.disable)) {
+      return refuse("invalid_args: enable and disable are lists of at most 64 tool names of 1-128 characters");
+    }
+    const enable: string[] = args.enable ?? [];
+    const disable: string[] = args.disable ?? [];
+    if (enable.length + disable.length === 0) return refuse("invalid_args: set_tools needs enable or disable");
+    const both = enable.find((name) => disable.includes(name));
+    if (both !== undefined) return refuse(`invalid_args: ${cap(both, 128)} is in both enable and disable`);
+    let known: Set<unknown>;
+    let current: string[];
+    try {
+      known = new Set((pi.getAllTools() ?? []).map((tool: any) => tool?.name));
+      current = [...pi.getActiveTools()];
+    } catch (error) {
+      return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+    }
+    const unknown = [...new Set([...enable, ...disable])].filter((name) => !known.has(name));
+    if (unknown.length > 0) {
+      return refuse(`unknown_tool: ${unknown.slice(0, 10).map((name) => cap(name, 128)).join(", ")}`);
+    }
+    const next = [...current.filter((name) => !disable.includes(name)), ...enable.filter((name) => !current.includes(name))];
+    if (next.length === 0) return refuse("invalid_args: no tools would remain");
+    Promise.resolve(pi.setActiveTools(next)).then(
+      () => finish({ ok: true, data: { active_tools: toolNames(pi.getActiveTools?.()) } }),
+      (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
+    );
+    return rest;
+  }
+
+  // Steer and cancel a subagent of the root session in OMP's process, as OMP's Agent Hub and its
+  // RPC mode do: an aside into the running turn, or a release with a tombstone plus an abort.
+  function subagentAction(op: string, args: any, finish: any, refuse: any, rest: any) {
+    const id = args.subagent_id;
+    if (typeof id !== "string" || !SUBAGENT_ID.test(id)) {
+      return refuse("invalid_args: subagent_id must be an id from omp.subagents");
+    }
+    const text = args.text;
+    if (op === "subagent_steer" && (typeof text !== "string" || !text.trim() || text.length > 3000)) {
+      return refuse("invalid_args: subagent_steer needs text of 1-3000 characters");
+    }
+    const registry = agentRegistry();
+    if (!registry) return refuse("unsupported_op: this OMP has no agent registry");
+    const ref = sessionSubagent(registry, id);
+    if (!ref) return refuse(`no_subagent: ${id} is not a subagent of this session`);
+    const session = ref.session;
+    if (ref.status !== "running" || !session) return refuse(`subagent_not_running: ${id} is ${cap(ref.status, 20)}`);
+    if (op === "subagent_steer") {
+      // Between turns an aside would start a new turn; the executor's own reminders run there.
+      if (session.isStreaming !== true) {
+        return refuse(`subagent_busy: ${id} is between turns; retry in a few seconds`);
+      }
+      Promise.resolve(session.sendUserMessage(text, { deliverAs: "aside" })).then(
+        () => finish({ ok: true, data: { subagent_id: id, delivered: "aside" } }),
+        (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
+      );
+      return rest;
+    }
+    void (async () => {
+      const manager = await loadLifecycleManager(pi.pi?.AgentRegistry);
+      if (!manager) {
+        return finish({ ok: false, error: "unsupported_op: OMP's agent lifecycle module did not load as OMP's own" });
+      }
+      if (registry.get(id) !== ref || ref.status !== "running" || ref.session !== session) {
+        return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
+      }
+      // Release first: it marks the ref aborted at once, which the task executor turns into the
+      // task's abort; a bare abort would only end the subagent's turn.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([
+        Promise.allSettled([
+          Promise.resolve().then(() => manager.global().release(id, ref, { tombstone: true })),
+          Promise.resolve().then(() => session.abort({ reason: "Interrupted by herdr" })),
+        ]),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(resolve, subagentCancelWaitMs);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (!result) return finish({ ok: true, data: { subagent_id: id, cancelled: true, settled: false } });
+      const [released] = result;
+      if (released.status === "rejected") {
+        return finish({ ok: false, error: `failed: ${cap(released.reason?.message ?? released.reason, 200)}` });
+      }
+      if (released.value !== true) {
+        return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
+      }
+      return finish({ ok: true, data: { subagent_id: id, cancelled: true } });
+    })();
     return rest;
   }
 
@@ -1635,6 +1982,17 @@ export default function (pi) {
       if (lost) publishState(true);
       if (instructionListener) scheduleDetail(undefined, true);
     };
+    // Subagent changes show in the roster: registry events (start, status, end) and the tool
+    // events of subagent bindings, at most one report a second.
+    onSubagentChange = () => {
+      if (rootSession) scheduleDetail();
+    };
+    if (!unsubscribeRegistry) {
+      try {
+        const off = agentRegistry()?.onChange?.(() => onSubagentChange?.());
+        if (typeof off === "function") unsubscribeRegistry = off;
+      } catch {}
+    }
     registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
@@ -1676,7 +2034,25 @@ export default function (pi) {
     activateBlocked(data.label);
   });
 
+  // A subagent's binding of this module adds what OMP's registry lacks: the agent type and the
+  // tool the subagent runs. Returns whether `ctx` is a subagent's.
+  function noteSubagent(event: string, data: any, ctx: any): boolean {
+    const agent = ctx?.agent;
+    if (agent?.kind !== "sub" || typeof agent.id !== "string") return false;
+    const info = subagentInfo.get(agent.id) ?? {};
+    if (typeof agent.name === "string" && agent.name) info.type = agent.name;
+    if (event === "tool_execution_start") {
+      info.tool = { name: cap(data?.toolName || "tool", 120), call_id: data?.toolCallId, started_ms: Date.now() };
+    } else if (event === "tool_execution_end" && info.tool?.call_id === data?.toolCallId) {
+      info.tool = undefined;
+    }
+    subagentInfo.set(agent.id, info);
+    onSubagentChange?.();
+    return true;
+  }
+
   pi.on("session_start", (_event, ctx) => {
+    if (noteSubagent("session_start", _event, ctx)) return;
     if (!activateRootSession(ctx)) {
       return;
     }
@@ -1805,6 +2181,7 @@ export default function (pi) {
   });
 
   pi.on("tool_execution_start", (event, ctx) => {
+    if (noteSubagent("tool_execution_start", event, ctx)) return;
     if (event?.toolName !== "ask") {
       if (rootSession && event?.toolCallId) {
         toolInputs.set(event.toolCallId, event.args);
@@ -1840,6 +2217,7 @@ export default function (pi) {
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
+    if (noteSubagent("tool_execution_end", event, ctx)) return;
     if (event?.toolName !== "ask") {
       if (rootSession) {
         runningTools.delete(event?.toolCallId);
@@ -1968,6 +2346,9 @@ export default function (pi) {
     activations += 1;
     clearInterval(moveWatch);
     moveWatch = undefined;
+    unsubscribeRegistry?.();
+    unsubscribeRegistry = undefined;
+    onSubagentChange = undefined;
     clearPendingTimers();
     clearTimeout(detailTimer);
     detailTimer = undefined;
