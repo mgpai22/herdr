@@ -139,6 +139,8 @@ pub enum Method {
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.instruct")]
     AgentInstruct(AgentInstructParams),
+    #[serde(rename = "agent.action")]
+    AgentAction(AgentActionParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]
@@ -211,6 +213,10 @@ pub enum Method {
     PaneReportAgentSessionV2(PaneReportAgentSessionV2Params),
     #[serde(rename = "pane.ack_instruction")]
     PaneAckInstruction(PaneAckInstructionParams),
+    #[serde(rename = "pane.ack_action")]
+    PaneAckAction(PaneAckActionParams),
+    #[serde(rename = "pane.report_omp_detail")]
+    PaneReportOmpDetail(PaneReportOmpDetailParams),
     #[serde(rename = "pane.report_metadata")]
     PaneReportMetadata(PaneReportMetadataParams),
     #[serde(rename = "pane.clear_agent_authority")]

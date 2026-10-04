@@ -494,6 +494,12 @@ impl App {
             agent_session: pane.agent_session,
             runtime_id,
             accepts_instructions,
+            accepts_actions: accepts_instructions && terminal.action_listener,
+            omp: terminal.omp_detail.clone().filter(|_| accepts_instructions),
+            last_action: self
+                .last_actions
+                .get(&terminal.id)
+                .map(|(info, _)| info.clone()),
             listener_withdrawn,
             last_instruction: recent_instructions.first().cloned(),
             recent_instructions,

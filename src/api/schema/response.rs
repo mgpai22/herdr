@@ -112,6 +112,14 @@ pub enum ResponseResult {
         instruction_id: String,
         delivered_as: super::panes::InstructionDelivery,
     },
+    AgentActionDone {
+        /// The agent when the integration's result arrived.
+        agent: AgentInfo,
+        action_id: String,
+        op: super::agents::AgentActionOp,
+        /// The op's result, as the integration reported it.
+        data: serde_json::Map<String, serde_json::Value>,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

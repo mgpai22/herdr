@@ -30,6 +30,15 @@ use super::super::api_helpers::{
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
+/// The most key input one `pane.ack_action` may ask Herdr to write: one token-marked paste per
+/// key, so an ask with several questions needs some room.
+const ACTION_KEYS_MAX: usize = 64 * 1024;
+/// The pause between an action's two key chunks: long enough for the dialog the first chunk
+/// opened (OMP's custom answer editor) to take focus.
+const ACTION_KEYS_PAUSE: std::time::Duration = std::time::Duration::from_millis(150);
+/// The largest `pane.report_omp_detail` detail Herdr keeps.
+const OMP_DETAIL_MAX: usize = 16 * 1024;
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
@@ -1783,14 +1792,31 @@ impl App {
             } else {
                 terminal.instruction_listener_withdrawn.take()
             };
-            terminal.instruction_listener =
-                params.accepts_instructions.then(|| owner_after.clone());
-            terminal.instruction_listener_runtime = params
+            let listener = params.accepts_instructions.then(|| owner_after.clone());
+            let runtime = params
                 .runtime_instance
+                .clone()
+                .filter(|_| params.accepts_instructions);
+            // Detail belongs to the listener that reported it.
+            if terminal.instruction_listener != listener
+                || terminal.instruction_listener_runtime != runtime
+            {
+                terminal.omp_detail = None;
+            }
+            terminal.instruction_listener = listener;
+            terminal.instruction_listener_runtime = runtime;
+            terminal.action_listener = params.accepts_instructions && params.accepts_actions;
+            terminal.block_token = params
+                .block_token
                 .clone()
                 .filter(|_| params.accepts_instructions);
         }
         for pending in self.pending_instruction_acks.values_mut() {
+            if pending.terminal_id == terminal_id {
+                pending.withdraws_listener = false;
+            }
+        }
+        for pending in self.pending_action_acks.values_mut() {
             if pending.terminal_id == terminal_id {
                 pending.withdraws_listener = false;
             }
@@ -1891,6 +1917,193 @@ impl App {
             params.outcome,
             now,
         );
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Accepts the OMP integration's result for a pending `agent.action` only from the exact
+    /// process incarnation the block was written to. An ack with keys (a dialog answer) is not
+    /// final: Herdr writes the keys, once, and the caller hears the result from a later ack the
+    /// integration sends when the dialog closed.
+    pub(super) fn handle_pane_ack_action(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneAckActionParams,
+    ) -> String {
+        use super::agents::ActionResult;
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if params.keys.len() > 2
+            || (!params.ok && !params.keys.is_empty())
+            || params.keys.iter().map(String::len).sum::<usize>() > ACTION_KEYS_MAX
+        {
+            return encode_error(
+                id,
+                "invalid_request",
+                "an action ack carries at most two key chunks, only when ok",
+            );
+        }
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| &pane.attached_terminal_id);
+        let Some(pending) = self
+            .pending_action_acks
+            .get(&params.action_id)
+            .filter(|pending| {
+                pending.deadline > std::time::Instant::now()
+                    && Some(&pending.terminal_id) == terminal_id
+            })
+        else {
+            return encode_error(
+                id,
+                "action_not_found",
+                "no pending action with this id for this pane",
+            );
+        };
+        if params.peer_pid != Some(params.agent_pid)
+            || params.agent_pid != pending.owner.pid
+            || crate::platform::observe_process(params.agent_pid)
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(&pending.owner)
+        {
+            return encode_error(
+                id,
+                "process_mismatch",
+                "the acknowledging process is not the OMP process the action was written to",
+            );
+        }
+        let Some(pending) = self.pending_action_acks.get_mut(&params.action_id) else {
+            return encode_success(id, ResponseResult::Ok {});
+        };
+        // The listener took the block, so it exists.
+        pending.withdraws_listener = false;
+        if !params.keys.is_empty() {
+            // The integration resends a keyed ack whose reply it missed; the keys went out once.
+            if std::mem::replace(&mut pending.keys_written, true) {
+                return encode_success(id, ResponseResult::Ok {});
+            }
+            let owner_pid = pending.owner.pid;
+            let refusal = match self.lookup_runtime_sender(ws_idx, pane_id) {
+                // OMP may have handed the terminal to another program since it took the block.
+                Some(runtime) if !super::super::agents::owner_in_foreground_job(runtime, owner_pid) => {
+                    Some("failed: the OMP process is no longer the pane foreground job; no keys were written")
+                }
+                #[cfg(target_os = "linux")]
+                Some(runtime) if super::super::agents::owner_child_reads_tty(runtime, owner_pid) => {
+                    Some("failed: another program reads the pane terminal now; no keys were written")
+                }
+                Some(runtime) => {
+                    let mut keys = params.keys.into_iter().map(Bytes::from);
+                    let written = match (keys.next(), keys.next()) {
+                        (Some(first), None) => runtime.try_send_bytes(first).is_ok(),
+                        (Some(first), Some(second)) => runtime
+                            .queue_user_input_submission(first, second, ACTION_KEYS_PAUSE, None)
+                            .is_ok(),
+                        (None, _) => true,
+                    };
+                    (!written).then_some("failed: herdr could not write the answer keys to the pane")
+                }
+                None => Some("failed: the pane is gone"),
+            };
+            if let Some(reason) = refusal {
+                if let Some(pending) = self.pending_action_acks.remove(&params.action_id) {
+                    super::agents::record_action_outcome(
+                        &mut self.last_actions,
+                        &pending.terminal_id,
+                        &params.action_id,
+                        pending.op,
+                        crate::api::schema::ActionOutcome::Refused,
+                    );
+                    let _ = pending.tx.send(ActionResult::Refused(reason.into()));
+                }
+                return encode_error(id, "keys_not_written", reason);
+            }
+            return encode_success(id, ResponseResult::Ok {});
+        }
+        let Some(pending) = self.pending_action_acks.remove(&params.action_id) else {
+            return encode_success(id, ResponseResult::Ok {});
+        };
+        super::agents::record_action_outcome(
+            &mut self.last_actions,
+            &pending.terminal_id,
+            &params.action_id,
+            pending.op,
+            if params.ok {
+                crate::api::schema::ActionOutcome::Done
+            } else {
+                crate::api::schema::ActionOutcome::Refused
+            },
+        );
+        let result = if params.ok {
+            let Some(agent) = self.agent_info(ws_idx, pane_id) else {
+                return encode_success(id, ResponseResult::Ok {});
+            };
+            ActionResult::Done {
+                agent: Box::new(agent),
+                data: params.data,
+            }
+        } else {
+            ActionResult::Refused(
+                params
+                    .error
+                    .unwrap_or_else(|| "failed: no reason given".into()),
+            )
+        };
+        let _ = pending.tx.send(result);
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// Stores the live detail of the process that registered the pane's OMP listener.
+    pub(super) fn handle_pane_report_omp_detail(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneReportOmpDetailParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if serde_json::to_string(&params.omp).map_or(true, |json| json.len() > OMP_DETAIL_MAX) {
+            return encode_error(id, "invalid_request", "OMP detail report is too large");
+        }
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .and_then(|terminal_id| self.state.terminals.get_mut(terminal_id))
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(listener) = terminal.instruction_listener.as_ref().filter(|listener| {
+            params.peer_pid == Some(params.agent_pid)
+                && listener.pid == params.agent_pid
+                && terminal.instruction_listener_runtime.as_deref()
+                    == Some(params.runtime_instance.as_str())
+        }) else {
+            return encode_error(
+                id,
+                "process_mismatch",
+                "the reporting process is not the pane's registered OMP listener",
+            );
+        };
+        if crate::platform::observe_process(params.agent_pid)
+            .ok()
+            .flatten()
+            .as_ref()
+            != Some(listener)
+        {
+            return encode_error(
+                id,
+                "process_mismatch",
+                "the reporting process is not the pane's registered OMP listener",
+            );
+        }
+        terminal.omp_detail = Some(params.omp);
         encode_success(id, ResponseResult::Ok {})
     }
 

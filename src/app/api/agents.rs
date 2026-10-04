@@ -97,15 +97,160 @@ pub(super) fn record_instruction_outcome(
 /// The marked paste the OMP integration consumes:
 /// `v3:<id>:<expires unix ms>:<text bytes>:<listener runtime>`. The runtime id is the
 /// integration's own random token, known only to it and to herdr, so a person's paste that
-/// imitates a block is not taken as an instruction.
-fn instruction_block(instruction_id: &str, text: &str, runtime: &str) -> String {
+/// imitates a block is not taken as an instruction. A listener with action support (integration
+/// v14) gets `v4`, whose runtime field is followed by `:<session tag>`: the integration drops a
+/// block for a session other than the one it runs now.
+fn instruction_block(
+    instruction_id: &str,
+    text: &str,
+    runtime: &str,
+    session: Option<&str>,
+) -> String {
+    match session {
+        Some(session) => listener_block(
+            "herdr-instruction:v4",
+            instruction_id,
+            text,
+            &format!("{runtime}:{}", session_tag(session)),
+            true,
+        ),
+        None => listener_block("herdr-instruction:v3", instruction_id, text, runtime, false),
+    }
+}
+
+/// The session a block was checked against, as the OMP integration compares it with the session
+/// it runs: the first 16 bytes of the SHA-256 of the session path or id, in hex.
+fn session_tag(session: &str) -> String {
+    Sha256::digest(session.as_bytes())[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The `agent.action` block: the instruction framing around `{"op","args"}` JSON.
+const ACTION_BLOCK: &str = "herdr-action:v1";
+
+/// `end_line` adds a last line `herdr-end:<id>` after the body (action blocks and v4 instruction
+/// blocks), so the integration can cut a block that reached OMP's editor out exactly, although
+/// OMP's paste handling changes the body (tabs, NFC). The header's length counts the body only.
+fn listener_block(kind: &str, block_id: &str, body: &str, runtime: &str, end_line: bool) -> String {
     let expires_ms = (std::time::SystemTime::now() + INSTRUCTION_EXPIRY)
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
+    let end = if end_line {
+        format!("\nherdr-end:{block_id}")
+    } else {
+        String::new()
+    };
     format!(
-        "\x1b[200~herdr-instruction:v3:{instruction_id}:{expires_ms}:{}:{runtime}\n{text}\x1b[201~",
-        text.len()
+        "\x1b[200~{kind}:{block_id}:{expires_ms}:{}:{runtime}\n{body}{end}\x1b[201~",
+        body.len()
     )
+}
+
+/// The latest action per terminal and until when `AgentInfo.last_action` shows it.
+pub(crate) type LastActions = std::collections::HashMap<
+    crate::terminal::TerminalId,
+    (crate::api::schema::LastActionInfo, Instant),
+>;
+
+/// Sets the outcome of `action_id` as the terminal's latest action, shown for the outcome TTL.
+pub(super) fn record_action_outcome(
+    last: &mut LastActions,
+    terminal_id: &crate::terminal::TerminalId,
+    action_id: &str,
+    op: crate::api::schema::AgentActionOp,
+    outcome: crate::api::schema::ActionOutcome,
+) {
+    last.insert(
+        terminal_id.clone(),
+        (
+            crate::api::schema::LastActionInfo {
+                action_id: action_id.to_string(),
+                op,
+                outcome,
+            },
+            Instant::now() + INSTRUCTION_OUTCOME_TTL,
+        ),
+    );
+}
+
+/// An `agent.action` block written to the PTY whose result has not come back.
+pub(crate) struct PendingActionAck {
+    pub(super) op: crate::api::schema::AgentActionOp,
+    pub(super) terminal_id: crate::terminal::TerminalId,
+    pub(super) owner: crate::platform::OwnerProcessIncarnation,
+    pub(super) runtime: Option<String>,
+    pub(super) tx: std::sync::mpsc::Sender<ActionResult>,
+    pub(super) deadline: Instant,
+    /// Cleared once the listener proved it exists after the block was written (an ack, or a
+    /// session report), as for an instruction.
+    pub(super) withdraws_listener: bool,
+    /// The answer keys of the first ack were written; a second set is refused.
+    pub(super) keys_written: bool,
+}
+
+pub(crate) enum ActionResult {
+    Done {
+        agent: Box<crate::api::schema::AgentInfo>,
+        data: serde_json::Map<String, serde_json::Value>,
+    },
+    Refused(String),
+}
+
+/// The two guarded writes to a pane's OMP listener.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListenerWrite {
+    Instruction,
+    Action,
+}
+
+impl ListenerWrite {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Instruction => "instruct",
+            Self::Action => "action",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Instruction => "instruction",
+            Self::Action => "action",
+        }
+    }
+
+    fn unsupported_code(self) -> &'static str {
+        match self {
+            Self::Instruction => "agent_instruction_unsupported",
+            Self::Action => "agent_action_unsupported",
+        }
+    }
+
+    fn accepts_field(self) -> &'static str {
+        match self {
+            Self::Instruction => "accepts_instructions",
+            Self::Action => "accepts_actions",
+        }
+    }
+
+    fn min_integration(self) -> u32 {
+        match self {
+            Self::Instruction => 13,
+            Self::Action => 14,
+        }
+    }
+}
+
+/// A pane whose live OMP listener passed every check for a guarded write.
+struct CheckedListener {
+    ws_idx: usize,
+    pane_id: crate::layout::PaneId,
+    agent: crate::api::schema::AgentInfo,
+    terminal_id: crate::terminal::TerminalId,
+    owner: crate::platform::OwnerProcessIncarnation,
+    listener_runtime: Option<String>,
+    block_runtime: String,
 }
 
 /// A listener runtime id that fits the block header: what the integration mints.
@@ -242,6 +387,12 @@ impl App {
                 }
                 return true;
             }
+            crate::api::schema::Method::AgentAction(params) => {
+                if let Err(response) = self.action_agent(request.id, params, &respond_to) {
+                    let _ = respond_to.send(response);
+                }
+                return true;
+            }
             _ => return false,
         };
         match self.queue_agent_prompt(request.id, params) {
@@ -274,123 +425,38 @@ impl App {
         params: AgentInstructParams,
         respond_to: &std::sync::mpsc::Sender<String>,
     ) -> Result<(), String> {
-        if !super::super::agents::INSTRUCTIONS_SUPPORTED {
-            return Err(encode_error(
-                id,
-                "agent_instruction_unsupported",
-                "agent.instruct needs process identity and terminal-reader checks this platform lacks",
-            ));
-        }
-        // A request that waited long in the server queue would leave the caller too little of its
-        // own timeout for the ack wait, and it may have given up already: write nothing.
-        if params
-            .received_at
-            .is_some_and(|received| received.elapsed() > INSTRUCTION_QUEUE_LIMIT)
-        {
-            return Err(encode_error(
-                id,
-                "agent_not_ready",
-                "the instruction waited too long in the server queue; nothing was written",
-            ));
-        }
-        self.expire_instruction_acks();
-        self.reconcile_managed_agent_target(&params.target);
-        let agent = self
-            .agent_info_for_target(&params.target)
-            .map_err(|err| encode_error_body(id.clone(), self.agent_target_error_body(err)))?;
-        params
-            .validate(&agent)
-            .map_err(|code| encode_error(id.clone(), code, "instruction refused before sending"))?;
-        if !agent.accepts_instructions {
-            return Err(encode_error(
-                id,
-                "agent_instruction_unsupported",
-                format!(
-                    "agent {} has no instruction listener registered now: OMP is restarting, exiting or reloading its extensions, or its herdr integration is older than v13; nothing was written; retry when agent.get shows accepts_instructions",
-                    params.target
-                ),
-            ));
-        }
-        let resolved = self
-            .resolve_agent_target(&params.target)
-            .map_err(|err| encode_error_body(id.clone(), self.agent_target_error_body(err)))?;
-        let Some(terminal) = self
-            .state
-            .workspaces
-            .get(resolved.ws_idx)
-            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
-            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
-        else {
-            return Err(agent_not_found(id, &params.target));
-        };
-        let Some(owner) = terminal.instruction_listener.clone() else {
-            return Err(agent_not_found(id, &params.target));
-        };
-        let listener_runtime = terminal.instruction_listener_runtime.clone();
-        // The block is bound to the listener's runtime token; without one it cannot be told apart
-        // from a person's paste, so nothing is written.
-        let Some(block_runtime) = listener_runtime
-            .clone()
-            .filter(|runtime| valid_listener_runtime(runtime))
-        else {
-            return Err(encode_error(
-                id,
-                "agent_instruction_unsupported",
-                format!(
-                    "agent {} registered no instruction token; nothing was written; retry when its OMP integration reports again",
-                    params.target
-                ),
-            ));
-        };
-        let terminal_id = terminal.id.clone();
-        let launch_pending = terminal.managed_agent_launch_pending();
-        self.settle_stale_deliveries(&terminal_id, &owner, listener_runtime.as_deref());
-        // One delivery per agent until its outcome is final: while a block is unconfirmed the
-        // listener may be gone (a second block would land in the editor), and while a taken
-        // delivery waits for its turn, `last_instruction` must keep following it.
-        if self
-            .pending_instruction_acks
-            .values()
-            .any(|pending| pending.terminal_id == terminal_id)
-        {
-            return Err(encode_error(
-                id,
-                "agent_not_ready",
-                format!(
-                    "an earlier instruction to agent {} has no final outcome yet",
-                    params.target
-                ),
-            ));
-        }
-        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return Err(agent_not_found(id, &params.target));
-        };
-        if !super::super::agents::owner_in_foreground_job(runtime, owner.pid) {
-            return Err(encode_error(
-                id,
-                "agent_identity_changed",
-                "the registered agent process is not the pane foreground job",
-            ));
-        }
-        if launch_pending || !runtime.bracketed_paste_enabled() {
-            return Err(agent_not_ready(id, &params.target));
-        }
-        #[cfg(target_os = "linux")]
-        if super::super::agents::owner_child_reads_tty(runtime, owner.pid) {
-            return Err(encode_error(
-                id,
-                "agent_not_ready",
-                format!(
-                    "agent {} has handed the terminal to another program, such as an external editor",
-                    params.target
-                ),
-            ));
-        }
+        let CheckedListener {
+            ws_idx,
+            pane_id,
+            agent,
+            terminal_id,
+            owner,
+            listener_runtime,
+            block_runtime,
+        } = self.check_listener_write(
+            &id,
+            &params.target,
+            params.received_at,
+            ListenerWrite::Instruction,
+            |agent| params.validate(agent),
+        )?;
         let instruction_id = new_instruction_id(&id, terminal_id.as_str());
-        let block = instruction_block(&instruction_id, &params.text, &block_runtime);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(block)) {
-            return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
-        }
+        let session = agent
+            .accepts_actions
+            .then(|| {
+                agent
+                    .agent_session
+                    .as_ref()
+                    .map(|session| session.value.clone())
+            })
+            .flatten();
+        let block = instruction_block(
+            &instruction_id,
+            &params.text,
+            &block_runtime,
+            session.as_deref(),
+        );
+        self.write_listener_block(&id, ws_idx, pane_id, block)?;
         // Acks are handled by this app loop after this step, so registering now misses none.
         let now = Instant::now();
         let deadline = now + INSTRUCTION_ACK_TIMEOUT;
@@ -414,9 +480,7 @@ impl App {
             },
         );
         // Read after the write, so the result's `last_instruction` names this delivery.
-        let agent = self
-            .agent_info(resolved.ws_idx, resolved.pane_id)
-            .unwrap_or(agent);
+        let agent = self.agent_info(ws_idx, pane_id).unwrap_or(agent);
         let respond_to = respond_to.clone();
         std::thread::spawn(move || {
             // A `pending` ack means OMP took the text; wait on for the turn start or the drop,
@@ -467,6 +531,256 @@ impl App {
         Ok(())
     }
 
+    /// Like `instruct_agent`, for a structured action: the integration runs the op and acks
+    /// with its result, which a waiter thread answers with.
+    fn action_agent(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentActionParams,
+        respond_to: &std::sync::mpsc::Sender<String>,
+    ) -> Result<(), String> {
+        let CheckedListener {
+            terminal_id,
+            owner,
+            listener_runtime,
+            block_runtime,
+            ws_idx,
+            pane_id,
+            agent,
+        } = self.check_listener_write(
+            &id,
+            &params.target,
+            params.received_at,
+            ListenerWrite::Action,
+            |agent| params.validate(agent),
+        )?;
+        let action_id = new_instruction_id(&id, terminal_id.as_str());
+        // The session herdr checked `expected_session` against: OMP may have changed it since,
+        // before its session report reached herdr.
+        let session = agent
+            .agent_session
+            .as_ref()
+            .map(|session| session_tag(&session.value));
+        let body = serde_json::json!({ "op": params.op, "args": params.args, "session": session })
+            .to_string();
+        let block = listener_block(ACTION_BLOCK, &action_id, &body, &block_runtime, true);
+        self.write_listener_block(&id, ws_idx, pane_id, block)?;
+        let deadline = Instant::now() + INSTRUCTION_ACK_TIMEOUT;
+        let (tx, rx) = std::sync::mpsc::channel();
+        record_action_outcome(
+            &mut self.last_actions,
+            &terminal_id,
+            &action_id,
+            params.op,
+            crate::api::schema::ActionOutcome::Written,
+        );
+        self.pending_action_acks.insert(
+            action_id.clone(),
+            PendingActionAck {
+                op: params.op,
+                terminal_id,
+                owner,
+                runtime: listener_runtime,
+                tx,
+                deadline,
+                withdraws_listener: true,
+                keys_written: false,
+            },
+        );
+        let op = params.op;
+        let respond_to = respond_to.clone();
+        std::thread::spawn(move || {
+            let response = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(ActionResult::Done { agent, data }) => encode_success(
+                    id,
+                    ResponseResult::AgentActionDone {
+                        agent: *agent,
+                        action_id,
+                        op,
+                        data,
+                    },
+                ),
+                Ok(ActionResult::Refused(reason)) => {
+                    encode_error(id, "agent_action_refused", reason)
+                }
+                Err(_) => encode_error(
+                    id,
+                    "action_unconfirmed",
+                    format!(
+                        "OMP did not confirm action {action_id}; it discards a block it reads more than {} ms late, but a lost or late result looks the same and the action may have run, so do not send it again automatically",
+                        INSTRUCTION_EXPIRY.as_millis()
+                    ),
+                ),
+            };
+            let _ = respond_to.send(response);
+        });
+        Ok(())
+    }
+
+    /// Every check a guarded write to a pane's OMP listener needs, in one app-loop step.
+    fn check_listener_write(
+        &mut self,
+        id: &str,
+        target: &str,
+        received_at: Option<Instant>,
+        write: ListenerWrite,
+        validate: impl FnOnce(&crate::api::schema::AgentInfo) -> Result<(), &'static str>,
+    ) -> Result<CheckedListener, String> {
+        let id = id.to_string();
+        let noun = write.noun();
+        if !super::super::agents::INSTRUCTIONS_SUPPORTED {
+            return Err(encode_error(
+                id,
+                write.unsupported_code(),
+                format!("agent.{} needs process identity and terminal-reader checks this platform lacks", write.method()),
+            ));
+        }
+        // A request that waited long in the server queue would leave the caller too little of its
+        // own timeout for the ack wait, and it may have given up already: write nothing.
+        if received_at.is_some_and(|received| received.elapsed() > INSTRUCTION_QUEUE_LIMIT) {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!("the {noun} waited too long in the server queue; nothing was written"),
+            ));
+        }
+        self.expire_instruction_acks();
+        self.reconcile_managed_agent_target(target);
+        let agent = self
+            .agent_info_for_target(target)
+            .map_err(|err| encode_error_body(id.clone(), self.agent_target_error_body(err)))?;
+        validate(&agent).map_err(|code| {
+            encode_error(id.clone(), code, format!("{noun} refused before sending"))
+        })?;
+        let accepts = match write {
+            ListenerWrite::Instruction => agent.accepts_instructions,
+            ListenerWrite::Action => agent.accepts_actions,
+        };
+        if !accepts {
+            return Err(encode_error(
+                id,
+                write.unsupported_code(),
+                format!(
+                    "agent {target} has no {noun} listener registered now: OMP is restarting, exiting, switching session or reloading its extensions, or its herdr integration is older than v{}; nothing was written; retry when agent.get shows {}",
+                    write.min_integration(),
+                    write.accepts_field()
+                ),
+            ));
+        }
+        let resolved = self
+            .resolve_agent_target(target)
+            .map_err(|err| encode_error_body(id.clone(), self.agent_target_error_body(err)))?;
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+        else {
+            return Err(agent_not_found(id, target));
+        };
+        let Some(owner) = terminal.instruction_listener.clone() else {
+            return Err(agent_not_found(id, target));
+        };
+        let listener_runtime = terminal.instruction_listener_runtime.clone();
+        // The block is bound to the listener's token; without one it cannot be told apart from a
+        // person's paste, so nothing is written.
+        let Some(block_runtime) = terminal
+            .block_token
+            .clone()
+            .or_else(|| listener_runtime.clone())
+            .filter(|runtime| valid_listener_runtime(runtime))
+        else {
+            return Err(encode_error(
+                id,
+                write.unsupported_code(),
+                format!(
+                    "agent {target} registered no {noun} token; nothing was written; retry when its OMP integration reports again"
+                ),
+            ));
+        };
+        let terminal_id = terminal.id.clone();
+        let launch_pending = terminal.managed_agent_launch_pending();
+        self.settle_stale_deliveries(&terminal_id, &owner, listener_runtime.as_deref());
+        // One block per agent until the last one has its result: while a block is
+        // unconfirmed the listener may be gone, and a second block would land in the editor.
+        // An instruction also waits for its final outcome, so `last_instruction` keeps following
+        // a taken delivery that waits for its turn.
+        if self
+            .pending_action_acks
+            .values()
+            .any(|pending| pending.terminal_id == terminal_id)
+        {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!("an earlier action to agent {target} has no result yet"),
+            ));
+        }
+        if self.pending_instruction_acks.values().any(|pending| {
+            pending.terminal_id == terminal_id
+                && (write == ListenerWrite::Instruction || pending.withdraws_listener)
+        }) {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!("an earlier instruction to agent {target} has no final outcome yet"),
+            ));
+        }
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return Err(agent_not_found(id, target));
+        };
+        if !super::super::agents::owner_in_foreground_job(runtime, owner.pid) {
+            return Err(encode_error(
+                id,
+                "agent_identity_changed",
+                "the registered agent process is not the pane foreground job",
+            ));
+        }
+        if launch_pending || !runtime.bracketed_paste_enabled() {
+            return Err(agent_not_ready(id, target));
+        }
+        #[cfg(target_os = "linux")]
+        if super::super::agents::owner_child_reads_tty(runtime, owner.pid) {
+            return Err(encode_error(
+                id,
+                "agent_not_ready",
+                format!(
+                    "agent {target} has handed the terminal to another program, such as an external editor"
+                ),
+            ));
+        }
+        Ok(CheckedListener {
+            ws_idx: resolved.ws_idx,
+            pane_id: resolved.pane_id,
+            agent,
+            terminal_id,
+            owner,
+            listener_runtime,
+            block_runtime,
+        })
+    }
+
+    fn write_listener_block(
+        &self,
+        id: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        block: String,
+    ) -> Result<(), String> {
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_not_found",
+                "agent pane is gone",
+            ));
+        };
+        runtime
+            .try_send_bytes(Bytes::from(block))
+            .map_err(|err| encode_error(id.to_string(), "agent_prompt_failed", err.to_string()))
+    }
+
     /// Only the listener a block was written to can answer for it. A delivery written to an
     /// earlier process in the pane, or to the same process before an exec restart replaced its
     /// runtime, never gets a final outcome, so it is settled as `unconfirmed` at once.
@@ -497,6 +811,22 @@ impl App {
                 );
             }
         }
+        // A dropped sender tells the action's waiter that no result will come.
+        let last_actions = &mut self.last_actions;
+        self.pending_action_acks.retain(|action_id, pending| {
+            let keep = pending.terminal_id != *terminal_id
+                || (pending.owner == *owner && pending.runtime.as_deref() == runtime);
+            if !keep {
+                record_action_outcome(
+                    last_actions,
+                    &pending.terminal_id,
+                    action_id,
+                    pending.op,
+                    crate::api::schema::ActionOutcome::Unconfirmed,
+                );
+            }
+            keep
+        });
     }
 
     /// Settles deliveries whose wait has passed. A never-taken delivery may mean the listener is
@@ -515,6 +845,29 @@ impl App {
                 settle_unconfirmed(terminals, recent, instruction_id, pending, now);
                 false
             });
+        // An action block nobody acked may mean the listener is gone, as for an instruction.
+        let last_actions = &mut self.last_actions;
+        self.pending_action_acks.retain(|action_id, pending| {
+            if pending.deadline > now {
+                return true;
+            }
+            record_action_outcome(
+                last_actions,
+                &pending.terminal_id,
+                action_id,
+                pending.op,
+                crate::api::schema::ActionOutcome::Unconfirmed,
+            );
+            if let Some(terminal) = terminals.get_mut(&pending.terminal_id).filter(|terminal| {
+                pending.withdraws_listener
+                    && terminal.instruction_listener.as_ref() == Some(&pending.owner)
+            }) {
+                terminal.instruction_listener = None;
+            }
+            false
+        });
+        last_actions
+            .retain(|terminal_id, (_, until)| *until > now && terminals.contains_key(terminal_id));
         recent.retain(|terminal_id, entries| {
             entries.retain(|entry| entry.until > now);
             !entries.is_empty() && terminals.contains_key(terminal_id)
@@ -975,7 +1328,9 @@ mod tests {
                 launch_profile: "default".into(),
                 agent_pid: pid,
                 accepts_instructions,
+                accepts_actions: accepts_instructions,
                 runtime_instance: runtime.map(str::to_string),
+                block_token: None,
                 peer_pid: Some(pid),
             },
         )
@@ -1013,12 +1368,15 @@ mod tests {
     fn sent_instruction_id(rx: &mut tokio::sync::mpsc::Receiver<Bytes>, text: &str) -> String {
         let bytes = rx.try_recv().expect("the instruction was written");
         let written = std::str::from_utf8(&bytes).unwrap();
+        // An action listener (integration v14) gets v4, which adds the session tag.
         let header = written
             .strip_prefix("\x1b[200~herdr-instruction:v3:")
+            .or_else(|| written.strip_prefix("\x1b[200~herdr-instruction:v4:"))
             .and_then(|rest| rest.split_once('\n'))
             .expect("marked paste")
             .0;
-        let [id, expires_ms, length, runtime] = header.split(':').collect::<Vec<_>>()[..] else {
+        let fields = header.split(':').collect::<Vec<_>>();
+        let [id, expires_ms, length, runtime] = fields[..fields.len().min(4)] else {
             panic!("header {header:?}");
         };
         assert!(
@@ -1039,9 +1397,14 @@ mod tests {
         );
         assert_eq!(length, text.len().to_string());
         assert!(valid_listener_runtime(runtime), "{runtime:?}");
+        let version = if fields.len() == 5 { "v4" } else { "v3" };
         assert_eq!(
             written,
-            format!("\x1b[200~herdr-instruction:v3:{header}\n{text}\x1b[201~")
+            if version == "v4" {
+                format!("\x1b[200~herdr-instruction:v4:{header}\n{text}\nherdr-end:{id}\x1b[201~")
+            } else {
+                format!("\x1b[200~herdr-instruction:v3:{header}\n{text}\x1b[201~")
+            }
         );
         assert!(rx.try_recv().is_err(), "nothing follows the paste");
         id.to_string()
@@ -2431,5 +2794,499 @@ mod tests {
                 Some("shell-pane")
             );
         }
+    }
+
+    /// `agent.action` params for the fixture agent that `instruct` params were made for.
+    #[cfg(target_os = "linux")]
+    fn action_params(
+        instruct: &AgentInstructParams,
+        op: crate::api::schema::AgentActionOp,
+        args: serde_json::Value,
+    ) -> crate::api::schema::AgentActionParams {
+        crate::api::schema::AgentActionParams {
+            target: instruct.target.clone(),
+            op,
+            args: args.as_object().unwrap().clone(),
+            expected_terminal_id: instruct.expected_terminal_id.clone(),
+            expected_name: instruct.expected_name.clone(),
+            expected_agent: instruct.expected_agent.clone(),
+            expected_session: instruct.expected_session.clone(),
+            expected_runtime_id: instruct.expected_runtime_id.clone(),
+            expected_workspace_id: instruct.expected_workspace_id.clone(),
+            expected_cwd: instruct.expected_cwd.clone(),
+            received_at: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_action(
+        app: &mut App,
+        params: crate::api::schema::AgentActionParams,
+    ) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(app.handle_deferred_agent_api_request(
+            crate::api::schema::Request {
+                id: "action".into(),
+                method: crate::api::schema::Method::AgentAction(params)
+            },
+            tx
+        ));
+        rx
+    }
+
+    /// The written `herdr-action:v1` block's id and JSON body.
+    #[cfg(target_os = "linux")]
+    fn sent_action(rx: &mut tokio::sync::mpsc::Receiver<Bytes>) -> (String, serde_json::Value) {
+        let bytes = rx.try_recv().expect("the action was written");
+        let written = std::str::from_utf8(&bytes).unwrap();
+        let (header, body) = written
+            .strip_prefix("\x1b[200~herdr-action:v1:")
+            .and_then(|rest| rest.strip_suffix("\x1b[201~"))
+            .and_then(|rest| rest.split_once('\n'))
+            .expect("marked action block");
+        let fields: Vec<_> = header.split(':').collect();
+        // The body ends with the end line that names the block.
+        let body = body
+            .strip_suffix(&format!("\nherdr-end:{}", fields[0]))
+            .expect("end line");
+        assert_eq!(fields[2].parse::<usize>().unwrap(), body.len());
+        assert_eq!(fields[3], FIXTURE_RUNTIME);
+        (fields[0].to_string(), serde_json::from_str(body).unwrap())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ack_action(
+        app: &mut App,
+        target: &str,
+        action_id: &str,
+        peer_pid: u32,
+        ok: bool,
+        error: Option<&str>,
+        keys: Vec<String>,
+    ) -> String {
+        app.handle_pane_ack_action(
+            "ack".into(),
+            crate::api::schema::PaneAckActionParams {
+                pane_id: target.into(),
+                action_id: action_id.into(),
+                agent_pid: std::process::id(),
+                ok,
+                error: error.map(str::to_string),
+                data: serde_json::json!({ "dialog_id": "c1" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                keys,
+                peer_pid: Some(peer_pid),
+            },
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_action_reaches_only_a_listener_with_action_support_and_returns_its_result() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Blocked);
+        let target = instruct.target.clone();
+        let answer = serde_json::json!({ "dialog_id": "c1", "approve": false });
+        let error_code = |response: String| {
+            serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+                .unwrap()
+                .error
+        };
+        // An integration older than v14 never registered action support.
+        let refused = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::Answer, answer.clone()),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+        assert_eq!(error_code(refused).code, "agent_action_unsupported");
+        assert!(rx.try_recv().is_err());
+
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::Answer, answer.clone()),
+        );
+        let (action_id, body) = sent_action(&mut rx);
+        // The block names the session herdr checked, so OMP refuses it in another session.
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "op": "answer",
+                "args": answer,
+                "session": session_tag(&fixture_session_path()),
+            })
+        );
+        // A second write waits until the first block has its result.
+        let busy = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::Abort, serde_json::json!({})),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+        assert_eq!(error_code(busy).code, "agent_not_ready");
+        // Only the process the block went to can answer for it.
+        let foreign = ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id() + 1,
+            true,
+            None,
+            vec![],
+        );
+        assert!(foreign.contains("process_mismatch"), "{foreign}");
+        let ok = ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            true,
+            None,
+            vec!["\x1b[B\r".into()],
+        );
+        assert!(ok.contains("\"ok\""), "{ok}");
+        // The answer keys are written, once; the caller waits for the dialog to close.
+        assert_eq!(&rx.try_recv().unwrap()[..], b"\x1b[B\r");
+        let again = ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            true,
+            None,
+            vec!["\r".into()],
+        );
+        // A resent keyed ack is answered ok, and the keys are not written twice.
+        assert!(again.contains("\"ok\""), "{again}");
+        assert!(rx.try_recv().is_err());
+        assert!(response.recv_timeout(Duration::from_millis(50)).is_err());
+        ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            true,
+            None,
+            vec![],
+        );
+        let done: SuccessResponse =
+            serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        let ResponseResult::AgentActionDone {
+            action_id: done_id,
+            op,
+            data,
+            ..
+        } = done.result
+        else {
+            panic!("{:?}", done.result);
+        };
+        assert_eq!(
+            (done_id.as_str(), op),
+            (action_id.as_str(), AgentActionOp::Answer)
+        );
+        assert_eq!(data["dialog_id"], "c1");
+        let outcome = |app: &App| {
+            app.agent_info_for_target(&target)
+                .unwrap()
+                .last_action
+                .map(|last| (last.action_id, last.outcome))
+        };
+        assert_eq!(
+            outcome(&app),
+            Some((action_id.clone(), crate::api::schema::ActionOutcome::Done))
+        );
+        // A late ack for a settled action is not found.
+        let late = ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            true,
+            None,
+            vec![],
+        );
+        assert!(late.contains("action_not_found"), "{late}");
+
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::Answer, answer.clone()),
+        );
+        let (action_id, _) = sent_action(&mut rx);
+        ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            false,
+            Some("dialog_changed: another dialog"),
+            vec![],
+        );
+        let refused = error_code(response.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert_eq!(refused.code, "agent_action_refused");
+        assert!(refused.message.starts_with("dialog_changed:"));
+        assert_eq!(
+            outcome(&app),
+            Some((action_id, crate::api::schema::ActionOutcome::Refused))
+        );
+
+        // No result in time: unconfirmed, and the listener counts as gone until it reports again.
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::Abort, serde_json::json!({})),
+        );
+        let (action_id, _) = sent_action(&mut rx);
+        assert_eq!(
+            outcome(&app),
+            Some((
+                action_id.clone(),
+                crate::api::schema::ActionOutcome::Written
+            ))
+        );
+        let unconfirmed = error_code(response.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(unconfirmed.code, "action_unconfirmed");
+        app.expire_instruction_acks();
+        let info = app.agent_info_for_target(&target).unwrap();
+        assert!(!info.accepts_instructions && !info.accepts_actions);
+        // A caller can tell this withdrawal from an integration without action support.
+        assert_eq!(
+            outcome(&app),
+            Some((action_id, crate::api::schema::ActionOutcome::Unconfirmed))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn omp_detail_comes_only_from_the_registered_listener_and_ends_with_it() {
+        let (mut app, instruct, _rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        let detail = crate::api::schema::OmpDetail {
+            model: Some("openai/gpt-5.1".into()),
+            thinking: Some("high".into()),
+            tool: None,
+            context: Some(crate::api::schema::OmpContext {
+                tokens: 1200,
+                window: 200_000,
+                percent: 1,
+            }),
+            todos: None,
+            dialog: None,
+            updated_ms: 1,
+        };
+        let report = |app: &mut App, runtime: &str, peer_pid: u32| {
+            app.handle_pane_report_omp_detail(
+                "detail".into(),
+                crate::api::schema::PaneReportOmpDetailParams {
+                    pane_id: target.clone(),
+                    agent_pid: std::process::id(),
+                    runtime_instance: runtime.into(),
+                    omp: detail.clone(),
+                    peer_pid: Some(peer_pid),
+                },
+            )
+        };
+        assert!(
+            report(&mut app, "another-runtime", std::process::id()).contains("process_mismatch")
+        );
+        assert!(
+            report(&mut app, FIXTURE_RUNTIME, std::process::id() + 1).contains("process_mismatch")
+        );
+        assert_eq!(app.agent_info_for_target(&target).unwrap().omp, None);
+        assert!(report(&mut app, FIXTURE_RUNTIME, std::process::id()).contains("\"ok\""));
+        assert_eq!(
+            app.agent_info_for_target(&target).unwrap().omp,
+            Some(detail.clone())
+        );
+        // An exec restart registers a new runtime: the old detail is gone.
+        report_session_from(&mut app, &target, 50, true, Some("next-runtime"));
+        let info = app.agent_info_for_target(&target).unwrap();
+        assert!(info.accepts_actions);
+        assert_eq!(info.omp, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unconfirmed_action_keeps_a_listener_that_reported_since() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::Abort, serde_json::json!({})),
+        );
+        sent_action(&mut rx);
+        // The integration reports again (a session change) before the result is due.
+        report_session(&mut app, &target, 60, true);
+        response.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.expire_instruction_acks();
+        assert!(app.agent_info_for_target(&target).unwrap().accepts_actions);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn answer_keys_are_not_written_once_another_program_reads_the_terminal() {
+        use crate::api::schema::AgentActionOp;
+        let pane_id = app_with_agent().state.workspaces[0].tabs[0].root_pane;
+        let (events, _events_rx) = tokio::sync::mpsc::channel(32);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            pane_id,
+            24,
+            80,
+            std::env::temp_dir(),
+            0,
+            Default::default(),
+            None,
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        )
+        .unwrap();
+        let owner_pid = runtime.child_pid().unwrap();
+        // The "agent" reads one line (the block header) itself, then starts `cat`, which reads
+        // the terminal in its place, as OMP's external editor does.
+        runtime
+            .try_send_bytes(Bytes::from_static(
+                b"printf '\\033[?2004h'; exec sh -c 'read line; cat; exec sleep 30'\n",
+            ))
+            .unwrap();
+        let job_size =
+            || crate::detect::foreground_job(owner_pid).map_or(0, |job| job.processes.len());
+        let execed = || {
+            std::fs::read_to_string(format!("/proc/{owner_pid}/cmdline"))
+                .is_ok_and(|cmd| cmd.contains("read line"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(execed() && job_size() == 1 && runtime.bracketed_paste_enabled())
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let owner = crate::platform::observe_process(owner_pid)
+            .unwrap()
+            .unwrap();
+        let (mut app, instruct) = guarded_app(AgentState::Blocked, owner, runtime);
+        let target = instruct.target.clone();
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::Answer,
+                serde_json::json!({ "dialog_id": "c1", "approve": true }),
+            ),
+        );
+        let action_id = app.pending_action_acks.keys().next().unwrap().clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job_size() != 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(job_size(), 2, "the agent and its tty-reading child");
+        let ack = app.handle_pane_ack_action(
+            "ack".into(),
+            crate::api::schema::PaneAckActionParams {
+                pane_id: target,
+                action_id,
+                agent_pid: owner_pid,
+                ok: true,
+                error: None,
+                data: Default::default(),
+                keys: vec!["\x1b[A\r".into()],
+                peer_pid: Some(owner_pid),
+            },
+        );
+        assert!(ack.contains("keys_not_written"), "{ack}");
+        let refused: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert_eq!(refused.error.code, "agent_action_refused");
+        assert!(
+            refused.error.message.contains("another program reads"),
+            "{}",
+            refused.error.message
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_instruction_to_an_action_listener_names_its_session() {
+        let (mut app, params, mut rx) = guarded_fixture(AgentState::Idle);
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let _response = start_instruct(&mut app, params);
+        let bytes = rx.try_recv().expect("the instruction was written");
+        let written = std::str::from_utf8(&bytes).unwrap();
+        let header = written
+            .strip_prefix("\x1b[200~herdr-instruction:v4:")
+            .and_then(|rest| rest.split_once('\n'))
+            .expect("a v4 block")
+            .0;
+        let fields: Vec<_> = header.split(':').collect();
+        assert_eq!(fields[3], FIXTURE_RUNTIME);
+        assert_eq!(fields[4], session_tag(&fixture_session_path()));
+        // The body ends with the end line, so the integration can cut a pasted block out exactly.
+        assert!(
+            written.ends_with(&format!("\nherdr-end:{}\x1b[201~", fields[0])),
+            "{written:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn blocks_carry_the_token_the_listener_registered_last() {
+        let (mut app, params, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = params.target.clone();
+        let pid = std::process::id();
+        for (seq, token) in [(70, "token-one"), (71, "token-two")] {
+            let reply = app.handle_pane_report_agent_session_v2(
+                "v2".into(),
+                crate::api::schema::PaneReportAgentSessionV2Params {
+                    pane_id: target.clone(),
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    seq: Some(seq),
+                    agent_session_id: None,
+                    agent_session_path: Some(fixture_session_path()),
+                    session_start_source: Some("startup".into()),
+                    launch_profile: "default".into(),
+                    agent_pid: pid,
+                    accepts_instructions: true,
+                    accepts_actions: true,
+                    runtime_instance: Some(FIXTURE_RUNTIME.into()),
+                    block_token: Some(token.into()),
+                    peer_pid: Some(pid),
+                },
+            );
+            assert!(reply.contains("\"ok\""), "{reply}");
+        }
+        let _response = start_instruct(&mut app, params);
+        let bytes = rx.try_recv().expect("the instruction was written");
+        let header = std::str::from_utf8(&bytes)
+            .unwrap()
+            .strip_prefix("\x1b[200~herdr-instruction:v4:")
+            .and_then(|rest| rest.split_once('\n'))
+            .expect("a v4 block")
+            .0
+            .to_string();
+        // The latest token, not the runtime id or an earlier token.
+        assert_eq!(header.split(':').nth(3), Some("token-two"));
     }
 }

@@ -139,7 +139,10 @@ pub struct App {
     pub(crate) omp_launchers: std::collections::BTreeMap<String, String>,
     pub(crate) pending_instruction_acks:
         std::collections::HashMap<String, api::agents::PendingInstructionAck>,
+    pub(crate) pending_action_acks:
+        std::collections::HashMap<String, api::agents::PendingActionAck>,
     pub(crate) recent_instructions: api::agents::RecentInstructions,
+    pub(crate) last_actions: api::agents::LastActions,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
@@ -603,7 +606,9 @@ impl App {
             next_agent_resume_at: None,
             omp_launchers: config.session.omp_launchers.clone(),
             pending_instruction_acks: std::collections::HashMap::new(),
+            pending_action_acks: std::collections::HashMap::new(),
             recent_instructions: std::collections::HashMap::new(),
+            last_actions: std::collections::HashMap::new(),
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,

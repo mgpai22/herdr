@@ -42,4 +42,7 @@ pub struct ServerCapabilities {
     /// Supports `agent.instruct` delivery acknowledged by the OMP integration.
     #[serde(default)]
     pub agent_instruct: bool,
+    /// Supports `agent.action` structured OMP actions acknowledged by the OMP integration.
+    #[serde(default)]
+    pub agent_action: bool,
 }

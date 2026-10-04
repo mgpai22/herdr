@@ -1086,7 +1086,7 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params);
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
-            Method::AgentPrompt(_) | Method::AgentInstruct(_) => {
+            Method::AgentPrompt(_) | Method::AgentInstruct(_) | Method::AgentAction(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
@@ -1162,6 +1162,12 @@ impl App {
             }
             Method::PaneAckInstruction(params) => {
                 return self.handle_pane_ack_instruction(request.id, params);
+            }
+            Method::PaneAckAction(params) => {
+                return self.handle_pane_ack_action(request.id, params);
+            }
+            Method::PaneReportOmpDetail(params) => {
+                return self.handle_pane_report_omp_detail(request.id, params);
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
