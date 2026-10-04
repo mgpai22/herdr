@@ -389,8 +389,12 @@ let statusText: string | undefined;
 // agent type, the running tool and `person` (a message that neither the task executor nor herdr
 // sent reached the current run: a person's chat from OMP's agent view, or another client's).
 // The root binding counts runs: OMP's registry flips a subagent between running and idle at every
-// turn of one task run, and a new run starts only after the previous one handed over its result
-// or was parked (a `task` resume, a wake, or a person's chat with the finished subagent).
+// turn of one task run, and a new run starts only once the previous one is over: OMP's executor
+// finished it (with a result or not; it then hands the subagent to the lifecycle manager), it
+// handed over its result, or it was parked. A `task` resume, a wake and a person's chat with the
+// finished subagent each start a new run. Inside a woken run every turn counts as a new run: that
+// over-count only makes a caller read again. A subagent that a run with `person` set spawns
+// starts with `person` set too: it does that person's work.
 type SubagentInfo = {
   type?: string;
   tool?: { name: string; call_id?: string; started_ms: number };
@@ -418,7 +422,12 @@ function observeRun(ref: any): SubagentInfo {
   const info = subagentEntry(ref.id);
   if (info.status === undefined) {
     info.accepted = ref.lifecycle?.acceptedAt !== undefined;
-  } else if (ref.status === "running" && info.status !== "running" && (info.accepted || info.status === "parked")) {
+    if (typeof ref.parentId === "string" && subagentInfo.get(ref.parentId)?.person) info.person = true;
+  } else if (
+    ref.status === "running" &&
+    info.status !== "running" &&
+    (info.accepted || info.status === "parked" || runFinished(ref))
+  ) {
     info.run += 1;
     info.accepted = false;
     info.person = false;
@@ -431,6 +440,18 @@ function observeRun(ref: any): SubagentInfo {
 let onSubagentChange: (() => void) | undefined;
 // OMP's agent lifecycle manager, loaded once; undefined when it does not load as OMP's own.
 let lifecycleManager: Promise<any> | undefined;
+// The same manager once loaded, for the synchronous registry listener.
+let lifecycleLoaded: any;
+
+// OMP's executor finished the subagent's run: it adopts every finished or failed subagent it keeps
+// alive (`finalizeSubagentLifecycle`), and only then.
+function runFinished(ref: any): boolean {
+  try {
+    return lifecycleLoaded?.global?.().has?.(ref.id, ref) === true;
+  } catch {
+    return false;
+  }
+}
 
 function loadLifecycleManager(registryClass: unknown): Promise<any> {
   lifecycleManager ??= (async () => {
@@ -442,15 +463,19 @@ function loadLifecycleManager(registryClass: unknown): Promise<any> {
     // registry, and a release there would cancel nothing.
     if (registryClass === undefined || registry?.AgentRegistry !== registryClass) return undefined;
     const manager = lifecycle?.AgentLifecycleManager;
-    return typeof manager?.global === "function" ? manager : undefined;
+    if (typeof manager?.global !== "function") return undefined;
+    lifecycleLoaded = manager;
+    return manager;
   })().catch(() => undefined);
   return lifecycleManager;
 }
 
-// C0 and C1 controls, line and paragraph separators, and bidirectional controls: OMP's renderer
+// C0 and C1 controls, line and paragraph separators, and format characters: OMP's renderer
 // strips some of these and keeps others, so the text a person sees could differ from the text
 // herdr reports, or reorder in a terminal behind herdr.
-const UNSAFE_TEXT = /[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+// Format characters (every bidi control among them) are invisible; the joiners and tag characters
+// that emoji sequences need stay allowed.
+const UNSAFE_TEXT = /[\x00-\x1f\x7f-\x9f\u2028\u2029]|(?![\u200c\u200d\u{e0020}-\u{e007f}])\p{Cf}/u;
 
 function isOneLine(text: unknown, max: number): text is string {
   return typeof text === "string" && text.trim().length > 0 && text.length <= max && !UNSAFE_TEXT.test(text);
@@ -2078,6 +2103,8 @@ export default function (pi) {
     onSubagentChange = () => {
       if (rootSession) scheduleDetail();
     };
+    // Run counting needs to know when OMP's executor finished a run (`runFinished`).
+    void loadLifecycleManager(pi.pi?.AgentRegistry);
     if (!unsubscribeRegistry) {
       try {
         const off = agentRegistry()?.onChange?.((event: any) => {

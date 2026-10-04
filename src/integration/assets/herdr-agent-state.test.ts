@@ -2920,13 +2920,28 @@ test("Oh My Pi keeps the tool list that fits when both lists are too large", asy
 test("Oh My Pi refuses text with controls a terminal or OMP would show differently", async () => {
   const notices: unknown[][] = [];
   const omp = await installOmpForActions("omp-unsafe-text", {}, { notify: (...args: unknown[]) => notices.push(args), setStatus: () => {} });
-  for (const text of ["st \u009b7mINV", "next\u0085line", "bidi \u202edesrever", "sep \u2028 ls", "mark\u200f", "iso\u2066x"]) {
+  for (const text of [
+    "st \u009b7mINV",
+    "next\u0085line",
+    "bidi \u202edesrever",
+    "sep \u2028 ls",
+    "mark\u200f",
+    "iso\u2066x",
+    "alm \u061cXYZ",
+    "zw\u200bsp",
+    "bom\ufeff",
+  ]) {
     expect((await omp.act({ op: "notify", args: { text } })).ack.error).toStartWith("invalid_args:");
     expect((await omp.act({ op: "status", args: { text } })).ack.error).toStartWith("invalid_args:");
     expect((await omp.act({ op: "command", args: { name: "name", args: { title: text } } })).ack.error).toStartWith("invalid_args:");
   }
   expect((await omp.act({ op: "notify", args: { text: "ünïcode — ok" } })).ack.ok).toBe(true);
-  expect(notices).toEqual([["ünïcode — ok", "info"]]);
+  // Emoji sequences keep their joiners.
+  expect((await omp.act({ op: "notify", args: { text: "team 👩\u200d💻" } })).ack.ok).toBe(true);
+  expect(notices).toEqual([
+    ["ünïcode — ok", "info"],
+    ["team 👩\u200d💻", "info"],
+  ]);
 });
 
 test("Oh My Pi steers and cancels only the subagent run the caller read", async () => {
@@ -3053,4 +3068,59 @@ test("Oh My Pi does not report a cancel that OMP's release did not apply", async
   expect(ack.ok).toBe(false);
   expect(ack.error).toBe("subagent_not_running: gone ended before the cancel");
   expect(ack.data?.cancelled).toBeUndefined();
+});
+
+test("Oh My Pi starts a new run when a subagent whose run OMP finished without a result wakes", async () => {
+  const calls: string[] = [];
+  const ref: any = subRef("Ha", { session: { isStreaming: true, abort: async () => void calls.push("abort") } });
+  const { registry, pi } = fakeRegistry([ref]);
+  const adopted = new Set<unknown>();
+  lifecycle.manager = {
+    has: (id: string, expected: unknown) => id === "Ha" && adopted.has(expected),
+    release: async () => {
+      calls.push("release");
+      return true;
+    },
+  };
+  const omp = await installOmpForActions("omp-subagent-failed-wake", { pi });
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.run === 1);
+  // A provider error ends the run without a result; OMP's executor keeps the subagent alive.
+  ref.status = "idle";
+  registry.changed();
+  adopted.add(ref);
+  // The parent writes agent://Ha: the subagent wakes for new work.
+  ref.status = "running";
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.run === 2, 3_000);
+  const ack = (await omp.act({ op: "subagent_cancel", args: { subagent_id: "Ha", expected_run: 1 } })).ack;
+  expect(ack.error).toBe("subagent_changed: Ha is on run 2 now, not run 1; read agent.get again");
+  expect(calls).toEqual([]);
+});
+
+test("Oh My Pi protects a subagent that a run someone else chats with spawned", async () => {
+  const calls: string[] = [];
+  const session = { isStreaming: true, sendUserMessage: async () => void calls.push("steer"), abort: async () => {} };
+  const refs: any[] = [subRef("RCa", { session })];
+  const { registry, pi } = fakeRegistry(refs);
+  lifecycle.manager = {
+    release: async () => {
+      calls.push("release");
+      return true;
+    },
+  };
+  const omp = await installOmpForActions("omp-subagent-person-child", { pi });
+  const sub = { hasUI: false, agent: { kind: "sub", id: "RCa", name: "task", depth: 1 } };
+  await omp.harness.handlers.get("message_start")?.(
+    { message: { role: "user", content: [{ type: "text", text: "Person here: start Kid1 and wait for it." }] } },
+    sub,
+  );
+  // The person's run spawns a child of its own.
+  refs.push(subRef("RCa.Kid1", { parentId: "RCa", sessionFile: "/tmp/omp-instruct/RCa/RCa.Kid1.jsonl", session }));
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.some((item: any) => item.id === "RCa.Kid1" && item.person), 3_000);
+  for (const op of ["subagent_steer", "subagent_cancel"]) {
+    const ack = (await omp.act({ op, args: { subagent_id: "RCa.Kid1", text: "[sahur] x", expected_run: 1 } })).ack;
+    expect(ack.error).toStartWith("subagent_person_chat:");
+  }
+  expect(calls).toEqual([]);
 });

@@ -306,9 +306,11 @@ pub enum AgentActionOp {
     Notify,
     /// `args.text` (one line; `null` or omitted clears): set Herdr's status-line text in OMP.
     Status,
-    /// `args.subagent_id` and `args.text`: send a running subagent of the session an aside.
+    /// `args.subagent_id`, `args.expected_run` (the `run` of the subagent's row the caller read)
+    /// and `args.text`: queue an aside into that run of a running subagent of the session.
     SubagentSteer,
-    /// `args.subagent_id`: cancel a running subagent of the session.
+    /// `args.subagent_id` and `args.expected_run` (the `run` of the subagent's row the caller
+    /// read): cancel that run of a running subagent of the session.
     SubagentCancel,
 }
 
