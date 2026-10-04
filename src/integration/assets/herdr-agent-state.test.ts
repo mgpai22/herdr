@@ -2493,3 +2493,56 @@ test("Oh My Pi tells herdr about a moved session while idle", async () => {
     3_000,
   );
 });
+
+test("Oh My Pi registers again after a cancelled switch that follows a move the watch has not seen", async () => {
+  process.env.HERDR_OMP_SWITCH_WAIT_MS = "200";
+  process.env.HERDR_OMP_SWITCH_POLL_MS = "50";
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "600000";
+  const omp = await installOmpForActions("omp-move-then-cancel");
+  delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+  let file = "/tmp/omp-instruct.jsonl";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+  const reports = () =>
+    omp.harness.requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as {
+      params: Record<string, any>;
+    }[];
+  // A person's /move, then at once a /new that another extension cancels: no session event follows.
+  file = "/tmp/moved-cancel/omp-instruct.jsonl";
+  await omp.harness.handlers.get("session_before_switch")?.({ reason: "new" }, omp.harness.context);
+  expect(reports().at(-1)?.params.accepts_instructions).toBe(false);
+  await waitFor(
+    () => reports().at(-1)?.params.accepts_instructions === true && reports().at(-1)?.params.agent_session_path === file,
+    3_000,
+  );
+  delete process.env.HERDR_OMP_SWITCH_WAIT_MS;
+  delete process.env.HERDR_OMP_SWITCH_POLL_MS;
+  expect((await omp.act({ op: "abort", args: {}, session: tagOf(file) })).ack.ok).toBe(true);
+});
+
+test("Oh My Pi reports a session moved during a long outage once herdr answers", async () => {
+  const { received, state } = await startOutageServer("omp-move-outage");
+  process.env.HERDR_OMP_SESSION_RETRY_MS = "10";
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "50";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+  let file = "/tmp/omp-move-outage.jsonl";
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    ui: { onTerminalInput: () => () => {} },
+    sessionManager: { getSessionFile: () => file, getSessionId: () => "omp-move-outage" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.params?.agent_session_path === file));
+  state.outage = true;
+  // A person's /move while herdr does not answer.
+  file = "/tmp/moved-outage/omp-move-outage.jsonl";
+  // Longer than the 8 quick session retries (10 ms doubling: about 2.6 s).
+  await Bun.sleep(4_500);
+  const before = received.length;
+  state.outage = false;
+  await waitFor(() => received.slice(before).some((request) => request.params?.agent_session_path === file), 9_000);
+}, 20_000);

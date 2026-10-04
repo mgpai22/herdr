@@ -359,9 +359,10 @@ const droppedWatchMs = 10_000;
 // Longer than OMP's 30 s cap for one extension handler, so a capped handler of another
 // extension (OMP then goes on with the change) is seen as a change still applying.
 const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 40_000);
-const switchPollMs = parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000);
+// Interval knobs are at least 10 ms: 0 would spin for the life of the pane.
+const switchPollMs = Math.max(parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000), 10);
 // How often the integration looks for a moved session file (`/move`, `/wt`).
-const moveWatchMs = parseDurationEnv("HERDR_OMP_MOVE_WATCH_MS", 3000);
+const moveWatchMs = Math.max(parseDurationEnv("HERDR_OMP_MOVE_WATCH_MS", 3000), 10);
 // How long OMP may take to report that a dialog closed after a person's key.
 const closeReportWaitMs = 300;
 
@@ -478,6 +479,9 @@ function followSessionMove(ctx: any): boolean {
   movedSessionTags.push(tagOf(before));
   movedSessionTags.splice(0, movedSessionTags.length - 8);
   updateSessionRef(ctx);
+  // Nothing reports a move again (only the next turn would), so keep trying while herdr is
+  // unreachable, as for a lost report: a herdr restart must resume the moved file.
+  reportsLost = true;
   void reportSession();
   return true;
 }
@@ -1902,7 +1906,7 @@ export default function (pi) {
       if (now !== sessionKey || Date.now() - stableSince < switchWaitMs) return;
       clearInterval(watch);
       registerInstructionListener(ctx);
-      void reportSession();
+      if (!followSessionMove(ctx)) void reportSession();
     }, switchPollMs);
     watch.unref?.();
   }
@@ -1920,16 +1924,18 @@ export default function (pi) {
   // applying (other extensions' handlers, a flush, an advisor drain) keeps it withdrawn; any change
   // of the session OMP runs (a swap, a rollback) starts the wait over. Residual: two other
   // handlers that each hit the cap take longer than the wait; a block that then arrives after
-  // OMP changed its session file is still refused at take time (`liveSessionMoved`). The withdrawal report gets one attempt of
-  // at most 1 s, so a herdr that accepts but does not answer delays the person's switch by that
-  // much.
+  // OMP changed its session is still refused at take time (`liveSessionMoved`). The withdrawal
+  // report gets one attempt of at most 1 s, so a herdr that accepts but does not answer delays the
+  // person's switch by that much.
   for (const event of ["session_before_switch", "session_before_branch"]) {
     pi.on(event, async (_event, ctx) => {
       if (!rootSession) return undefined;
       unsubscribeInstructions?.();
       unsubscribeInstructions = undefined;
       instructionListener = false;
-      watchWithdrawal(ctx, activations, currentSessionKey());
+      // The session OMP runs now, which is the one before the event (OMP swaps later). The stored
+      // key can still name the file from before a `/move` the watch has not seen yet.
+      watchWithdrawal(ctx, activations, readSessionKey(ctx) ?? currentSessionKey());
       const sessionRef = currentSessionRef();
       if (sessionRef) {
         await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
