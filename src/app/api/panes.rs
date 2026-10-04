@@ -1806,6 +1806,10 @@ impl App {
             terminal.instruction_listener = listener;
             terminal.instruction_listener_runtime = runtime;
             terminal.action_listener = params.accepts_instructions && params.accepts_actions;
+            terminal.block_token = params
+                .block_token
+                .clone()
+                .filter(|_| params.accepts_instructions);
         }
         for pending in self.pending_instruction_acks.values_mut() {
             if pending.terminal_id == terminal_id {

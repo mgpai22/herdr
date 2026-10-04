@@ -3515,6 +3515,13 @@
                 "null"
               ]
             },
+            "block_token": {
+              "description": "The token Herdr puts in instruction and action blocks for this listener (OMP integration\nv14+, new on every session registration). Without it the blocks carry `runtime_instance`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "launch_profile": {
               "type": "string"
             },

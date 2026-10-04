@@ -5,6 +5,7 @@
 // HERDR_INTEGRATION_VERSION=14
 // @ts-nocheck
 
+import { createHash } from "node:crypto";
 import net from "node:net";
 import path from "node:path";
 
@@ -29,28 +30,32 @@ function enabled() {
   );
 }
 
-let requestQueue: Promise<boolean> = Promise.resolve(true);
+// What became of a request: `ok`, `unreachable` (no answer: herdr is down, busy or gone), or the
+// error code herdr answered with.
+type Reply = string;
 
-function sendRequestAttempt(request: any, timeoutMs: number): Promise<boolean> {
+let requestQueue: Promise<Reply> = Promise.resolve("ok");
+
+function sendRequestAttempt(request: any, timeoutMs: number): Promise<Reply> {
   if (!enabled()) {
-    return Promise.resolve(true);
+    return Promise.resolve("ok");
   }
 
   return new Promise((resolve) => {
     let done = false;
     let response = "";
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    const finish = (delivered: boolean) => {
+    const finish = (reply: Reply) => {
       if (done) return;
       done = true;
       if (timeout) clearTimeout(timeout);
       socket.destroy();
-      resolve(delivered);
+      resolve(reply);
     };
 
     const socket = net.createConnection(socketEndpoint!);
     socket.setEncoding("utf8");
-    socket.on("error", () => finish(false));
+    socket.on("error", () => finish("unreachable"));
     socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
     socket.on("data", (chunk) => {
       response += chunk;
@@ -58,26 +63,27 @@ function sendRequestAttempt(request: any, timeoutMs: number): Promise<boolean> {
       if (newline < 0) return;
       try {
         const parsed = JSON.parse(response.slice(0, newline));
-        finish(parsed?.id === request.id && parsed?.result?.type === "ok");
+        if (parsed?.id === request.id && parsed?.result?.type === "ok") finish("ok");
+        else finish(typeof parsed?.error?.code === "string" ? parsed.error.code : "invalid_response");
       } catch {
-        finish(false);
+        finish("invalid_response");
       }
     });
-    socket.on("end", () => finish(false));
-    timeout = setTimeout(() => finish(false), timeoutMs);
+    socket.on("end", () => finish("unreachable"));
+    timeout = setTimeout(() => finish("unreachable"), timeoutMs);
     timeout.unref?.();
   });
 }
 
-async function sendRequestNow(buildRequest: () => unknown): Promise<boolean> {
-  if (await sendRequestAttempt(buildRequest(), 500)) return true;
+async function sendRequestNow(buildRequest: () => unknown): Promise<Reply> {
+  if ((await sendRequestAttempt(buildRequest(), 500)) === "ok") return "ok";
   // A retry of the same wire object turns a lost-then-applied first attempt
   // into a stale duplicate, so each attempt builds a fresh request with a new
   // id and seq.
   return sendRequestAttempt(buildRequest(), 1500);
 }
 
-function sendRequest(buildRequest: () => unknown): Promise<boolean> {
+function sendRequest(buildRequest: () => unknown): Promise<Reply> {
   requestQueue = requestQueue.then(
     () => sendRequestNow(buildRequest),
     () => sendRequestNow(buildRequest),
@@ -114,13 +120,36 @@ const launchProfile = (process.env.OMP_PROFILE ?? process.env.PI_PROFILE)?.trim(
 const runtimeSlot = globalThis as { [key: symbol]: string | undefined };
 const RUNTIME_KEY = Symbol.for("herdr.omp.runtime");
 const runtimeInstance = (runtimeSlot[RUNTIME_KEY] ??= crypto.randomUUID());
+// The token herdr puts in instruction and action blocks: only herdr learns it, over the
+// peer-checked socket. It changes on every session registration, and at once when a block is found
+// in OMP's editor (where a person, the session file and the model could read it), so a leaked token
+// stops working. The previous token keeps working for a few seconds after a normal change, for a
+// block herdr wrote before it learned the new one.
+type BlockTokens = { current: string; previous?: string; previousUntil?: number };
+const tokenSlot = globalThis as { [key: symbol]: BlockTokens | undefined };
+const TOKEN_KEY = Symbol.for("herdr.omp.blockToken");
+const blockTokens = (tokenSlot[TOKEN_KEY] ??= { current: crypto.randomUUID() });
+
+function rotateBlockToken(keepPrevious: boolean): void {
+  blockTokens.previous = keepPrevious ? blockTokens.current : undefined;
+  blockTokens.previousUntil = keepPrevious ? Date.now() + 10_000 : undefined;
+  blockTokens.current = crypto.randomUUID();
+}
+
+function isBlockToken(token: string): boolean {
+  return (
+    token === blockTokens.current ||
+    (token === blockTokens.previous && Date.now() < (blockTokens.previousUntil ?? 0))
+  );
+}
 // A herdr `agent.instruct` delivery: one bracketed paste with no Enter. The header carries the
 // instruction id, the unix ms after which the block must be discarded, the text's UTF-8 byte
 // length, and this runtime's token, which only herdr learns (over the peer-checked socket): a
 // person's paste that imitates a block lacks it and reaches the editor as a paste. OMP hands a
 // paste to input listeners as one string, plus an Enter typed in the same read.
+// v4 adds the tag of the session herdr checked (see `sessionTag`).
 const INSTRUCTION =
-  /^\x1b\[200~herdr-instruction:v3:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+  /^\x1b\[200~herdr-instruction:(?:v3|v4):([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})(?::([0-9a-f]{32}))?\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
 // A herdr `agent.action` block: the same framing and token rules, around `{"op","args"}` JSON.
 const ACTION =
   /^\x1b\[200~herdr-action:v1:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
@@ -163,9 +192,9 @@ function ackInstruction(
       agent_pid: process.pid,
       outcome,
     },
-  })).then((acked) => {
+  })).then((reply) => {
     // herdr withdraws a listener whose delivery it never heard back about.
-    if (!acked) reportLost();
+    if (reply !== "ok") reportLost();
   });
 }
 
@@ -178,7 +207,7 @@ function ackAction(
   // A final result goes through the report queue, behind the detail report sent just before it,
   // so the `agent` herdr answers with shows the action's effect.
   queued = false,
-): Promise<boolean> {
+): Promise<Reply> {
   return (queued ? sendRequest : sendRequestNow)(() => ({
     id: `${source}:action:${actionId}:${Date.now()}`,
     method: "pane.ack_action",
@@ -196,7 +225,8 @@ function ackAction(
 
 // Cuts by code point, so a cap never splits a surrogate pair (herdr refuses a lone surrogate).
 function cap(text: unknown, max = 500): string {
-  const value = typeof text === "string" ? text : String(text ?? "");
+  // A lone surrogate (already in the input) makes herdr refuse the whole report.
+  const value = (typeof text === "string" ? text : String(text ?? "")).toWellFormed();
   if (value.length <= max) return value;
   const points = Array.from(value);
   return points.length > max ? `${points.slice(0, max - 1).join("")}…` : value;
@@ -270,11 +300,12 @@ const THINKING_LEVELS: Record<string, true> = {
 // that holds one cannot be saved and restored as text.
 const PASTE_MARKER = /\[Paste #\d+(?:, (?:\+\d+ lines|\d+ chars))?\]/;
 // A herdr answer key: one bracketed paste per key, which the listener replaces with that key's
-// bytes. The header carries the action id, the key's place in the answer, an expiry and this
-// runtime's token, so no key a person types is ever taken for herdr's. The body is one key code,
+// bytes. The header carries the action id, the key's place in the answer, an expiry and a nonce the
+// integration minted for this answer and gave herdr alone, in the keyed ack. No key a person types
+// is taken for herdr's, and a block forged with a leaked block token cannot answer a dialog. The body is one key code,
 // or `T` and a custom answer text.
 const KEY_BLOCK =
-  /^\x1b\[200~herdr-key:v1:([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
+  /^\x1b\[200~herdr-key:v1:([0-9a-f]{32}):(\d+):(\d+):([0-9a-f]{32})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
 const KEY_BYTES: Record<string, string> = { U: "\x1b[A", D: "\x1b[B", E: "\r", S: " ", X: "\x1b" };
 // The detail herdr keeps is at most 16 KiB; a dialog report shrinks to stay under this.
 const detailBudgetBytes = 15 * 1024;
@@ -347,6 +378,13 @@ function currentSessionKey(): string | undefined {
   return undefined;
 }
 
+// The current session as herdr tags it in a block: the first 16 bytes of the SHA-256 of the
+// session path, else its id, in hex.
+function sessionTag(): string | undefined {
+  const value = currentAgentSessionPath ?? currentAgentSessionId;
+  return value === undefined ? undefined : createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
 function withRegisteredSessionRef(params: Record<string, unknown>): Record<string, unknown> {
   if (registeredSessionKey !== currentSessionKey()) return params;
   if (currentAgentSessionPath) return { ...params, agent_session_path: currentAgentSessionPath };
@@ -392,6 +430,7 @@ function sessionReport(sessionStartSource: string, sessionRef: Record<string, un
       accepts_instructions: instructionListener,
       accepts_actions: instructionListener,
       runtime_instance: runtimeInstance,
+      block_token: blockTokens.current,
       ...sessionRef,
     },
   };
@@ -404,21 +443,29 @@ let onRegistered: ((lost: boolean) => void) | undefined;
 // A state, detail or ack report that herdr never got. Each report gets two attempts, and a state
 // equal to the last one is not sent again, so a report lost in a socket outage would stay lost
 // until the next change. Recovery re-registers the session (with its own retries) and then sends
-// state and detail again. At most 3 recoveries in a row without a delivered report, so a herdr
-// that refuses a report does not start a loop.
+// state and detail again. Recoveries are spaced: the gap starts at the session retry base and
+// doubles, up to a minute, while reports keep getting lost; it starts over after a minute without
+// a loss. A report herdr answered with an error is refused, not lost: registering again cannot
+// change that answer, so it never starts a recovery.
 let reportsLost = false;
-let lossRecoveries = 0;
+let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+let recoveryGapMs = 0;
+let lastLossAt = 0;
+const recoveryGapMaxMs = 60_000;
+const recoveryQuietMs = 60_000;
 
 function reportLost(): void {
-  if (reportsLost || lossRecoveries >= 3) return;
+  const now = Date.now();
+  if (now - lastLossAt > recoveryQuietMs) recoveryGapMs = sessionRetryBaseMs;
+  lastLossAt = now;
+  if (reportsLost) return;
   reportsLost = true;
-  lossRecoveries += 1;
-  void reportSession();
-}
-
-function reportDelivered(delivered: boolean): void {
-  if (delivered) lossRecoveries = 0;
-  else reportLost();
+  recoveryTimer = setTimeout(() => {
+    recoveryTimer = undefined;
+    void reportSession();
+  }, recoveryGapMs);
+  recoveryTimer.unref?.();
+  recoveryGapMs = Math.min(Math.max(recoveryGapMs, 1) * 2, recoveryGapMaxMs);
 }
 
 async function reportSession(sessionStartSource = "startup", attempt = 0): Promise<void> {
@@ -431,19 +478,28 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
     reportsLost = false;
     return;
   }
+  clearTimeout(recoveryTimer);
+  recoveryTimer = undefined;
 
   // Each retry attempt mints a fresh id and sequence number. If the server
   // applied the first attempt but its reply was lost, an identical retry
   // would be rejected as stale and leave the session unregistered with no
   // later session event to recover it. A fresh retry replays the same
   // profile, PID, and session through every server check and converges.
-  const delivered = await sendRequest(() => sessionReport(sessionStartSource, sessionRef));
+  const reply = await sendRequest(() => sessionReport(sessionStartSource, sessionRef));
+  const delivered = reply === "ok";
   if (delivered && currentSessionKey() === sessionKey) {
     registeredSessionKey = sessionKey;
     const lost = reportsLost;
     reportsLost = false;
     onRegistered?.(lost);
-  } else if (!delivered && currentSessionKey() === sessionKey && attempt < sessionRetryLimit) {
+  } else if (
+    !delivered &&
+    currentSessionKey() === sessionKey &&
+    // After the retries, keep trying slowly while a report is lost and herdr does not answer, so
+    // state and detail are resent whenever herdr comes back.
+    (attempt < sessionRetryLimit || (reportsLost && reply === "unreachable"))
+  ) {
     sessionRetryTimer = setTimeout(() => {
       sessionRetryTimer = undefined;
       if (currentSessionKey() === sessionKey && registeredSessionKey !== sessionKey) {
@@ -465,7 +521,7 @@ async function sendState(state: AgentState, message?: string): Promise<void> {
   // before it. The session ref is fixed at the first attempt: a retry must
   // not drop a ref that was registered when this report was first sent.
   let params: Record<string, unknown> | undefined;
-  const delivered = await sendRequest(() => {
+  const reply = await sendRequest(() => {
     params ??= withRegisteredSessionRef({ pane_id: paneId, source, agent: "omp", state, message });
     return {
       id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
@@ -473,16 +529,18 @@ async function sendState(state: AgentState, message?: string): Promise<void> {
       params: { ...params, seq: nextReportSeq() },
     };
   });
-  reportDelivered(delivered);
+  if (reply === "unreachable") reportLost();
 }
 
 let sendInFlight = false;
 let queuedState: QueuedState | undefined;
+// Settles once every state queued so far was sent.
+let stateSent: Promise<void> = Promise.resolve();
 
 function queueState(state: AgentState, message?: string): void {
   queuedState = { state, message };
   if (!sendInFlight) {
-    void drainStateQueue();
+    stateSent = drainStateQueue();
   }
 }
 
@@ -501,7 +559,7 @@ async function drainStateQueue(): Promise<void> {
   } finally {
     sendInFlight = false;
     if (queuedState) {
-      void drainStateQueue();
+      stateSent = drainStateQueue();
     }
   }
 }
@@ -631,11 +689,17 @@ export default function (pi) {
     if (!match) {
       return undefined;
     }
-    const [, instructionId, expiresMs, byteLength, token, text, enter] = match;
-    if (token !== runtimeInstance || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
+    const [, instructionId, expiresMs, byteLength, token, session, text, enter] = match;
+    if (!isBlockToken(token) || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
       return undefined;
     }
     const rest = enter ? { data: enter } : { consume: true };
+    // herdr checked the caller's session against the last one OMP reported; OMP has moved on
+    // (`/new`, `/resume`, a branch) before that report reached herdr. Nothing is sent.
+    if (session !== undefined && session !== sessionTag()) {
+      ackInstruction(instructionId, "dropped");
+      return rest;
+    }
     // herdr has given up on a late block, and a paste OMP cut short is not the whole text: drop
     // both, unsent and unacked. The report tells herdr that the listener still exists.
     if (Date.now() > Number(expiresMs) || Buffer.byteLength(text, "utf8") !== Number(byteLength)) {
@@ -701,6 +765,8 @@ export default function (pi) {
   // The latest root-session context, for the detail fields an event does not carry.
   let detailCtx: any;
   let detailTimer: ReturnType<typeof setTimeout> | undefined;
+  // herdr refused a detail report; set until the next session event.
+  let detailRefused = false;
   let lastDetailAt = 0;
   // Tools the root session started and has not finished, oldest first.
   const runningTools = new Map<string, { name: string; call_id: string; started_ms: number }>();
@@ -733,6 +799,7 @@ export default function (pi) {
   let answering:
     | {
         actionId: string;
+        nonce: string;
         dialogId: string;
         codes: string[];
         next: number;
@@ -742,6 +809,8 @@ export default function (pi) {
         timer: ReturnType<typeof setTimeout>;
       }
     | undefined;
+  // The nonces of recent answers, so their late key blocks are dropped.
+  const answerNonces: string[] = [];
   // Keys OMP passes to extension listeners that never act on a dialog: focus reports and mouse.
   const TERMINAL_NOISE = /^\x1b\[(?:I|O|<[\d;]+[mM])$/;
 
@@ -812,7 +881,7 @@ export default function (pi) {
   function sendDetail() {
     clearTimeout(detailTimer);
     detailTimer = undefined;
-    if (!rootSession || !instructionListener || !detailCtx) return;
+    if (!rootSession || !instructionListener || !detailCtx || detailRefused) return;
     lastDetailAt = Date.now();
     void sendRequest(() => ({
       id: `${source}:detail:${Date.now()}:${Math.random().toString(36).slice(2)}`,
@@ -823,7 +892,13 @@ export default function (pi) {
         runtime_instance: runtimeInstance,
         omp: buildDetail(),
       },
-    })).then(reportDelivered);
+    })).then((reply) => {
+      // herdr withdrew the listener: register again. Any other error is herdr refusing the
+      // report (a server without `pane.report_omp_detail`, or detail it rejects); sending it again
+      // cannot help, so detail stops until the next session event.
+      if (reply === "unreachable" || reply === "process_mismatch") reportLost();
+      else if (reply !== "ok") detailRefused = true;
+    });
   }
 
   // At most one report a second for usage and tool churn; a dialog reports at once.
@@ -981,9 +1056,11 @@ export default function (pi) {
   function takeKey(data: string) {
     const match = KEY_BLOCK.exec(data);
     if (!match) return undefined;
-    const [, actionId, seq, expiresMs, token, code, enter] = match;
-    if (token !== runtimeInstance) return undefined;
-    const current = answering?.actionId === actionId ? answering : undefined;
+    const [, actionId, seq, expiresMs, nonce, code, enter] = match;
+    const current = answering?.actionId === actionId && answering.nonce === nonce ? answering : undefined;
+    // A block of an answer that ended is dropped; one with a nonce this runtime never minted is a
+    // person's paste (or a forgery) and passes as such.
+    if (!current && !answerNonces.includes(nonce)) return undefined;
     const usable =
       current &&
       !current.spoiled &&
@@ -1010,7 +1087,7 @@ export default function (pi) {
       return undefined;
     }
     const [, actionId, expiresMs, byteLength, token, body, enter] = match;
-    if (token !== runtimeInstance || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
+    if (!isBlockToken(token) || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
       return undefined;
     }
     const rest = enter ? { data: enter } : { consume: true };
@@ -1018,11 +1095,15 @@ export default function (pi) {
       void reportSession();
       return rest;
     }
-    const finish = (result: { ok: boolean; error?: string; data?: Record<string, unknown> }) => {
+    // The result follows the state and detail reports that show the action's effect, so the
+    // `agent` herdr answers with is current.
+    const finish = async (result: { ok: boolean; error?: string; data?: Record<string, unknown> }) => {
+      publishState(true);
+      await stateSent;
       scheduleDetail(ctx, true);
-      void ackAction(actionId, result, true).then((acked) => {
+      void ackAction(actionId, result, true).then((reply) => {
         // A lost ack withdraws the listener in herdr until the next session report.
-        if (!acked) reportLost();
+        if (reply !== "ok") reportLost();
       });
     };
     const refuse = (error: string) => {
@@ -1036,6 +1117,11 @@ export default function (pi) {
       return refuse("invalid_args: the action body is not JSON");
     }
     const args = request?.args && typeof request.args === "object" ? request.args : {};
+    // herdr checked the caller's session against the last one OMP reported; OMP has moved on
+    // (`/new`, `/resume`, a branch) before that report reached herdr.
+    if (typeof request?.session === "string" && request.session !== sessionTag()) {
+      return refuse("session_changed: OMP runs another session now; read agent.get again");
+    }
     const idle = ctx?.isIdle?.() === true;
     switch (request?.op) {
       case "abort": {
@@ -1048,7 +1134,14 @@ export default function (pi) {
           );
         }
         ctx?.abort?.();
-        finish({ ok: true, data: { was_idle: idle } });
+        // The result waits (up to 3 s) for the turn to end, so its status shows the abort.
+        const until = Date.now() + 3000;
+        const settled = setInterval(() => {
+          if (agentActive && Date.now() < until) return;
+          clearInterval(settled);
+          void finish({ ok: true, data: { was_idle: idle } });
+        }, 50);
+        settled.unref?.();
         return rest;
       }
       case "set_model": {
@@ -1126,12 +1219,15 @@ export default function (pi) {
     const answer = answerCodes(head, args);
     if ("error" in answer) return refuse(answer.error);
     const expires = Date.now() + answerWaitMs;
+    const nonce = crypto.randomUUID().replaceAll("-", "");
+    answerNonces.push(nonce);
+    answerNonces.splice(0, answerNonces.length - 16);
     let seq = 0;
     const keys = answer.chunks.map((chunk) =>
       chunk
         .map(
           (code) =>
-            `\x1b[200~herdr-key:v1:${actionId}:${seq++}:${expires}:${runtimeInstance}\n${code}\x1b[201~`,
+            `\x1b[200~herdr-key:v1:${actionId}:${seq++}:${expires}:${nonce}\n${code}\x1b[201~`,
         )
         .join(""),
     );
@@ -1159,6 +1255,7 @@ export default function (pi) {
     timer.unref?.();
     answering = {
       actionId,
+      nonce,
       dialogId: id,
       codes: answer.chunks.flat(),
       next: 0,
@@ -1217,6 +1314,51 @@ export default function (pi) {
     instructionListener = typeof unsubscribeInstructions === "function";
   }
 
+  // Removes herdr blocks for this runtime from the editor text; returns whether it found any.
+  function scrubLeakedBlocks(ctx: any): boolean {
+    const ui = ctx?.ui;
+    const text = ui?.getEditorText?.();
+    if (typeof text !== "string" || !text.includes("herdr-")) return false;
+    let kept = "";
+    let at = 0;
+    let found = false;
+    const header =
+      /herdr-(action:v1|instruction:v[34]|key:v1):([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})(?::[0-9a-f]{32})?\n/g;
+    for (let match = header.exec(text); match; match = header.exec(text)) {
+      const [whole, kind, id, second, third, token] = match;
+      const ours = kind === "key:v1" ? answerNonces.includes(token) : isBlockToken(token);
+      if (!ours) continue;
+      found = true;
+      // Action and instruction headers give the body's UTF-8 length; a key's body is one line.
+      const bodyStart = match.index + whole.length;
+      let end = bodyStart;
+      if (kind === "key:v1") {
+        const newline = text.indexOf("\n", bodyStart);
+        end = newline < 0 ? text.length : newline;
+      } else {
+        const bytes = Number(third);
+        let used = 0;
+        for (const point of text.slice(bodyStart)) {
+          if (used >= bytes) break;
+          used += Buffer.byteLength(point, "utf8");
+          end += point.length;
+        }
+      }
+      kept += text.slice(at, match.index);
+      at = end;
+      header.lastIndex = end;
+      if (kind === "action:v1") {
+        void ackAction(id, { ok: false, error: "failed: the block reached OMP's editor during a session change; nothing ran" });
+      } else if (kind.startsWith("instruction")) {
+        ackInstruction(id, "dropped");
+      }
+      void second;
+    }
+    if (!found) return false;
+    ui.setEditorText?.(kept + text.slice(at));
+    return true;
+  }
+
   function activateRootSession(ctx: any, sessionStartSource = "startup"): boolean {
     if (ctx?.hasUI !== true) {
       return false;
@@ -1226,8 +1368,13 @@ export default function (pi) {
     compacting = false;
     // A new or changed session has no running tool or open dialog of its own.
     runningTools.clear();
+    detailRefused = false;
     dialogs = [];
     detailCtx = ctx;
+    // A block herdr wrote while OMP had no listener (it drops them all when a session change
+    // starts) reached the editor as a paste. Take it out, tell herdr nothing ran, and stop using
+    // the token it showed. Every registration gets a new token anyway.
+    rotateBlockToken(!scrubLeakedBlocks(ctx));
     onRegistered = (lost) => {
       if (lost) publishState(true);
       if (instructionListener) scheduleDetail(undefined, true);
@@ -1493,6 +1640,24 @@ export default function (pi) {
   for (const event of ["turn_end", "tool_result"]) {
     pi.on(event, (_event, ctx) => {
       if (rootSession) scheduleDetail(ctx);
+    });
+  }
+
+  // OMP drops every input listener when a session change starts (`/new`, `/resume`, fork,
+  // branch), before these events, and registers none until the change ends. Tell herdr at once,
+  // so it refuses writes instead of putting a block into the editor. `session_switch` or
+  // `session_branch` registers the listener again.
+  for (const event of ["session_before_switch", "session_before_branch"]) {
+    pi.on(event, async () => {
+      if (!rootSession) return undefined;
+      unsubscribeInstructions?.();
+      unsubscribeInstructions = undefined;
+      instructionListener = false;
+      const sessionRef = currentSessionRef();
+      if (sessionRef) {
+        await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
+      }
+      return undefined;
     });
   }
 

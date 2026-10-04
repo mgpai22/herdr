@@ -414,6 +414,10 @@ pub struct PaneReportAgentSessionV2Params {
     /// an exec restart of the same process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_instance: Option<String>,
+    /// The token Herdr puts in instruction and action blocks for this listener (OMP integration
+    /// v14+, new on every session registration). Without it the blocks carry `runtime_instance`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_token: Option<String>,
     #[serde(skip)]
     #[schemars(skip)]
     pub peer_pid: Option<u32>,

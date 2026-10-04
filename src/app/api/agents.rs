@@ -97,9 +97,33 @@ pub(super) fn record_instruction_outcome(
 /// The marked paste the OMP integration consumes:
 /// `v3:<id>:<expires unix ms>:<text bytes>:<listener runtime>`. The runtime id is the
 /// integration's own random token, known only to it and to herdr, so a person's paste that
-/// imitates a block is not taken as an instruction.
-fn instruction_block(instruction_id: &str, text: &str, runtime: &str) -> String {
-    listener_block("herdr-instruction:v3", instruction_id, text, runtime)
+/// imitates a block is not taken as an instruction. A listener with action support (integration
+/// v14) gets `v4`, whose runtime field is followed by `:<session tag>`: the integration drops a
+/// block for a session other than the one it runs now.
+fn instruction_block(
+    instruction_id: &str,
+    text: &str,
+    runtime: &str,
+    session: Option<&str>,
+) -> String {
+    match session {
+        Some(session) => listener_block(
+            "herdr-instruction:v4",
+            instruction_id,
+            text,
+            &format!("{runtime}:{}", session_tag(session)),
+        ),
+        None => listener_block("herdr-instruction:v3", instruction_id, text, runtime),
+    }
+}
+
+/// The session a block was checked against, as the OMP integration compares it with the session
+/// it runs: the first 16 bytes of the SHA-256 of the session path or id, in hex.
+fn session_tag(session: &str) -> String {
+    Sha256::digest(session.as_bytes())[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The `agent.action` block: the instruction framing around `{"op","args"}` JSON.
@@ -408,7 +432,21 @@ impl App {
             |agent| params.validate(agent),
         )?;
         let instruction_id = new_instruction_id(&id, terminal_id.as_str());
-        let block = instruction_block(&instruction_id, &params.text, &block_runtime);
+        let session = agent
+            .accepts_actions
+            .then(|| {
+                agent
+                    .agent_session
+                    .as_ref()
+                    .map(|session| session.value.clone())
+            })
+            .flatten();
+        let block = instruction_block(
+            &instruction_id,
+            &params.text,
+            &block_runtime,
+            session.as_deref(),
+        );
         self.write_listener_block(&id, ws_idx, pane_id, block)?;
         // Acks are handled by this app loop after this step, so registering now misses none.
         let now = Instant::now();
@@ -499,7 +537,7 @@ impl App {
             block_runtime,
             ws_idx,
             pane_id,
-            ..
+            agent,
         } = self.check_listener_write(
             &id,
             &params.target,
@@ -508,7 +546,14 @@ impl App {
             |agent| params.validate(agent),
         )?;
         let action_id = new_instruction_id(&id, terminal_id.as_str());
-        let body = serde_json::json!({ "op": params.op, "args": params.args }).to_string();
+        // The session herdr checked `expected_session` against: OMP may have changed it since,
+        // before its session report reached herdr.
+        let session = agent
+            .agent_session
+            .as_ref()
+            .map(|session| session_tag(&session.value));
+        let body = serde_json::json!({ "op": params.op, "args": params.args, "session": session })
+            .to_string();
         let block = listener_block(ACTION_BLOCK, &action_id, &body, &block_runtime);
         self.write_listener_block(&id, ws_idx, pane_id, block)?;
         let deadline = Instant::now() + INSTRUCTION_ACK_TIMEOUT;
@@ -630,10 +675,12 @@ impl App {
             return Err(agent_not_found(id, target));
         };
         let listener_runtime = terminal.instruction_listener_runtime.clone();
-        // The block is bound to the listener's runtime token; without one it cannot be told apart
-        // from a person's paste, so nothing is written.
-        let Some(block_runtime) = listener_runtime
+        // The block is bound to the listener's token; without one it cannot be told apart from a
+        // person's paste, so nothing is written.
+        let Some(block_runtime) = terminal
+            .block_token
             .clone()
+            .or_else(|| listener_runtime.clone())
             .filter(|runtime| valid_listener_runtime(runtime))
         else {
             return Err(encode_error(
@@ -1274,6 +1321,7 @@ mod tests {
                 accepts_instructions,
                 accepts_actions: accepts_instructions,
                 runtime_instance: runtime.map(str::to_string),
+                block_token: None,
                 peer_pid: Some(pid),
             },
         )
@@ -1311,12 +1359,15 @@ mod tests {
     fn sent_instruction_id(rx: &mut tokio::sync::mpsc::Receiver<Bytes>, text: &str) -> String {
         let bytes = rx.try_recv().expect("the instruction was written");
         let written = std::str::from_utf8(&bytes).unwrap();
+        // An action listener (integration v14) gets v4, which adds the session tag.
         let header = written
             .strip_prefix("\x1b[200~herdr-instruction:v3:")
+            .or_else(|| written.strip_prefix("\x1b[200~herdr-instruction:v4:"))
             .and_then(|rest| rest.split_once('\n'))
             .expect("marked paste")
             .0;
-        let [id, expires_ms, length, runtime] = header.split(':').collect::<Vec<_>>()[..] else {
+        let fields = header.split(':').collect::<Vec<_>>();
+        let [id, expires_ms, length, runtime] = fields[..fields.len().min(4)] else {
             panic!("header {header:?}");
         };
         assert!(
@@ -1337,9 +1388,10 @@ mod tests {
         );
         assert_eq!(length, text.len().to_string());
         assert!(valid_listener_runtime(runtime), "{runtime:?}");
+        let version = if fields.len() == 5 { "v4" } else { "v3" };
         assert_eq!(
             written,
-            format!("\x1b[200~herdr-instruction:v3:{header}\n{text}\x1b[201~")
+            format!("\x1b[200~herdr-instruction:{version}:{header}\n{text}\x1b[201~")
         );
         assert!(rx.try_recv().is_err(), "nothing follows the paste");
         id.to_string()
@@ -2845,7 +2897,15 @@ mod tests {
             action_params(&instruct, AgentActionOp::Answer, answer.clone()),
         );
         let (action_id, body) = sent_action(&mut rx);
-        assert_eq!(body, serde_json::json!({ "op": "answer", "args": answer }));
+        // The block names the session herdr checked, so OMP refuses it in another session.
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "op": "answer",
+                "args": answer,
+                "session": session_tag(&fixture_session_path()),
+            })
+        );
         // A second write waits until the first block has its result.
         let busy = start_action(
             &mut app,
@@ -3143,5 +3203,68 @@ mod tests {
             "{}",
             refused.error.message
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_instruction_to_an_action_listener_names_its_session() {
+        let (mut app, params, mut rx) = guarded_fixture(AgentState::Idle);
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let _response = start_instruct(&mut app, params);
+        let bytes = rx.try_recv().expect("the instruction was written");
+        let written = std::str::from_utf8(&bytes).unwrap();
+        let header = written
+            .strip_prefix("\x1b[200~herdr-instruction:v4:")
+            .and_then(|rest| rest.split_once('\n'))
+            .expect("a v4 block")
+            .0;
+        let fields: Vec<_> = header.split(':').collect();
+        assert_eq!(fields[3], FIXTURE_RUNTIME);
+        assert_eq!(fields[4], session_tag(&fixture_session_path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn blocks_carry_the_token_the_listener_registered_last() {
+        let (mut app, params, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = params.target.clone();
+        let pid = std::process::id();
+        for (seq, token) in [(70, "token-one"), (71, "token-two")] {
+            let reply = app.handle_pane_report_agent_session_v2(
+                "v2".into(),
+                crate::api::schema::PaneReportAgentSessionV2Params {
+                    pane_id: target.clone(),
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    seq: Some(seq),
+                    agent_session_id: None,
+                    agent_session_path: Some(fixture_session_path()),
+                    session_start_source: Some("startup".into()),
+                    launch_profile: "default".into(),
+                    agent_pid: pid,
+                    accepts_instructions: true,
+                    accepts_actions: true,
+                    runtime_instance: Some(FIXTURE_RUNTIME.into()),
+                    block_token: Some(token.into()),
+                    peer_pid: Some(pid),
+                },
+            );
+            assert!(reply.contains("\"ok\""), "{reply}");
+        }
+        let _response = start_instruct(&mut app, params);
+        let bytes = rx.try_recv().expect("the instruction was written");
+        let header = std::str::from_utf8(&bytes)
+            .unwrap()
+            .strip_prefix("\x1b[200~herdr-instruction:v4:")
+            .and_then(|rest| rest.split_once('\n'))
+            .expect("a v4 block")
+            .0
+            .to_string();
+        // The latest token, not the runtime id or an earlier token.
+        assert_eq!(header.split(':').nth(3), Some("token-two"));
     }
 }
