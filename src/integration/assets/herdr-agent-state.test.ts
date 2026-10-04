@@ -3197,3 +3197,28 @@ test("Oh My Pi lists a resumed session's earlier subagents without waiting for O
   expect(ack.error).toBe("subagent_not_running: K6 is parked");
   persisted.scan = async () => {};
 });
+
+test("Oh My Pi keeps listing and acting on the session's subagents after a move", async () => {
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "50";
+  const sent: unknown[][] = [];
+  const ref: any = subRef("Nb", {
+    session: { isStreaming: true, sendUserMessage: async (...args: unknown[]) => void sent.push(args) },
+  });
+  const { registry, pi } = fakeRegistry([ref]);
+  const omp = await installOmpForActions("omp-subagent-moved", { pi });
+  delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+  let file = "/tmp/omp-instruct.jsonl";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+  // A person's /move: OMP renames the session file and its transcript directory, while its
+  // registry keeps each subagent's old path.
+  file = "/tmp/moved-roster/omp-instruct.jsonl";
+  await waitFor(
+    () => omp.harness.requests.some((request) => isRecord(request) && (request as any).params?.agent_session_path === file),
+    3_000,
+  );
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.id === "Nb", 3_000);
+  const steer = (await omp.act({ op: "subagent_steer", args: { subagent_id: "Nb", text: "[sahur] still there", expected_run: 1 } })).ack;
+  expect(steer.ok).toBe(true);
+  expect(sent).toHaveLength(1);
+});

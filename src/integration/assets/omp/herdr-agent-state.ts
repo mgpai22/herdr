@@ -568,7 +568,10 @@ function updateSessionRef(ctx: any): void {
     currentAgentSessionId = undefined;
   }
   if (currentSessionKey() !== previousKey) registeredSessionKey = undefined;
-  if (currentAgentSessionId !== previousId) movedSessionTags = [];
+  if (currentAgentSessionId !== previousId) {
+    movedSessionTags = [];
+    movedSessionStems = [];
+  }
 }
 
 // The session OMP runs now, read from `ctx` without storing it.
@@ -619,6 +622,10 @@ function liveSessionMoved(ctx: any): boolean {
 // Tags of earlier files of the current session (`/move`, `/wt`): a block herdr checked against
 // one of them is for this conversation.
 let movedSessionTags: string[] = [];
+// Directory stems of earlier files of the current session. OMP's agent registry keeps each
+// subagent's transcript path from before a `/move` or `/wt` (the move renames the files, not the
+// refs), so the session's subagents are matched against these too.
+let movedSessionStems: string[] = [];
 
 function tagOf(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
@@ -642,6 +649,10 @@ function followSessionMove(ctx: any): boolean {
   if (!isAbsoluteSessionPath(file) || file === before) return false;
   movedSessionTags.push(tagOf(before));
   movedSessionTags.splice(0, movedSessionTags.length - 8);
+  if (before.endsWith(".jsonl")) {
+    movedSessionStems.push(before.slice(0, -".jsonl".length));
+    movedSessionStems.splice(0, movedSessionStems.length - 8);
+  }
   updateSessionRef(ctx);
   // Nothing reports a move again (only the next turn would), so keep trying while herdr is
   // unreachable, as for a lost report: a herdr restart must resume the moved file.
@@ -1225,15 +1236,15 @@ export default function (pi) {
   // earlier session of this process and agents without a file.
   function isSessionSubagent(ref: any, stem: string | undefined): boolean {
     const file = ref?.sessionFile;
+    const under = (dir: string) =>
+      file.length > dir.length + 1 && file.startsWith(dir) && (file[dir.length] === "/" || file[dir.length] === "\\");
     return (
       stem !== undefined &&
       ref?.kind === "sub" &&
       typeof ref.id === "string" &&
       typeof ref.status === "string" &&
       typeof file === "string" &&
-      file.length > stem.length + 1 &&
-      file.startsWith(stem) &&
-      (file[stem.length] === "/" || file[stem.length] === "\\")
+      (under(stem) || movedSessionStems.some(under))
     );
   }
 
