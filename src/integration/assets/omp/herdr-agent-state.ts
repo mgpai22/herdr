@@ -378,17 +378,55 @@ const SUBAGENT_STATUSES = new Set(["running", "idle", "parked", "aborted"]);
 // Roster sizes, largest first; the detail uses the first that fits.
 const ROSTER_TIERS = [30, 10, 0];
 const toolListMax = 200;
+// How many of herdr's own steers into one subagent run are remembered until they arrive.
+const steerMemory = 64;
 // How long a subagent cancel waits for OMP's release before it answers.
 const subagentCancelWaitMs = 5000;
 // What the `status` op set. OMP keeps statuses in memory, as this module keeps this: an OMP
 // restart or an extension reload clears both.
 let statusText: string | undefined;
-// What subagent bindings of this module add to OMP's agent registry: the agent type and the tool
-// the subagent runs. Keyed by registry id.
-const subagentInfo = new Map<
-  string,
-  { type?: string; tool?: { name: string; call_id?: string; started_ms: number } }
->();
+// What this module adds to OMP's agent registry, keyed by registry id. Subagent bindings fill the
+// agent type, the running tool and `person` (a message that neither the task executor nor herdr
+// sent reached the current run: a person's chat from OMP's agent view, or another client's).
+// The root binding counts runs: OMP's registry flips a subagent between running and idle at every
+// turn of one task run, and a new run starts only after the previous one handed over its result
+// or was parked (a `task` resume, a wake, or a person's chat with the finished subagent).
+type SubagentInfo = {
+  type?: string;
+  tool?: { name: string; call_id?: string; started_ms: number };
+  run: number;
+  status?: string;
+  accepted: boolean;
+  person: boolean;
+  // Texts herdr steered that have not arrived yet, so their user messages are not taken for a
+  // person's. A steer queued in a run's last step can arrive in the next run.
+  steers: string[];
+};
+const subagentInfo = new Map<string, SubagentInfo>();
+
+function subagentEntry(id: string): SubagentInfo {
+  let info = subagentInfo.get(id);
+  if (!info) {
+    info = { run: 1, accepted: false, person: false, steers: [] };
+    subagentInfo.set(id, info);
+  }
+  return info;
+}
+
+// Follows a subagent's registry ref from one observation to the next; returns its entry.
+function observeRun(ref: any): SubagentInfo {
+  const info = subagentEntry(ref.id);
+  if (info.status === undefined) {
+    info.accepted = ref.lifecycle?.acceptedAt !== undefined;
+  } else if (ref.status === "running" && info.status !== "running" && (info.accepted || info.status === "parked")) {
+    info.run += 1;
+    info.accepted = false;
+    info.person = false;
+  }
+  if (ref.lifecycle?.acceptedAt !== undefined) info.accepted = true;
+  info.status = ref.status;
+  return info;
+}
 // Set by the root binding: a subagent's binding saw a change.
 let onSubagentChange: (() => void) | undefined;
 // OMP's agent lifecycle manager, loaded once; undefined when it does not load as OMP's own.
@@ -409,8 +447,25 @@ function loadLifecycleManager(registryClass: unknown): Promise<any> {
   return lifecycleManager;
 }
 
+// C0 and C1 controls, line and paragraph separators, and bidirectional controls: OMP's renderer
+// strips some of these and keeps others, so the text a person sees could differ from the text
+// herdr reports, or reorder in a terminal behind herdr.
+const UNSAFE_TEXT = /[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
 function isOneLine(text: unknown, max: number): text is string {
-  return typeof text === "string" && text.trim().length > 0 && text.length <= max && !/[\x00-\x1f\x7f]/.test(text);
+  return typeof text === "string" && text.trim().length > 0 && text.length <= max && !UNSAFE_TEXT.test(text);
+}
+
+// The text of a user message's content.
+function messageText(content: unknown): string | undefined {
+  return typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+          .filter((part) => part?.type === "text")
+          .map((part) => part.text)
+          .join("\n")
+      : undefined;
 }
 
 function toolNames(names: unknown): string[] {
@@ -1171,6 +1226,7 @@ export default function (pi) {
     }
     const stem = sessionStem();
     const subs = refs.filter((ref) => isSessionSubagent(ref, stem));
+    for (const ref of subs) observeRun(ref);
     if (subs.length === 0) return undefined;
     const ms = (value: unknown) => (Number.isFinite(value) ? Math.max(0, Math.round(value as number)) : 0);
     subs.sort((a, b) =>
@@ -1191,6 +1247,9 @@ export default function (pi) {
         ...(info?.type ? { type: cap(info.type, 80) } : {}),
         ...(typeof ref.parentId === "string" && ref.parentId !== "Main" ? { parent: cap(ref.parentId, 80) } : {}),
         status: SUBAGENT_STATUSES.has(ref.status) ? ref.status : cap(ref.status, 20),
+        run: info?.run ?? 1,
+        ...((info?.run ?? 1) > 1 ? { revived: true } : {}),
+        ...(info?.person ? { person: true } : {}),
         ...(typeof ref.activity === "string" && ref.activity ? { activity: cap(ref.activity, 160) } : {}),
         ...(info?.tool ? { tool: { name: info.tool.name, started_ms: info.tool.started_ms } } : {}),
         ...(model?.provider && model?.id ? { model: cap(`${model.provider}/${model.id}`, 200) } : {}),
@@ -1796,6 +1855,10 @@ export default function (pi) {
     if (typeof id !== "string" || !SUBAGENT_ID.test(id)) {
       return refuse("invalid_args: subagent_id must be an id from omp.subagents");
     }
+    const expectedRun = args.expected_run;
+    if (!Number.isSafeInteger(expectedRun) || expectedRun < 1) {
+      return refuse("invalid_args: expected_run must be the run from omp.subagents");
+    }
     const text = args.text;
     if (op === "subagent_steer" && (typeof text !== "string" || !text.trim() || text.length > 3000)) {
       return refuse("invalid_args: subagent_steer needs text of 1-3000 characters");
@@ -1805,12 +1868,34 @@ export default function (pi) {
     const ref = sessionSubagent(registry, id);
     if (!ref) return refuse(`no_subagent: ${id} is not a subagent of this session`);
     const session = ref.session;
-    if (ref.status !== "running" || !session) return refuse(`subagent_not_running: ${id} is ${cap(ref.status, 20)}`);
+    // Checked in this order: a run that ended reports its end, even when the caller read an older
+    // one.
+    const stillOwned = () => {
+      const info = observeRun(ref);
+      if (ref.status !== "running" || !ref.session) return `subagent_not_running: ${id} is ${cap(ref.status, 20)}`;
+      if (info.run !== expectedRun) {
+        return `subagent_changed: ${id} is on run ${info.run} now, not run ${expectedRun}; read agent.get again`;
+      }
+      if (info.person) {
+        return `subagent_person_chat: someone else (a person in OMP's agent view, or another client) sent ${id}'s run a message; nothing was sent`;
+      }
+      return undefined;
+    };
+    const owned = stillOwned();
+    if (owned) return refuse(owned);
     if (op === "subagent_steer") {
+      // The run's result is with its parent; an aside now would start a turn after it.
+      if (ref.lifecycle?.responseAt !== undefined) {
+        return refuse(`subagent_not_running: ${id} has handed over its result`);
+      }
       // Between turns an aside would start a new turn; the executor's own reminders run there.
       if (session.isStreaming !== true) {
         return refuse(`subagent_busy: ${id} is between turns; retry in a few seconds`);
       }
+      const info = subagentEntry(id);
+      // Queued asides reach the subagent together at its next step boundary, so every one queued in
+      // this run is kept (up to a bound far above what one step boundary sees).
+      info.steers = [...info.steers.slice(-(steerMemory - 1)), text];
       Promise.resolve(session.sendUserMessage(text, { deliverAs: "aside" })).then(
         () => finish({ ok: true, data: { subagent_id: id, delivered: "aside" } }),
         (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
@@ -1820,11 +1905,17 @@ export default function (pi) {
     void (async () => {
       const manager = await loadLifecycleManager(pi.pi?.AgentRegistry);
       if (!manager) {
-        return finish({ ok: false, error: "unsupported_op: OMP's agent lifecycle module did not load as OMP's own" });
+        return finish({
+          ok: false,
+          error: "unsupported_op: OMP's agent lifecycle module did not load as OMP's own; reload the extension or restart OMP",
+        });
       }
-      if (registry.get(id) !== ref || ref.status !== "running" || ref.session !== session) {
+      // The import awaited: the subagent may have ended or moved on meanwhile.
+      if (registry.get(id) !== ref || ref.session !== session) {
         return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
       }
+      const changed = stillOwned();
+      if (changed) return finish({ ok: false, error: changed });
       // Release first: it marks the ref aborted at once, which the task executor turns into the
       // task's abort; a bare abort would only end the subagent's turn.
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1858,7 +1949,7 @@ export default function (pi) {
     const sub = args.args && typeof args.args === "object" ? args.args : {};
     if (name !== "name") return refuse(`unsupported_op: command ${cap(name, 40)}`);
     const title = sub.title;
-    if (typeof title !== "string" || !title.trim() || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) {
+    if (!isOneLine(title, 200)) {
       return refuse("invalid_args: name needs a one-line title of at most 200 characters");
     }
     Promise.resolve(pi.setSessionName(title.trim())).then(
@@ -1989,7 +2080,10 @@ export default function (pi) {
     };
     if (!unsubscribeRegistry) {
       try {
-        const off = agentRegistry()?.onChange?.(() => onSubagentChange?.());
+        const off = agentRegistry()?.onChange?.((event: any) => {
+          if (event?.ref?.kind === "sub" && typeof event.ref.id === "string") observeRun(event.ref);
+          onSubagentChange?.();
+        });
         if (typeof off === "function") unsubscribeRegistry = off;
       } catch {}
     }
@@ -2039,14 +2133,20 @@ export default function (pi) {
   function noteSubagent(event: string, data: any, ctx: any): boolean {
     const agent = ctx?.agent;
     if (agent?.kind !== "sub" || typeof agent.id !== "string") return false;
-    const info = subagentInfo.get(agent.id) ?? {};
+    const info = subagentEntry(agent.id);
     if (typeof agent.name === "string" && agent.name) info.type = agent.name;
-    if (event === "tool_execution_start") {
+    if (event === "message_start") {
+      const message = data?.message;
+      if (message?.role !== "user" || message.attribution === "agent") return true;
+      const text = messageText(message.content);
+      const steer = text === undefined ? -1 : info.steers.indexOf(text);
+      if (steer >= 0) info.steers.splice(steer, 1);
+      else info.person = true;
+    } else if (event === "tool_execution_start") {
       info.tool = { name: cap(data?.toolName || "tool", 120), call_id: data?.toolCallId, started_ms: Date.now() };
     } else if (event === "tool_execution_end" && info.tool?.call_id === data?.toolCallId) {
       info.tool = undefined;
     }
-    subagentInfo.set(agent.id, info);
     onSubagentChange?.();
     return true;
   }
@@ -2097,21 +2197,13 @@ export default function (pi) {
     });
   }
 
-  pi.on("message_start", (event) => {
+  pi.on("message_start", (event, ctx) => {
+    if (noteSubagent("message_start", event, ctx)) return;
     const message = event?.message;
     if (!rootSession || awaitingAdmission.length === 0 || message?.role !== "user") {
       return;
     }
-    const content = message.content;
-    const text =
-      typeof content === "string"
-        ? content
-        : Array.isArray(content)
-          ? content
-              .filter((part) => part?.type === "text")
-              .map((part) => part.text)
-              .join("\n")
-          : undefined;
+    const text = messageText(message.content);
     // Only the delivered text starts its turn; a person's own prompt never claims it.
     const index =
       typeof text === "string"

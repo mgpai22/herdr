@@ -2884,6 +2884,21 @@
                 "null"
               ]
             },
+            "person": {
+              "description": "A message that neither the task nor Herdr sent reached this run (a person's chat in OMP's\nagent view, or another client); the `subagent_*` ops refuse it.",
+              "type": "boolean"
+            },
+            "revived": {
+              "description": "The run is not the subagent's first.",
+              "type": "boolean"
+            },
+            "run": {
+              "default": 0,
+              "description": "Which run of this subagent the row shows, from 1. A new run starts when the subagent runs\nagain after it handed over its result or was parked: a `task` resume, a wake, or a person's\nchat. `subagent_steer` and `subagent_cancel` take it as `expected_run`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
             "started_ms": {
               "format": "uint64",
               "minimum": 0,
@@ -9227,6 +9242,21 @@
                 "string",
                 "null"
               ]
+            },
+            "person": {
+              "description": "A message that neither the task nor Herdr sent reached this run (a person's chat in OMP's\nagent view, or another client); the `subagent_*` ops refuse it.",
+              "type": "boolean"
+            },
+            "revived": {
+              "description": "The run is not the subagent's first.",
+              "type": "boolean"
+            },
+            "run": {
+              "default": 0,
+              "description": "Which run of this subagent the row shows, from 1. A new run starts when the subagent runs\nagain after it handed over its result or was parked: a `task` resume, a wake, or a person's\nchat. `subagent_steer` and `subagent_cancel` take it as `expected_run`.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
             },
             "started_ms": {
               "format": "uint64",

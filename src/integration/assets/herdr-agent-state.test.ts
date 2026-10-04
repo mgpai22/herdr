@@ -2631,15 +2631,16 @@ mock.module("@oh-my-pi/pi-coding-agent/registry/agent-lifecycle", () => ({
 
 // A process-wide agent registry like OMP's, with `refs` as its agents.
 function fakeRegistry(refs: any[]) {
-  const listeners = new Set<() => void>();
+  const listeners = new Set<(event: unknown) => void>();
   const registry = {
     list: () => refs,
     get: (id: string) => refs.find((ref) => ref.id === id),
-    onChange: (listener: () => void) => {
+    onChange: (listener: (event: unknown) => void) => {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-    changed: () => listeners.forEach((listener) => listener()),
+    // OMP emits one event per ref change, synchronously.
+    changed: () => refs.forEach((ref) => listeners.forEach((listener) => listener({ type: "status_changed", ref }))),
     listeners,
   };
   return { registry, pi: { AgentRegistry: Object.assign(FakeAgentRegistry, { global: () => registry }) } };
@@ -2792,7 +2793,9 @@ test("Oh My Pi lists the session's subagents, running first, within the roster c
     activity: "step 4",
     model: "anthropic/claude-haiku-4-5",
     started_ms: 504,
+    run: 1,
   });
+  expect(roster.items[0].revived).toBeUndefined();
   expect(roster.items[1].parent).toBeUndefined();
   // The root's own events never count as a subagent's.
   expect(omp.details().at(-1)?.tool).toBeUndefined();
@@ -2841,7 +2844,7 @@ test("Oh My Pi steers only a subagent of its session that runs a turn", async ()
   ]);
   const omp = await installOmpForActions("omp-subagent-steer", { pi });
   const steer = async (id: string, text = "[sahur] look at the tests too") =>
-    (await omp.act({ op: "subagent_steer", args: { subagent_id: id, text } })).ack;
+    (await omp.act({ op: "subagent_steer", args: { subagent_id: id, text, expected_run: 1 } })).ack;
   expect(await steer("busy")).toMatchObject({ ok: true, data: { subagent_id: "busy", delivered: "aside" } });
   expect(sent).toEqual([["[sahur] look at the tests too", { deliverAs: "aside" }]]);
   expect((await steer("between")).error).toStartWith("subagent_busy:");
@@ -2867,7 +2870,8 @@ test("Oh My Pi cancels a subagent through OMP's own lifecycle manager", async ()
     },
   };
   const omp = await installOmpForActions("omp-subagent-cancel", { pi });
-  const cancel = async (id: string) => (await omp.act({ op: "subagent_cancel", args: { subagent_id: id } })).ack;
+  const cancel = async (id: string) =>
+    (await omp.act({ op: "subagent_cancel", args: { subagent_id: id, expected_run: 1 } })).ack;
   expect((await cancel("ghost")).error).toBe("no_subagent: ghost is not a subagent of this session");
   expect((await cancel("finished")).error).toBe("subagent_not_running: finished is idle");
   expect(calls).toEqual([]);
@@ -2889,7 +2893,164 @@ test("Oh My Pi refuses a subagent cancel when the lifecycle module is not OMP's 
   // cancel nothing.
   const omp = await installOmpForActions("omp-subagent-cancel-copy", { pi: { AgentRegistry: { global: () => registry } } });
   lifecycle.manager = { release: async () => void calls.push("release") };
-  const ack = (await omp.act({ op: "subagent_cancel", args: { subagent_id: "worker" } })).ack;
+  const ack = (await omp.act({ op: "subagent_cancel", args: { subagent_id: "worker", expected_run: 1 } })).ack;
   expect(ack.error).toStartWith("unsupported_op:");
   expect(calls).toEqual([]);
+});
+
+test("Oh My Pi keeps the tool list that fits when both lists are too large", async () => {
+  const names = (prefix: string) => Array.from({ length: 200 }, (_, i) => `${prefix}${i}`.padEnd(128, "x"));
+  const active = names("a");
+  const omp = await installOmpForActions(
+    "omp-tool-shrink",
+    {
+      getActiveTools: () => active,
+      getAllTools: () => [...active, ...names("i")].map((name) => ({ name })),
+    },
+    { setStatus: () => {} },
+  );
+  expect((await omp.act({ op: "status", args: { text: "refresh" } })).ack.ok).toBe(true);
+  await waitFor(() => omp.details().at(-1)?.status_text === "refresh");
+  const detail = omp.details().at(-1)!;
+  expect(Buffer.byteLength(JSON.stringify(detail), "utf8")).toBeLessThanOrEqual(30 * 1024);
+  expect(detail.active_tools).toHaveLength(200);
+  expect(detail.inactive_tools).toBeUndefined();
+});
+
+test("Oh My Pi refuses text with controls a terminal or OMP would show differently", async () => {
+  const notices: unknown[][] = [];
+  const omp = await installOmpForActions("omp-unsafe-text", {}, { notify: (...args: unknown[]) => notices.push(args), setStatus: () => {} });
+  for (const text of ["st \u009b7mINV", "next\u0085line", "bidi \u202edesrever", "sep \u2028 ls", "mark\u200f", "iso\u2066x"]) {
+    expect((await omp.act({ op: "notify", args: { text } })).ack.error).toStartWith("invalid_args:");
+    expect((await omp.act({ op: "status", args: { text } })).ack.error).toStartWith("invalid_args:");
+    expect((await omp.act({ op: "command", args: { name: "name", args: { title: text } } })).ack.error).toStartWith("invalid_args:");
+  }
+  expect((await omp.act({ op: "notify", args: { text: "ünïcode — ok" } })).ack.ok).toBe(true);
+  expect(notices).toEqual([["ünïcode — ok", "info"]]);
+});
+
+test("Oh My Pi steers and cancels only the subagent run the caller read", async () => {
+  const sent: unknown[][] = [];
+  const ref: any = subRef("worker", {
+    session: { isStreaming: true, sendUserMessage: async (...args: unknown[]) => void sent.push(args), abort: async () => {} },
+  });
+  const { registry, pi } = fakeRegistry([ref]);
+  lifecycle.manager = { release: async () => true };
+  const omp = await installOmpForActions("omp-subagent-run", { pi });
+  const steer = async (run: unknown) =>
+    (await omp.act({ op: "subagent_steer", args: { subagent_id: "worker", text: "[sahur] go", expected_run: run } })).ack;
+  expect((await steer(undefined)).error).toStartWith("invalid_args:");
+  expect((await steer(1)).ok).toBe(true);
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.run === 1);
+  // Between two turns of the same task run OMP shows it idle: still run 1.
+  ref.status = "idle";
+  registry.changed();
+  ref.status = "running";
+  registry.changed();
+  expect((await steer(1)).ok).toBe(true);
+  // The run hands over its result; then a person chats with the finished subagent.
+  ref.status = "idle";
+  ref.lifecycle = { responseAt: 5, acceptedAt: 5 };
+  registry.changed();
+  ref.status = "running";
+  ref.lifecycle = undefined;
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.run === 2, 3_000);
+  expect(omp.details().at(-1)?.subagents?.items?.[0]?.revived).toBe(true);
+  // A caller that read the first run touches nothing.
+  expect((await steer(1)).error).toBe("subagent_changed: worker is on run 2 now, not run 1; read agent.get again");
+  expect((await omp.act({ op: "subagent_cancel", args: { subagent_id: "worker", expected_run: 1 } })).ack.error).toStartWith(
+    "subagent_changed:",
+  );
+  expect(sent).toHaveLength(2);
+});
+
+test("Oh My Pi leaves a subagent run alone once someone else sent it a message", async () => {
+  const sent: unknown[][] = [];
+  const ref: any = subRef("chat", {
+    session: { isStreaming: true, sendUserMessage: async (...args: unknown[]) => void sent.push(args), abort: async () => {} },
+  });
+  const { registry, pi } = fakeRegistry([ref]);
+  const calls: string[] = [];
+  lifecycle.manager = { release: async () => void calls.push("release") };
+  const omp = await installOmpForActions("omp-subagent-person", { pi });
+  const sub = { hasUI: false, agent: { kind: "sub", id: "chat", name: "task", depth: 1 } };
+  const message = (text: string, attribution?: string) =>
+    omp.harness.handlers.get("message_start")?.(
+      { message: { role: "user", content: [{ type: "text", text }], ...(attribution ? { attribution } : {}) } },
+      sub,
+    );
+  // The task's own prompt and herdr's steer are not a person's.
+  await message("Run the tests.", "agent");
+  expect((await omp.act({ op: "subagent_steer", args: { subagent_id: "chat", text: "[sahur] also lint", expected_run: 1 } })).ack.ok).toBe(true);
+  await message("[sahur] also lint");
+  expect((await omp.act({ op: "subagent_steer", args: { subagent_id: "chat", text: "[sahur] again", expected_run: 1 } })).ack.ok).toBe(true);
+  // Asides herdr queued during one step all arrive at the next step boundary.
+  for (let i = 0; i < 20; i += 1) {
+    const text = `[sahur] queued ${i}`;
+    expect((await omp.act({ op: "subagent_steer", args: { subagent_id: "chat", text, expected_run: 1 } })).ack.ok).toBe(true);
+  }
+  // The run handed over its result while they were queued: they start its next run.
+  ref.status = "idle";
+  ref.lifecycle = { responseAt: 5, acceptedAt: 5 };
+  registry.changed();
+  ref.status = "running";
+  ref.lifecycle = undefined;
+  registry.changed();
+  for (let i = 0; i < 20; i += 1) await message(`[sahur] queued ${i}`);
+  expect((await omp.act({ op: "subagent_steer", args: { subagent_id: "chat", text: "[sahur] after", expected_run: 2 } })).ack.ok).toBe(true);
+  // A person types into the subagent from OMP's agent view.
+  await message("Person here: stop and explain.");
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.person === true, 3_000);
+  for (const op of ["subagent_steer", "subagent_cancel"]) {
+    const ack = (await omp.act({ op, args: { subagent_id: "chat", text: "[sahur] x", expected_run: 2 } })).ack;
+    expect(ack.error).toStartWith("subagent_person_chat:");
+  }
+  expect(sent).toHaveLength(23);
+  expect(calls).toEqual([]);
+});
+
+test("Oh My Pi never steers a subagent that handed over its result", async () => {
+  const sent: unknown[][] = [];
+  // The run yielded; a queued aside keeps it streaming, so OMP still shows it running.
+  const { pi } = fakeRegistry([
+    subRef("yielded", {
+      lifecycle: { responseAt: 5, acceptedAt: 5 },
+      session: { isStreaming: true, sendUserMessage: async (...args: unknown[]) => void sent.push(args) },
+    }),
+  ]);
+  const omp = await installOmpForActions("omp-subagent-yielded", { pi });
+  const ack = (await omp.act({ op: "subagent_steer", args: { subagent_id: "yielded", text: "[sahur] more", expected_run: 1 } })).ack;
+  expect(ack.error).toBe("subagent_not_running: yielded has handed over its result");
+  expect(sent).toEqual([]);
+});
+
+test("Oh My Pi cancels nothing when the subagent ended while the cancel started", async () => {
+  const calls: string[] = [];
+  const ref: any = subRef("racer", { session: { isStreaming: true, abort: async () => void calls.push("abort") } });
+  let reads = 0;
+  const registry = {
+    list: () => [ref],
+    // The second read comes after the lifecycle import: the run ended in between.
+    get: () => (++reads === 1 ? ref : { ...ref, status: "idle" }),
+    onChange: () => () => {},
+  };
+  const omp = await installOmpForActions("omp-subagent-cancel-race", {
+    pi: { AgentRegistry: Object.assign(FakeAgentRegistry, { global: () => registry }) },
+  });
+  lifecycle.manager = { release: async () => void calls.push("release") };
+  const ack = (await omp.act({ op: "subagent_cancel", args: { subagent_id: "racer", expected_run: 1 } })).ack;
+  expect(ack.error).toBe("subagent_not_running: racer ended before the cancel");
+  expect(calls).toEqual([]);
+});
+
+test("Oh My Pi does not report a cancel that OMP's release did not apply", async () => {
+  const ref: any = subRef("gone", { session: { isStreaming: true, abort: async () => {} } });
+  const { pi } = fakeRegistry([ref]);
+  lifecycle.manager = { release: async () => false };
+  const omp = await installOmpForActions("omp-subagent-release-false", { pi });
+  const ack = (await omp.act({ op: "subagent_cancel", args: { subagent_id: "gone", expected_run: 1 } })).ack;
+  expect(ack.ok).toBe(false);
+  expect(ack.error).toBe("subagent_not_running: gone ended before the cancel");
+  expect(ack.data?.cancelled).toBeUndefined();
 });

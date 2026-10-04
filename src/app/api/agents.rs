@@ -3081,6 +3081,9 @@ mod tests {
                         "name": "Explore",
                         "type": "explore",
                         "status": "running",
+                        "run": 2,
+                        "revived": true,
+                        "person": true,
                         "tool": {"name": "grep", "started_ms": 5},
                         "started_ms": 3,
                         "active_ms": 4
@@ -3109,6 +3112,8 @@ mod tests {
         let json = serde_json::to_value(&info.omp).unwrap();
         assert_eq!(json["subagents"]["items"][0]["type"], "explore");
         assert_eq!(json["subagents"]["truncated"], true);
+        assert_eq!(json["subagents"]["items"][0]["run"], 2);
+        assert_eq!(json["subagents"]["items"][0]["person"], true);
         assert!(report(&mut app, detail(33 * 1024)).contains("too large"));
         assert_eq!(app.agent_info_for_target(&target).unwrap().omp, Some(kept));
     }
