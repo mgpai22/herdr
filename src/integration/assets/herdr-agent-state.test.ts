@@ -1854,7 +1854,8 @@ async function startOutageServer(name: string) {
   socketPath = recordingSocketPath;
   await rm(recordingSocketPath, { force: true });
   const received: { method: string; params: Record<string, any> }[] = [];
-  const state = { outage: false };
+  // `outage`: herdr refuses at once; `silent`: herdr reads and never answers.
+  const state = { outage: false, silent: false };
   const recordingServer = createServer((socket) => {
     let input = "";
     socket.setEncoding("utf8");
@@ -1867,6 +1868,7 @@ async function startOutageServer(name: string) {
         socket.destroy();
         return;
       }
+      if (state.silent) return;
       received.push(request);
       socket.end(JSON.stringify({ id: request.id, result: { type: "ok" } }) + "\n");
     });
@@ -2359,12 +2361,13 @@ test("Oh My Pi waits for a session change to settle before it registers again", 
   const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
   install(pi);
   let file = "/tmp/omp-settle.jsonl";
+  let sessionId = "z";
   const context = {
     hasUI: true,
     mode: "tui",
     isIdle: () => true,
     ui: { onTerminalInput: () => () => {}, getEditorText: () => "" },
-    sessionManager: { getSessionFile: () => file, getSessionId: () => "z" },
+    sessionManager: { getSessionFile: () => file, getSessionId: () => sessionId },
   };
   await handlers.get("session_start")?.({ reason: "startup" }, context);
   await waitFor(() => received.some((request) => request.method === "pane.report_agent_session_v2"));
@@ -2375,8 +2378,10 @@ test("Oh My Pi waits for a session change to settle before it registers again", 
   // A slow switch: OMP swaps to the target at 300 ms, then rolls back at 600 ms.
   await Bun.sleep(300);
   file = "/tmp/omp-settle-target.jsonl";
+  sessionId = "z-target";
   await Bun.sleep(300);
   file = "/tmp/omp-settle.jsonl";
+  sessionId = "z";
   // Still applying: nothing registered while the session moved, nor right after it came back.
   await Bun.sleep(250);
   expect(reports().length).toBe(withdrawn);
@@ -2546,3 +2551,61 @@ test("Oh My Pi reports a session moved during a long outage once herdr answers",
   state.outage = false;
   await waitFor(() => received.slice(before).some((request) => request.params?.agent_session_path === file), 9_000);
 }, 20_000);
+
+test("Oh My Pi registers again when a cancelled switch is followed by a move before the wait ends", async () => {
+  process.env.HERDR_OMP_SWITCH_WAIT_MS = "400";
+  process.env.HERDR_OMP_SWITCH_POLL_MS = "50";
+  const omp = await installOmpForActions("omp-cancel-then-move");
+  let file = "/tmp/omp-instruct.jsonl";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+  const reports = () =>
+    omp.harness.requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as {
+      params: Record<string, any>;
+    }[];
+  // A /new that another extension cancels, then a person's /move during the wait.
+  await omp.harness.handlers.get("session_before_switch")?.({ reason: "new" }, omp.harness.context);
+  expect(reports().at(-1)?.params.accepts_instructions).toBe(false);
+  await Bun.sleep(100);
+  file = "/tmp/cancel-then-move/omp-instruct.jsonl";
+  await waitFor(
+    () => reports().at(-1)?.params.accepts_instructions === true && reports().at(-1)?.params.agent_session_path === file,
+    3_000,
+  );
+  delete process.env.HERDR_OMP_SWITCH_WAIT_MS;
+  delete process.env.HERDR_OMP_SWITCH_POLL_MS;
+});
+
+test("Oh My Pi keeps a move report retrying when an older report fails after the move", async () => {
+  const { received, state } = await startOutageServer("omp-move-race");
+  process.env.HERDR_OMP_SESSION_RETRY_MS = "10";
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "50";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+  let file = "/tmp/omp-move-race.jsonl";
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => false,
+    ui: { onTerminalInput: () => () => {} },
+    sessionManager: { getSessionFile: () => file, getSessionId: () => "omp-move-race" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.params?.agent_session_path === file));
+  // herdr reads and does not answer: the turn's reports time out, and recovery keeps a session
+  // report waiting.
+  state.silent = true;
+  await handlers.get("agent_start")?.({}, context);
+  await Bun.sleep(5_000);
+  // A person's /move while that report waits.
+  file = "/tmp/moved-race/omp-move-race.jsonl";
+  await Bun.sleep(200);
+  // Then herdr refuses at once for longer than the 8 quick retries, then answers again.
+  state.silent = false;
+  state.outage = true;
+  await Bun.sleep(8_000);
+  const before = received.length;
+  state.outage = false;
+  await waitFor(() => received.slice(before).some((request) => request.params?.agent_session_path === file), 9_000);
+}, 30_000);

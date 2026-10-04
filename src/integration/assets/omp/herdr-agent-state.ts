@@ -419,6 +419,17 @@ function updateSessionRef(ctx: any): void {
 }
 
 // The session OMP runs now, read from `ctx` without storing it.
+// The session OMP runs now by id (a move keeps it, a switch changes it), else by path.
+function readSessionIdKey(ctx: any): string | undefined {
+  try {
+    const id = ctx?.sessionManager?.getSessionId?.();
+    if (typeof id === "string" && id.length > 0) return `id\0${id}`;
+  } catch {
+    return undefined;
+  }
+  return readSessionKey(ctx);
+}
+
 function readSessionKey(ctx: any): string | undefined {
   let file: unknown;
   let id: unknown;
@@ -628,8 +639,9 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
       }
     }, Math.min(sessionRetryBaseMs * 2 ** attempt, 30_000));
     sessionRetryTimer.unref?.();
-  } else if (!delivered) {
-    // Out of retries, or the session changed: a later lost report may try again.
+  } else if (!delivered && currentSessionKey() === sessionKey) {
+    // Out of retries: a later lost report may try again. If the session changed, a newer report
+    // owns the flag (a move sets it before its report).
     reportsLost = false;
   }
 }
@@ -1888,7 +1900,10 @@ export default function (pi) {
   }
 
   // See the comment at the `session_before_*` handlers.
+  let withdrawalWatch: ReturnType<typeof setInterval> | undefined;
   function watchWithdrawal(ctx: any, activation: number, sessionKey: string | undefined) {
+    // A newer withdrawal supersedes the previous one's watch.
+    clearInterval(withdrawalWatch);
     let stableSince = Date.now();
     let last = sessionKey;
     const deadline = Date.now() + 10 * 60_000;
@@ -1897,7 +1912,7 @@ export default function (pi) {
         clearInterval(watch);
         return;
       }
-      const now = readSessionKey(ctx);
+      const now = readSessionIdKey(ctx);
       if (now !== last) {
         last = now;
         stableSince = Date.now();
@@ -1909,6 +1924,7 @@ export default function (pi) {
       if (!followSessionMove(ctx)) void reportSession();
     }, switchPollMs);
     watch.unref?.();
+    withdrawalWatch = watch;
   }
 
   // OMP drops every input listener when a session change starts (`/new`, `/resume`, fork,
@@ -1918,9 +1934,10 @@ export default function (pi) {
   // A change can still fail or be cancelled after these events (a failed fork, another
   // extension's cancel, a `/btw` branch that throws), and then no session event follows. OMP 18.4.4
   // gives extensions no way to see that a change has ended, so the integration watches: once a
-  // second, it reads the session OMP runs (without storing it). It registers the listener again
-  // only after OMP has run the session it ran before the event, unchanged, for `switchWaitMs` (40
-  // s, above OMP's 30 s cap per handler) with no activation in between. A change that is still
+  // second, it reads the session OMP runs (without storing it), by id, so a `/move` or `/wt` does
+  // not count. It registers the listener again only after OMP has run the session it ran before
+  // the event, unchanged, for `switchWaitMs` (40 s, above OMP's 30 s cap per handler) with no
+  // activation in between. A change that is still
   // applying (other extensions' handlers, a flush, an advisor drain) keeps it withdrawn; any change
   // of the session OMP runs (a swap, a rollback) starts the wait over. Residual: two other
   // handlers that each hit the cap take longer than the wait; a block that then arrives after
@@ -1933,9 +1950,9 @@ export default function (pi) {
       unsubscribeInstructions?.();
       unsubscribeInstructions = undefined;
       instructionListener = false;
-      // The session OMP runs now, which is the one before the event (OMP swaps later). The stored
-      // key can still name the file from before a `/move` the watch has not seen yet.
-      watchWithdrawal(ctx, activations, readSessionKey(ctx) ?? currentSessionKey());
+      // The session OMP runs now, which is the one before the event (OMP swaps later), by id: a
+      // `/move` before or during the wait keeps it.
+      watchWithdrawal(ctx, activations, readSessionIdKey(ctx) ?? currentSessionKey());
       const sessionRef = currentSessionRef();
       if (sessionRef) {
         await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
