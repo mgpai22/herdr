@@ -2427,10 +2427,12 @@ test("Oh My Pi takes a dropped instruction back out of the editor, and only that
 test("Oh My Pi refuses a block while OMP has moved to another session but not announced it", async () => {
   const omp = await installOmpForActions("omp-mid-switch");
   let file = "/tmp/omp-instruct.jsonl";
-  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "s" } as never;
+  let sessionId = "s";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => sessionId } as never;
   const tag = tagOf(file);
-  // OMP swapped the session file; `session_switch` has not come yet.
+  // OMP swapped to another session (a new id and file); `session_switch` has not come yet.
   file = "/tmp/omp-mid-switch-new.jsonl";
+  sessionId = "s-new";
   const action = await omp.act({ op: "abort", args: {}, session: tag });
   expect(action.ack.error).toStartWith("session_changed:");
   expect(omp.aborted()).toBe(0);
@@ -2451,4 +2453,43 @@ test("Oh My Pi recognizes every token it ever issued, whichever one herdr applie
   expect(omp.listener(actionBlock(id, { op: "abort", args: {} }, applied))).toEqual({ consume: true });
   await waitFor(() => omp.acks().some((ack) => ack.action_id === id));
   expect(omp.acks().find((ack) => ack.action_id === id)?.error).toStartWith("failed: the block carried a retired token");
+});
+
+test("Oh My Pi follows a moved session (same id, new path): blocks still run and herdr learns the path", async () => {
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "50";
+  const omp = await installOmpForActions("omp-moved-session");
+  delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+  let file = "/tmp/omp-instruct.jsonl";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+  const tag = tagOf(file);
+  // A person's /move: OMP renames the session file, keeps the id, and emits no event.
+  file = "/tmp/moved/omp-instruct.jsonl";
+  // A block herdr checked against the old path runs: it is the same conversation.
+  const moved = await omp.act({ op: "abort", args: {}, session: tag });
+  expect(moved.ack.ok).toBe(true);
+  expect(omp.aborted()).toBe(1);
+  // herdr hears of the new path without a turn.
+  const reports = () =>
+    omp.harness.requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as {
+      params: Record<string, any>;
+    }[];
+  await waitFor(() => reports().at(-1)?.params.agent_session_path === file);
+  // A block for the new path runs too.
+  expect((await omp.act({ op: "abort", args: {}, session: tagOf(file) })).ack.ok).toBe(true);
+});
+
+test("Oh My Pi tells herdr about a moved session while idle", async () => {
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "50";
+  const omp = await installOmpForActions("omp-moved-idle");
+  delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+  let file = "/tmp/omp-instruct.jsonl";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+  file = "/tmp/moved-idle/omp-instruct.jsonl";
+  await waitFor(
+    () =>
+      (omp.harness.requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2").at(-1) as
+        | { params: Record<string, any> }
+        | undefined)?.params.agent_session_path === file,
+    3_000,
+  );
 });

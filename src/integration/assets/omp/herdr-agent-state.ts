@@ -360,6 +360,8 @@ const droppedWatchMs = 10_000;
 // extension (OMP then goes on with the change) is seen as a change still applying.
 const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 40_000);
 const switchPollMs = parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000);
+// How often the integration looks for a moved session file (`/move`, `/wt`).
+const moveWatchMs = parseDurationEnv("HERDR_OMP_MOVE_WATCH_MS", 3000);
 // How long OMP may take to report that a dialog closed after a person's key.
 const closeReportWaitMs = 300;
 
@@ -397,6 +399,7 @@ export function isAbsoluteSessionPath(file: unknown): file is string {
 
 function updateSessionRef(ctx: any): void {
   const previousKey = currentSessionKey();
+  const previousId = currentAgentSessionId;
   try {
     const file = ctx?.sessionManager?.getSessionFile?.();
     currentAgentSessionPath = isAbsoluteSessionPath(file) ? file : undefined;
@@ -411,6 +414,7 @@ function updateSessionRef(ctx: any): void {
     currentAgentSessionId = undefined;
   }
   if (currentSessionKey() !== previousKey) registeredSessionKey = undefined;
+  if (currentAgentSessionId !== previousId) movedSessionTags = [];
 }
 
 // The session OMP runs now, read from `ctx` without storing it.
@@ -430,9 +434,52 @@ function readSessionKey(ctx: any): string | undefined {
 
 // OMP already runs another session than the one this runtime registered: it is between a
 // session change's swap and its `session_switch` event.
+// A session switch changes the session id (a new session, fork, branch or resume each have their
+// own). `/move` and `/wt` keep the id and only rename the session file, so they are not a switch.
 function liveSessionMoved(ctx: any): boolean {
-  const live = readSessionKey(ctx);
-  return live !== undefined && live !== currentSessionKey();
+  let id: unknown;
+  try {
+    id = ctx?.sessionManager?.getSessionId?.();
+  } catch {
+    return false;
+  }
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    currentAgentSessionId !== undefined &&
+    id !== currentAgentSessionId
+  );
+}
+
+// Tags of earlier files of the current session (`/move`, `/wt`): a block herdr checked against
+// one of them is for this conversation.
+let movedSessionTags: string[] = [];
+
+function tagOf(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
+function isCurrentSessionTag(tag: string): boolean {
+  return tag === sessionTag() || movedSessionTags.includes(tag);
+}
+
+// OMP moved the session file (same id, new path), which emits no event: follow it and tell herdr,
+// so herdr shows, checks and resumes the new path. Returns whether it moved.
+function followSessionMove(ctx: any): boolean {
+  const before = currentAgentSessionPath;
+  if (before === undefined || liveSessionMoved(ctx)) return false;
+  let file: unknown;
+  try {
+    file = ctx?.sessionManager?.getSessionFile?.();
+  } catch {
+    return false;
+  }
+  if (!isAbsoluteSessionPath(file) || file === before) return false;
+  movedSessionTags.push(tagOf(before));
+  movedSessionTags.splice(0, movedSessionTags.length - 8);
+  updateSessionRef(ctx);
+  void reportSession();
+  return true;
 }
 
 function currentSessionKey(): string | undefined {
@@ -445,7 +492,7 @@ function currentSessionKey(): string | undefined {
 // session path, else its id, in hex.
 function sessionTag(): string | undefined {
   const value = currentAgentSessionPath ?? currentAgentSessionId;
-  return value === undefined ? undefined : createHash("sha256").update(value).digest("hex").slice(0, 32);
+  return value === undefined ? undefined : tagOf(value);
 }
 
 function withRegisteredSessionRef(params: Record<string, unknown>): Record<string, unknown> {
@@ -784,15 +831,16 @@ export default function (pi) {
       void reportSession();
       return rest;
     }
-    // herdr checked the caller's session against the last one OMP reported; OMP has moved on
-    // (`/new`, `/resume`, a branch) before that report reached herdr. Nothing is sent.
-    // OMP is mid-change: its session file moved and the activation has not come yet. Nothing is
-    // sent; the activation registers the new session.
+    // OMP is mid-switch: it runs another session (a new id) and the activation has not come yet.
+    // Nothing is sent; the activation registers the new session.
     if (liveSessionMoved(ctx)) {
       ackInstruction(instructionId, "dropped");
       return rest;
     }
-    if (session !== undefined && session !== sessionTag()) {
+    followSessionMove(ctx);
+    // herdr checked the caller's session against the last one OMP reported; OMP has moved on
+    // (`/new`, `/resume`, a branch) before that report reached herdr. Nothing is sent.
+    if (session !== undefined && !isCurrentSessionTag(session)) {
       ackInstruction(instructionId, "dropped");
       // herdr holds an older registration than OMP: register again (herdr just wrote, so it
       // answers).
@@ -913,6 +961,7 @@ export default function (pi) {
   let detailTimer: ReturnType<typeof setTimeout> | undefined;
   // herdr refused a detail report; set until the next session event.
   let detailRefused = false;
+  let moveWatch: ReturnType<typeof setInterval> | undefined;
   // Counts activations and shutdowns, so a pending withdrawal undo sees that a session event came.
   let activations = 0;
   let lastDetailAt = 0;
@@ -1281,7 +1330,8 @@ export default function (pi) {
     if (liveSessionMoved(ctx)) {
       return refuse("session_changed: OMP is switching to another session now; read agent.get again");
     }
-    if (typeof request?.session === "string" && request.session !== sessionTag()) {
+    followSessionMove(ctx);
+    if (typeof request?.session === "string" && !isCurrentSessionTag(request.session)) {
       void reportSession();
       return refuse("session_changed: OMP runs another session now; read agent.get again");
     }
@@ -1556,6 +1606,15 @@ export default function (pi) {
     // the token it showed. Every registration gets a new token anyway.
     rotateBlockToken(!scrubLeakedBlocks(ctx));
     clearDroppedText(ctx?.ui);
+    // `/move` and `/wt` rename the session file and emit no event: look every few seconds, so
+    // herdr learns the new path (for `expected_session` and for resume) without waiting for a
+    // write or a turn.
+    if (!moveWatch) {
+      moveWatch = setInterval(() => {
+        if (rootSession && instructionListener && detailCtx) followSessionMove(detailCtx);
+      }, moveWatchMs);
+      moveWatch.unref?.();
+    }
     onRegistered = (lost) => {
       if (lost) publishState(true);
       if (instructionListener) scheduleDetail(undefined, true);
@@ -1884,6 +1943,8 @@ export default function (pi) {
       return;
     }
     activations += 1;
+    clearInterval(moveWatch);
+    moveWatch = undefined;
     clearPendingTimers();
     clearTimeout(detailTimer);
     detailTimer = undefined;
