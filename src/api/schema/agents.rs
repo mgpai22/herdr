@@ -456,15 +456,17 @@ pub struct OmpSubagent {
     /// `running`, `idle`, `parked` or `aborted`.
     pub status: String,
     /// Which run of this subagent the row shows, from 1. A new run starts when the subagent runs
-    /// again after it handed over its result or was parked: a `task` resume, a wake, or a person's
-    /// chat. `subagent_steer` and `subagent_cancel` take it as `expected_run`.
+    /// again after OMP finished its previous run (with a result or without one) or parked it: a
+    /// `task` resume, a wake, or a person's chat. Inside such a later run every turn can count as
+    /// a new run. `subagent_steer` and `subagent_cancel` take it as `expected_run`.
     #[serde(default)]
     pub run: u32,
     /// The run is not the subagent's first.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub revived: bool,
-    /// A message that neither the task nor Herdr sent reached this run (a person's chat in OMP's
-    /// agent view, or another client); the `subagent_*` ops refuse it.
+    /// A message that neither the task nor Herdr sent reached this subagent (a person's chat in
+    /// OMP's agent view, or another client), or reached the run that spawned it. It stays set until
+    /// the subagent hands over a result or parks; the `subagent_*` ops refuse it.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub person: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -393,8 +393,9 @@ let statusText: string | undefined;
 // finished it (with a result or not; it then hands the subagent to the lifecycle manager), it
 // handed over its result, or it was parked. A `task` resume, a wake and a person's chat with the
 // finished subagent each start a new run. Inside a woken run every turn counts as a new run: that
-// over-count only makes a caller read again. A subagent that a run with `person` set spawns
-// starts with `person` set too: it does that person's work.
+// over-count only makes a caller read again. `person` stays set until the subagent hands over a
+// result or parks, across such turns. A subagent that a run with `person` set spawns starts with
+// `person` set too: it does that person's work.
 type SubagentInfo = {
   type?: string;
   tool?: { name: string; call_id?: string; started_ms: number };
@@ -428,9 +429,11 @@ function observeRun(ref: any): SubagentInfo {
     info.status !== "running" &&
     (info.accepted || info.status === "parked" || runFinished(ref))
   ) {
+    // A later turn of a finished subagent (a provider retry, a compaction continuation, a wake)
+    // keeps `person`: only a handed-over result or a park ends a person's chat.
+    if (info.accepted || info.status === "parked") info.person = false;
     info.run += 1;
     info.accepted = false;
-    info.person = false;
   }
   if (ref.lifecycle?.acceptedAt !== undefined) info.accepted = true;
   info.status = ref.status;
@@ -451,6 +454,24 @@ function runFinished(ref: any): boolean {
   } catch {
     return false;
   }
+}
+
+// OMP's `ensurePersistedRoster`, loaded once; undefined when it does not load as OMP's own.
+let persistedRoster: Promise<any> | undefined;
+
+// OMP registers a session's earlier subagents (from the transcripts under its directory) only when
+// something asks for them (the Agent Hub, an `agent://` read, the task tool). After a restart or a
+// resume the roster would be empty until then, so the root activation asks too.
+function loadPersistedRoster(registryClass: unknown): Promise<any> {
+  persistedRoster ??= (async () => {
+    const [persisted, registry] = await Promise.all([
+      import("@oh-my-pi/pi-coding-agent/registry/persisted-agents"),
+      import("@oh-my-pi/pi-coding-agent/registry/agent-registry"),
+    ]);
+    if (registryClass === undefined || registry?.AgentRegistry !== registryClass) return undefined;
+    return typeof persisted?.ensurePersistedRoster === "function" ? persisted.ensurePersistedRoster : undefined;
+  })().catch(() => undefined);
+  return persistedRoster;
 }
 
 function loadLifecycleManager(registryClass: unknown): Promise<any> {
@@ -2105,6 +2126,24 @@ export default function (pi) {
     };
     // Run counting needs to know when OMP's executor finished a run (`runFinished`).
     void loadLifecycleManager(pi.pi?.AgentRegistry);
+    // List the session's earlier subagents now, not only once something in OMP asks for them.
+    const registryNow = agentRegistry();
+    const activation = activations;
+    let sessionFile: unknown;
+    try {
+      sessionFile = ctx?.sessionManager?.getSessionFile?.();
+    } catch {}
+    if (registryNow && isAbsoluteSessionPath(sessionFile)) {
+      void loadPersistedRoster(pi.pi?.AgentRegistry).then(async (ensure) => {
+        if (!ensure || activation !== activations) return;
+        try {
+          await ensure(registryNow, sessionFile);
+        } catch {
+          return;
+        }
+        if (activation === activations && rootSession) scheduleDetail();
+      });
+    }
     if (!unsubscribeRegistry) {
       try {
         const off = agentRegistry()?.onChange?.((event: any) => {

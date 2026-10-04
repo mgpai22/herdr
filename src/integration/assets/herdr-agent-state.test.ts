@@ -2628,6 +2628,11 @@ mock.module("@oh-my-pi/pi-coding-agent/registry/agent-registry", () => ({ AgentR
 mock.module("@oh-my-pi/pi-coding-agent/registry/agent-lifecycle", () => ({
   AgentLifecycleManager: { global: () => lifecycle.manager },
 }));
+// OMP's scan of a session's earlier subagent transcripts; `persisted.scan` runs in the test.
+const persisted: { scan: (registry: any, sessionFile: string) => Promise<void> } = { scan: async () => {} };
+mock.module("@oh-my-pi/pi-coding-agent/registry/persisted-agents", () => ({
+  ensurePersistedRoster: (registry: any, sessionFile: string) => persisted.scan(registry, sessionFile),
+}));
 
 // A process-wide agent registry like OMP's, with `refs` as its agents.
 function fakeRegistry(refs: any[]) {
@@ -3123,4 +3128,72 @@ test("Oh My Pi protects a subagent that a run someone else chats with spawned", 
     expect(ack.error).toStartWith("subagent_person_chat:");
   }
   expect(calls).toEqual([]);
+});
+
+test("Oh My Pi keeps a person's chat protected across a retry turn of a finished subagent", async () => {
+  const calls: string[] = [];
+  const ref: any = subRef("K1", {
+    status: "idle",
+    lifecycle: { responseAt: 5, acceptedAt: 5 },
+    session: { isStreaming: true, sendUserMessage: async () => void calls.push("steer"), abort: async () => {} },
+  });
+  const { registry, pi } = fakeRegistry([ref]);
+  lifecycle.manager = {
+    has: (id: string, expected: unknown) => id === "K1" && expected === ref,
+    release: async () => {
+      calls.push("release");
+      return true;
+    },
+  };
+  const omp = await installOmpForActions("omp-subagent-person-retry", { pi });
+  const sub = { hasUI: false, agent: { kind: "sub", id: "K1", name: "task", depth: 1 } };
+  // The person chats with the finished subagent.
+  ref.status = "running";
+  ref.lifecycle = undefined;
+  registry.changed();
+  await omp.harness.handlers.get("message_start")?.(
+    { message: { role: "user", content: [{ type: "text", text: "Person here: sleep 40, then PERSON-TWO." }] } },
+    sub,
+  );
+  // A provider error: OMP retries in a new turn, with no new message.
+  ref.status = "idle";
+  registry.changed();
+  ref.status = "running";
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.run === 3, 3_000);
+  expect(omp.details().at(-1)?.subagents?.items?.[0]?.person).toBe(true);
+  for (const op of ["subagent_steer", "subagent_cancel"]) {
+    const ack = (await omp.act({ op, args: { subagent_id: "K1", text: "[sahur] probe", expected_run: 3 } })).ack;
+    expect(ack.error).toStartWith("subagent_person_chat:");
+  }
+  expect(calls).toEqual([]);
+  // The chat hands over its result; the parent's `task` resume starts a run of its own.
+  ref.status = "idle";
+  ref.lifecycle = { responseAt: 9, acceptedAt: 9 };
+  registry.changed();
+  ref.status = "running";
+  ref.lifecycle = undefined;
+  registry.changed();
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.run === 4, 3_000);
+  expect(omp.details().at(-1)?.subagents?.items?.[0]?.person).toBeUndefined();
+  expect((await omp.act({ op: "subagent_steer", args: { subagent_id: "K1", text: "[sahur] go", expected_run: 4 } })).ack.ok).toBe(true);
+});
+
+test("Oh My Pi lists a resumed session's earlier subagents without waiting for OMP to look", async () => {
+  const refs: any[] = [];
+  const { pi } = fakeRegistry(refs);
+  const scanned: string[] = [];
+  // OMP registers the transcripts it finds under the session's directory as parked refs.
+  persisted.scan = async (_registry, sessionFile) => {
+    scanned.push(sessionFile);
+    // The scan reads the disk; it ends after the activation's own reports.
+    await Bun.sleep(1_500);
+    refs.push(subRef("K6", { status: "parked" }));
+  };
+  const omp = await installOmpForActions("omp-subagent-persisted", { pi });
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.id === "K6", 3_000);
+  expect(scanned).toEqual(["/tmp/omp-instruct.jsonl"]);
+  const ack = (await omp.act({ op: "subagent_cancel", args: { subagent_id: "K6", expected_run: 1 } })).ack;
+  expect(ack.error).toBe("subagent_not_running: K6 is parked");
+  persisted.scan = async () => {};
 });

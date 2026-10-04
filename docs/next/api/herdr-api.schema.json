@@ -2885,7 +2885,7 @@
               ]
             },
             "person": {
-              "description": "A message that neither the task nor Herdr sent reached this run (a person's chat in OMP's\nagent view, or another client); the `subagent_*` ops refuse it.",
+              "description": "A message that neither the task nor Herdr sent reached this subagent (a person's chat in\nOMP's agent view, or another client), or reached the run that spawned it. It stays set until\nthe subagent hands over a result or parks; the `subagent_*` ops refuse it.",
               "type": "boolean"
             },
             "revived": {
@@ -2894,7 +2894,7 @@
             },
             "run": {
               "default": 0,
-              "description": "Which run of this subagent the row shows, from 1. A new run starts when the subagent runs\nagain after it handed over its result or was parked: a `task` resume, a wake, or a person's\nchat. `subagent_steer` and `subagent_cancel` take it as `expected_run`.",
+              "description": "Which run of this subagent the row shows, from 1. A new run starts when the subagent runs\nagain after OMP finished its previous run (with a result or without one) or parked it: a\n`task` resume, a wake, or a person's chat. Inside such a later run every turn can count as\na new run. `subagent_steer` and `subagent_cancel` take it as `expected_run`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
@@ -9244,7 +9244,7 @@
               ]
             },
             "person": {
-              "description": "A message that neither the task nor Herdr sent reached this run (a person's chat in OMP's\nagent view, or another client); the `subagent_*` ops refuse it.",
+              "description": "A message that neither the task nor Herdr sent reached this subagent (a person's chat in\nOMP's agent view, or another client), or reached the run that spawned it. It stays set until\nthe subagent hands over a result or parks; the `subagent_*` ops refuse it.",
               "type": "boolean"
             },
             "revived": {
@@ -9253,7 +9253,7 @@
             },
             "run": {
               "default": 0,
-              "description": "Which run of this subagent the row shows, from 1. A new run starts when the subagent runs\nagain after it handed over its result or was parked: a `task` resume, a wake, or a person's\nchat. `subagent_steer` and `subagent_cancel` take it as `expected_run`.",
+              "description": "Which run of this subagent the row shows, from 1. A new run starts when the subagent runs\nagain after OMP finished its previous run (with a result or without one) or parked it: a\n`task` resume, a wake, or a person's chat. Inside such a later run every turn can count as\na new run. `subagent_steer` and `subagent_cancel` take it as `expected_run`.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
