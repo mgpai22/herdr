@@ -133,6 +133,9 @@ type BlockTokens = {
   previous?: string;
   previousUntil?: number;
   retired: string[];
+  // The token herdr last confirmed. herdr writes with it, or a later one, until it confirms a
+  // newer one, so it is kept outside the ring however many rotations come meanwhile.
+  confirmed?: string;
 };
 const tokenSlot = globalThis as { [key: symbol]: BlockTokens | undefined };
 const TOKEN_KEY = Symbol.for("herdr.omp.blockToken");
@@ -151,6 +154,7 @@ function rotateBlockToken(keepPrevious: boolean): void {
 
 // herdr applied a registration that named `token`.
 function confirmBlockToken(token: string): void {
+  if (token === blockTokens.current) blockTokens.confirmed = token;
   if (token === blockTokens.current && blockTokens.previousUntil === Number.POSITIVE_INFINITY) {
     blockTokens.previousUntil = Date.now() + tokenGraceMs;
   }
@@ -164,7 +168,10 @@ function isBlockToken(token: string): boolean {
 }
 
 function isStaleBlockToken(token: string): boolean {
-  return !isBlockToken(token) && (token === runtimeInstance || blockTokens.retired.includes(token));
+  return (
+    !isBlockToken(token) &&
+    (token === runtimeInstance || token === blockTokens.confirmed || blockTokens.retired.includes(token))
+  );
 }
 
 // Action and v4 instruction bodies end with this line, so a block that reached OMP's editor can
@@ -350,7 +357,8 @@ const DIALOG_TIERS = [
 // How long an answer waits for its dialog to close; herdr waits 8 s for the final ack.
 const answerWaitMs = 5000;
 // How long a withdrawal before a session change waits for the change before it is undone.
-const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 5000);
+const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 30_000);
+const switchPollMs = parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000);
 // How long OMP may take to report that a dialog closed after a person's key.
 const closeReportWaitMs = 300;
 
@@ -402,6 +410,21 @@ function updateSessionRef(ctx: any): void {
     currentAgentSessionId = undefined;
   }
   if (currentSessionKey() !== previousKey) registeredSessionKey = undefined;
+}
+
+// The session OMP runs now, read from `ctx` without storing it.
+function readSessionKey(ctx: any): string | undefined {
+  let file: unknown;
+  let id: unknown;
+  try {
+    file = ctx?.sessionManager?.getSessionFile?.();
+    id = ctx?.sessionManager?.getSessionId?.();
+  } catch {
+    return undefined;
+  }
+  if (isAbsoluteSessionPath(file)) return `path\0${file}`;
+  if (typeof id === "string" && id.length > 0) return `id\0${id}`;
+  return undefined;
 }
 
 function currentSessionKey(): string | undefined {
@@ -737,6 +760,9 @@ export default function (pi) {
     // A block for a token this runtime retired, or a herdr from before block tokens: nothing runs.
     if (stale) {
       ackInstruction(instructionId, "dropped");
+      // herdr holds an older registration than OMP: register again (herdr just wrote, so it
+      // answers).
+      void reportSession();
       return rest;
     }
     // v4 bodies end with the end line; v3 bodies have none.
@@ -754,6 +780,9 @@ export default function (pi) {
     // (`/new`, `/resume`, a branch) before that report reached herdr. Nothing is sent.
     if (session !== undefined && session !== sessionTag()) {
       ackInstruction(instructionId, "dropped");
+      // herdr holds an older registration than OMP: register again (herdr just wrote, so it
+      // answers).
+      void reportSession();
       return rest;
     }
     // herdr has given up on a late block, and a paste OMP cut short is not the whole text: drop
@@ -1152,6 +1181,7 @@ export default function (pi) {
     const rest = enter ? { data: enter } : { consume: true };
     if (stale) {
       void ackAction(actionId, { ok: false, error: "failed: the block carried a retired token; nothing ran; read agent.get again" });
+      void reportSession();
       return rest;
     }
     const body = framed.endsWith(blockEnd(actionId)) ? framed.slice(0, -blockEnd(actionId).length) : undefined;
@@ -1188,6 +1218,7 @@ export default function (pi) {
     // herdr checked the caller's session against the last one OMP reported; OMP has moved on
     // (`/new`, `/resume`, a branch) before that report reached herdr.
     if (typeof request?.session === "string" && request.session !== sessionTag()) {
+      void reportSession();
       return refuse("session_changed: OMP runs another session now; read agent.get again");
     }
     const idle = ctx?.isIdle?.() === true;
@@ -1728,31 +1759,51 @@ export default function (pi) {
     });
   }
 
+  // See the comment at the `session_before_*` handlers.
+  function watchWithdrawal(ctx: any, activation: number, sessionKey: string | undefined) {
+    let stableSince = Date.now();
+    let last = sessionKey;
+    const deadline = Date.now() + 10 * 60_000;
+    const watch = setInterval(() => {
+      if (activation !== activations || !rootSession || Date.now() > deadline) {
+        clearInterval(watch);
+        return;
+      }
+      const now = readSessionKey(ctx);
+      if (now !== last) {
+        last = now;
+        stableSince = Date.now();
+        return;
+      }
+      if (now !== sessionKey || Date.now() - stableSince < switchWaitMs) return;
+      clearInterval(watch);
+      registerInstructionListener(ctx);
+      void reportSession();
+    }, switchPollMs);
+    watch.unref?.();
+  }
+
   // OMP drops every input listener when a session change starts (`/new`, `/resume`, fork,
   // branch), before these events, and registers none until the change ends. Tell herdr at once,
   // so it refuses writes instead of putting a block into the editor. `session_switch` or
   // `session_branch` registers the listener again.
   // A change can still fail or be cancelled after these events (a failed fork, another
-  // extension's cancel, a `/btw` branch that throws), and then no session event follows. When no
-  // activation came within `switchWaitMs` and OMP still runs the same session, the listener is
-  // registered again. The withdrawal report gets one attempt of at most 1 s, so a herdr that
-  // accepts but does not answer delays the person's switch by that much.
+  // extension's cancel, a `/btw` branch that throws), and then no session event follows. OMP 18.4.4
+  // gives extensions no way to see that a change has ended, so the integration watches: once a
+  // second, it reads the session OMP runs (without storing it). It registers the listener again
+  // only after OMP has run the session it ran before the event, unchanged, for `switchWaitMs` with
+  // no activation in between. A change that is still applying (other extensions' handlers, which
+  // OMP gives 30 s each, a flush, an advisor drain) keeps it withdrawn; any change of the session
+  // OMP runs (a swap, a rollback) starts the wait over. The withdrawal report gets one attempt of
+  // at most 1 s, so a herdr that accepts but does not answer delays the person's switch by that
+  // much. Residual: a handler that waits on a dialog longer than `switchWaitMs` is not seen.
   for (const event of ["session_before_switch", "session_before_branch"]) {
     pi.on(event, async (_event, ctx) => {
       if (!rootSession) return undefined;
       unsubscribeInstructions?.();
       unsubscribeInstructions = undefined;
       instructionListener = false;
-      const activation = activations;
-      const sessionKey = currentSessionKey();
-      const undo = setTimeout(() => {
-        if (activation !== activations || !rootSession) return;
-        updateSessionRef(ctx);
-        if (currentSessionKey() !== sessionKey) return;
-        registerInstructionListener(ctx);
-        void reportSession();
-      }, switchWaitMs);
-      undo.unref?.();
+      watchWithdrawal(ctx, activations, currentSessionKey());
       const sessionRef = currentSessionRef();
       if (sessionRef) {
         await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);

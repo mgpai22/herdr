@@ -2197,6 +2197,7 @@ test("Oh My Pi refuses a block with a token it retired, and keeps the previous t
 
 test("Oh My Pi registers again when a session change it was warned of does not happen", async () => {
   process.env.HERDR_OMP_SWITCH_WAIT_MS = "200";
+  process.env.HERDR_OMP_SWITCH_POLL_MS = "50";
   const omp = await installOmpForActions("omp-switch-cancelled");
   const reports = () =>
     omp.harness.requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as {
@@ -2207,6 +2208,7 @@ test("Oh My Pi registers again when a session change it was warned of does not h
   expect(reports().at(-1)?.params.accepts_instructions).toBe(false);
   await waitFor(() => reports().at(-1)?.params.accepts_instructions === true, 3_000);
   delete process.env.HERDR_OMP_SWITCH_WAIT_MS;
+  delete process.env.HERDR_OMP_SWITCH_POLL_MS;
   expect((await omp.act({ op: "abort", args: {} })).ack.ok).toBe(true);
 });
 
@@ -2292,4 +2294,95 @@ test("Oh My Pi keeps the previous block token valid while herdr has not taken th
   // Taken as herdr's block and refused for its session, not as a retired token.
   await waitFor(() => received.some((request) => request.method === "pane.ack_action" && request.params.action_id === id));
   expect(received.find((request) => request.params?.action_id === id)?.params.error).toStartWith("session_changed:");
+});
+
+test("Oh My Pi keeps the token herdr confirmed however many session changes follow", async () => {
+  const { received, state } = await startOutageServer("omp-ring-overflow");
+  let listener: TerminalInputHandler | undefined;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    ui: { onTerminalInput: (handler: TerminalInputHandler) => ((listener = handler), () => {}), getEditorText: () => "" },
+    sessionManager: { getSessionFile: () => "/tmp/omp-ring.jsonl", getSessionId: () => "r" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.method === "pane.report_agent_session_v2"));
+  await Bun.sleep(100);
+  const confirmed = runtimeToken()!;
+  // herdr cannot take registrations while the person steps through the tree 12 times.
+  state.outage = true;
+  for (let step = 0; step < 12; step += 1) await handlers.get("session_tree")?.({}, context);
+  state.outage = false;
+  const id = "8".repeat(32);
+  expect(listener?.(actionBlock(id, { op: "abort", args: {} }, confirmed))).toEqual({ consume: true });
+  await waitFor(() => received.some((request) => request.method === "pane.ack_action" && request.params.action_id === id), 5_000);
+}, 15_000);
+
+test("Oh My Pi registers again when a refusal shows herdr holds an older registration", async () => {
+  const received = await startRefusingServer("omp-refusal-registers", []);
+  let listener: TerminalInputHandler | undefined;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    ui: { onTerminalInput: (handler: TerminalInputHandler) => ((listener = handler), () => {}), getEditorText: () => "" },
+    sessionManager: { getSessionFile: () => "/tmp/omp-refusal.jsonl", getSessionId: () => "q" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.method === "pane.report_agent_session_v2"));
+  await Bun.sleep(100);
+  const sessions = () => received.filter((request) => request.method === "pane.report_agent_session_v2").length;
+  for (const [id, block] of [
+    ["9".repeat(32), (token: string) => actionBlock("9".repeat(32), { op: "abort", args: {}, session: "0".repeat(32) }, token)],
+    ["a".repeat(32), (token: string) => `\x1b[200~herdr-instruction:v4:${"a".repeat(32)}:${Date.now() + 4_000}:2:${token}:${"0".repeat(32)}\nhi\nherdr-end:${"a".repeat(32)}\x1b[201~`],
+    ["b".repeat(32), () => actionBlock("b".repeat(32), { op: "abort", args: {} }, Reflect.get(globalThis, Symbol.for("herdr.omp.runtime")))],
+  ] as const) {
+    const before = sessions();
+    expect(listener?.(block(runtimeToken()!))).toEqual({ consume: true });
+    await waitFor(() => sessions() > before, 3_000);
+    void id;
+  }
+});
+
+test("Oh My Pi waits for a session change to settle before it registers again", async () => {
+  process.env.HERDR_OMP_SWITCH_WAIT_MS = "400";
+  process.env.HERDR_OMP_SWITCH_POLL_MS = "50";
+  const received = await startRefusingServer("omp-switch-settle", []);
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  let file = "/tmp/omp-settle.jsonl";
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    ui: { onTerminalInput: () => () => {}, getEditorText: () => "" },
+    sessionManager: { getSessionFile: () => file, getSessionId: () => "z" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.method === "pane.report_agent_session_v2"));
+  const reports = () => received.filter((request) => request.method === "pane.report_agent_session_v2");
+  await handlers.get("session_before_switch")?.({ reason: "resume" }, context);
+  const withdrawn = reports().length;
+  expect(reports().at(-1)?.params.accepts_instructions).toBe(false);
+  // A slow switch: OMP swaps to the target at 300 ms, then rolls back at 600 ms.
+  await Bun.sleep(300);
+  file = "/tmp/omp-settle-target.jsonl";
+  await Bun.sleep(300);
+  file = "/tmp/omp-settle.jsonl";
+  // Still applying: nothing registered while the session moved, nor right after it came back.
+  await Bun.sleep(250);
+  expect(reports().length).toBe(withdrawn);
+  // Settled on the old session: registered again, for that session.
+  await waitFor(() => reports().length > withdrawn, 3_000);
+  expect(reports().at(-1)?.params).toMatchObject({ accepts_instructions: true, agent_session_path: "/tmp/omp-settle.jsonl" });
+  delete process.env.HERDR_OMP_SWITCH_WAIT_MS;
+  delete process.env.HERDR_OMP_SWITCH_POLL_MS;
 });
