@@ -2386,3 +2386,38 @@ test("Oh My Pi waits for a session change to settle before it registers again", 
   delete process.env.HERDR_OMP_SWITCH_WAIT_MS;
   delete process.env.HERDR_OMP_SWITCH_POLL_MS;
 });
+
+test("Oh My Pi takes a dropped instruction back out of the editor, and only that text", async () => {
+  let listener: TerminalInputHandler | undefined;
+  let editor = "";
+  const harness = await installOmpWithTerminalInput("omp-dropped-editor", {
+    onTerminalInput(handler: TerminalInputHandler) {
+      listener = handler;
+      return () => {};
+    },
+    getEditorText: () => editor,
+    setEditorText: (text: string) => (editor = text),
+  });
+  await harness.handlers.get("session_start")?.({ reason: "startup" }, harness.context);
+  await waitFor(() => harness.reports().length === 1);
+  const outcome = (id: string) =>
+    instructionAcks(harness.requests).find((ack) => ack.params.instruction_id === id && ack.params.outcome === "dropped");
+  // A person's /new while OMP prepared the turn: OMP puts the text back into the new editor.
+  for (const [id, after, expected] of [
+    ["0000000000000000000000000000000a", (text: string) => text, ""],
+    // The person typed more after it: OMP puts theirs on the next line; that part stays.
+    ["0000000000000000000000000000000b", (text: string) => `${text}\nmy own words`, "my own words"],
+    // Something else: never touched.
+    ["0000000000000000000000000000000c", () => "a different draft", "a different draft"],
+  ] as const) {
+    const text = `[sahur] status ${id.slice(-1)}`;
+    harness.setIdle(true);
+    harness.setBusyOnSend(true);
+    listener?.(instructionBlock(id, text));
+    editor = after(text);
+    harness.setIdle(true);
+    await waitFor(() => outcome(id) !== undefined);
+    expect(editor).toBe(expected);
+    editor = "";
+  }
+});

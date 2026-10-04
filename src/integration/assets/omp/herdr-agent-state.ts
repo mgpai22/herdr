@@ -205,6 +205,7 @@ let unsubscribeInstructions: (() => void) | undefined;
 // goes idle without starting it.
 let awaitingAdmission: {
   instructionId: string;
+  text: string;
   turnText: RegExp;
   idlePolls: number;
   until: number;
@@ -356,6 +357,8 @@ const DIALOG_TIERS = [
 ];
 // How long an answer waits for its dialog to close; herdr waits 8 s for the final ack.
 const answerWaitMs = 5000;
+// How long a dropped instruction's text is looked for in the editor.
+const droppedWatchMs = 10_000;
 // How long a withdrawal before a session change waits for the change before it is undone.
 const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 30_000);
 const switchPollMs = parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000);
@@ -811,6 +814,7 @@ export default function (pi) {
     ackInstruction(instructionId, "pending");
     awaitingAdmission.push({
       instructionId,
+      text,
       turnText: turnTextPattern(text),
       idlePolls: 0,
       until: Date.now() + admissionWaitMs,
@@ -822,7 +826,48 @@ export default function (pi) {
   // OMP's send gives no result to an extension. A send it drops (no model or API key, usage
   // limit, Esc during preparation, session change) leaves the session idle without a turn:
   // that, seen on two polls in a row outside a manual compaction, is a drop.
-  function watchAdmissions(ctx: { isIdle?: () => boolean; hasPendingMessages?: () => boolean }) {
+  // Texts OMP took but dropped without a turn. A person's session change while OMP prepared the
+  // turn makes OMP put the text back into the (new, empty) editor, where the person's next Enter
+  // would send it. The integration takes it out again: only when the editor holds exactly that
+  // text, or that text, a newline and what the person typed after it (how OMP puts a cancelled
+  // submission back), keeping the person's part. Checked at the drop, a few times after it, and
+  // at the next activation.
+  let droppedTexts: { text: string; until: number }[] = [];
+
+  function clearDroppedText(ui: any) {
+    const now = Date.now();
+    droppedTexts = droppedTexts.filter((entry) => entry.until > now);
+    const editor = ui?.getEditorText?.();
+    if (typeof editor !== "string" || !editor) return;
+    for (const [index, entry] of droppedTexts.entries()) {
+      const rest =
+        editor === entry.text
+          ? ""
+          : editor.startsWith(`${entry.text}\n`)
+            ? editor.slice(entry.text.length + 1)
+            : undefined;
+      if (rest === undefined) continue;
+      ui.setEditorText?.(rest);
+      droppedTexts.splice(index, 1);
+      return;
+    }
+  }
+
+  function rememberDropped(ui: any, text: string) {
+    droppedTexts.push({ text, until: Date.now() + droppedWatchMs });
+    droppedTexts.splice(0, droppedTexts.length - 8);
+    clearDroppedText(ui);
+    for (const delay of [300, 1_000, 3_000]) {
+      const check = setTimeout(() => clearDroppedText(ui ?? detailCtx?.ui), delay);
+      check.unref?.();
+    }
+  }
+
+  function watchAdmissions(ctx: {
+    isIdle?: () => boolean;
+    hasPendingMessages?: () => boolean;
+    ui?: unknown;
+  }) {
     if (admissionTimer) {
       return;
     }
@@ -833,6 +878,7 @@ export default function (pi) {
       awaitingAdmission = awaitingAdmission.filter((entry) => {
         entry.idlePolls = idle ? entry.idlePolls + 1 : 0;
         if (entry.idlePolls >= 2) {
+          rememberDropped(ctx?.ui, entry.text);
           ackInstruction(entry.instructionId, "dropped");
           return false;
         }
@@ -1491,6 +1537,7 @@ export default function (pi) {
     // starts) reached the editor as a paste. Take it out, tell herdr nothing ran, and stop using
     // the token it showed. Every registration gets a new token anyway.
     rotateBlockToken(!scrubLeakedBlocks(ctx));
+    clearDroppedText(ctx?.ui);
     onRegistered = (lost) => {
       if (lost) publishState(true);
       if (instructionListener) scheduleDetail(undefined, true);
