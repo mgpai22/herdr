@@ -2409,8 +2409,10 @@ test("Oh My Pi takes a dropped instruction back out of the editor, and only that
     ["0000000000000000000000000000000b", (text: string) => `${text}\nmy own words`, "my own words"],
     // Something else: never touched.
     ["0000000000000000000000000000000c", () => "a different draft", "a different draft"],
+    // A tab: OMP's editor shows it as 3 spaces.
+    ["0000000000000000000000000000000d", (text: string) => text.replaceAll("\t", "   "), ""],
   ] as const) {
-    const text = `[sahur] status ${id.slice(-1)}`;
+    const text = `[sahur] status\t${id.slice(-1)}`;
     harness.setIdle(true);
     harness.setBusyOnSend(true);
     listener?.(instructionBlock(id, text));
@@ -2420,4 +2422,33 @@ test("Oh My Pi takes a dropped instruction back out of the editor, and only that
     expect(editor).toBe(expected);
     editor = "";
   }
+});
+
+test("Oh My Pi refuses a block while OMP has moved to another session but not announced it", async () => {
+  const omp = await installOmpForActions("omp-mid-switch");
+  let file = "/tmp/omp-instruct.jsonl";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "s" } as never;
+  const tag = tagOf(file);
+  // OMP swapped the session file; `session_switch` has not come yet.
+  file = "/tmp/omp-mid-switch-new.jsonl";
+  const action = await omp.act({ op: "abort", args: {}, session: tag });
+  expect(action.ack.error).toStartWith("session_changed:");
+  expect(omp.aborted()).toBe(0);
+  const id = "e".repeat(32);
+  const block = `\x1b[200~herdr-instruction:v4:${id}:${Date.now() + 4_000}:2:${runtimeToken()}:${tag}\nhi\nherdr-end:${id}\x1b[201~`;
+  expect(omp.listener(block)).toEqual({ consume: true });
+  await waitFor(() => instructionAcks(omp.harness.requests).some((ack) => ack.params.instruction_id === id));
+  expect(instructionAcks(omp.harness.requests).find((ack) => ack.params.instruction_id === id)?.params.outcome).toBe("dropped");
+  expect(omp.harness.sent).toEqual([]);
+});
+
+test("Oh My Pi recognizes every token it ever issued, whichever one herdr applied", async () => {
+  const omp = await installOmpForActions("omp-every-token");
+  const applied = runtimeToken()!;
+  // herdr applied `applied`, but its reply never confirmed it; 20 session changes follow.
+  for (let step = 0; step < 20; step += 1) await omp.harness.handlers.get("session_tree")?.({}, omp.harness.context);
+  const id = "f".repeat(32);
+  expect(omp.listener(actionBlock(id, { op: "abort", args: {} }, applied))).toEqual({ consume: true });
+  await waitFor(() => omp.acks().some((ack) => ack.action_id === id));
+  expect(omp.acks().find((ack) => ack.action_id === id)?.error).toStartWith("failed: the block carried a retired token");
 });
