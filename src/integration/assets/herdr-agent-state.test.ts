@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -1594,7 +1594,7 @@ test("OMP stays off in a terminal started inside a herdr pane", async () => {
 
 function actionBlock(id: string, body: unknown, token = runtimeToken()) {
   const json = JSON.stringify(body);
-  return `\x1b[200~herdr-action:v1:${id}:${Date.now() + 4_000}:${Buffer.byteLength(json, "utf8")}:${token}\n${json}\x1b[201~`;
+  return `\x1b[200~herdr-action:v1:${id}:${Date.now() + 4_000}:${Buffer.byteLength(json, "utf8")}:${token}\n${json}\nherdr-end:${id}\x1b[201~`;
 }
 
 async function installOmpForActions(name: string) {
@@ -1963,6 +1963,12 @@ test("Oh My Pi registers again when herdr missed an instruction ack", async () =
 
 const tagOf = (session: string) => createHash("sha256").update(session).digest("hex").slice(0, 32);
 
+// Methods a running refusing server starts to refuse, by its request list.
+const refusing = new WeakMap<object, string[]>();
+function refuseSessionReports(received: object) {
+  refusing.set(received, ["pane.report_agent_session_v2"]);
+}
+
 // A server that answers ok, except for the methods in `refuse`, which get an error, as an older
 // herdr does for `pane.report_omp_detail`.
 async function startRefusingServer(name: string, refuse: string[]) {
@@ -1979,7 +1985,7 @@ async function startRefusingServer(name: string, refuse: string[]) {
       if (newline < 0) return;
       const request = JSON.parse(input.slice(0, newline));
       received.push({ at: Date.now(), ...request });
-      const reply = refuse.includes(request.method)
+      const reply = (refusing.get(received) ?? refuse).includes(request.method)
         ? { id: request.id, error: { code: "invalid_request", message: "unknown method" } }
         : { id: request.id, result: { type: "ok" } };
       socket.end(JSON.stringify(reply) + "\n");
@@ -2065,7 +2071,7 @@ test("Oh My Pi refuses blocks herdr checked against an earlier session", async (
   expect(stale.ack.error).toStartWith("session_changed:");
   // An instruction for the old session is dropped, unsent.
   const instruction = "b".repeat(32);
-  const block = `\x1b[200~herdr-instruction:v4:${instruction}:${Date.now() + 4_000}:2:${runtimeToken()}:${old}\nhi\x1b[201~`;
+  const block = `\x1b[200~herdr-instruction:v4:${instruction}:${Date.now() + 4_000}:2:${runtimeToken()}:${old}\nhi\nherdr-end:${instruction}\x1b[201~`;
   expect(omp.listener(block)).toEqual({ consume: true });
   await waitFor(() => instructionAcks(omp.harness.requests).some((ack) => ack.params.instruction_id === instruction));
   expect(instructionAcks(omp.harness.requests).find((ack) => ack.params.instruction_id === instruction)?.params.outcome).toBe("dropped");
@@ -2112,7 +2118,7 @@ test("Oh My Pi withdraws its listener while OMP switches session and cleans up b
   const instructionId = "b".repeat(32);
   const instruction = "say hi\nthen stop";
   omp.setEditor(
-    `draft one herdr-action:v1:${actionId}:${Date.now() + 4_000}:${Buffer.byteLength(action)}:${leaked}\n${action} and ` +
+    `draft one herdr-action:v1:${actionId}:${Date.now() + 4_000}:${Buffer.byteLength(action)}:${leaked}\n${action}\nherdr-end:${actionId} and ` +
       `herdr-instruction:v3:${instructionId}:${Date.now() + 4_000}:${Buffer.byteLength(instruction)}:${leaked}\n${instruction} end`,
   );
   await omp.harness.handlers.get("session_switch")?.({ reason: "new" }, omp.harness.context);
@@ -2125,11 +2131,165 @@ test("Oh My Pi withdraws its listener while OMP switches session and cleans up b
   // The new registration names a new token, and the leaked one no longer works.
   await waitFor(() => sessionReports().at(-1)?.params.accepts_instructions === true);
   expect(sessionReports().at(-1)?.params.block_token).not.toBe(leaked);
-  expect(omp.listener(actionBlock("c".repeat(32), { op: "abort", args: {} }, leaked))).toBeUndefined();
+  // A block with the leaked token is consumed and refused: it never reaches the editor, and it runs nothing.
+  expect(omp.listener(actionBlock("c".repeat(32), { op: "abort", args: {} }, leaked))).toEqual({ consume: true });
+  await waitFor(() => omp.acks().some((ack) => ack.action_id === "c".repeat(32)));
+  expect(omp.acks().find((ack) => ack.action_id === "c".repeat(32))?.error).toStartWith("failed: the block carried a retired token");
+  expect(omp.aborted()).toBe(0);
 
   // A normal re-registration keeps the previous token valid briefly, for a block already on its way.
   const previous = runtimeToken()!;
   await omp.harness.handlers.get("session_switch")?.({ reason: "resume" }, omp.harness.context);
   expect(runtimeToken()).not.toBe(previous);
   expect(omp.listener(actionBlock("d".repeat(32), { op: "abort", args: {} }, previous))).toEqual({ consume: true });
+});
+
+test("Oh My Pi refuses a block with a token it retired, and keeps the previous token until herdr confirms the new one", async () => {
+  const { received, state } = await startOutageServer("omp-retired-token");
+  let listener: TerminalInputHandler | undefined;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install({ ...pi, setThinkingLevel: () => {}, getThinkingLevel: () => "low" });
+  let file = "/tmp/omp-retired.jsonl";
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    ui: { onTerminalInput: (handler: TerminalInputHandler) => ((listener = handler), () => {}), getEditorText: () => "" },
+    sessionManager: { getSessionFile: () => file, getSessionId: () => "s" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.method === "pane.report_agent_session_v2"));
+  const first = runtimeToken()!;
+  // A person's /new while herdr cannot be reached: herdr keeps writing with the first token.
+  state.outage = true;
+  file = "/tmp/omp-retired-2.jsonl";
+  await handlers.get("session_switch")?.({ reason: "new" }, context);
+  const now = Date.now();
+  setSystemTime(new Date(now + 15_000));
+  try {
+    // Still valid: herdr has not confirmed the new token. The block names the old session.
+    const late = actionBlock("1".repeat(32), { op: "set_thinking", args: { level: "low" }, session: tagOf("/tmp/omp-retired.jsonl") }, first);
+    expect(listener?.(late)).toEqual({ consume: true });
+  } finally {
+    setSystemTime();
+  }
+  state.outage = false;
+  await waitFor(() => received.filter((request) => request.method === "pane.report_agent_session_v2").at(-1)?.params.block_token !== first, 8_000);
+  // The server recorded the report before the integration read its reply; let it read it.
+  await Bun.sleep(200);
+  // Confirmed; 10 s later the first token is retired: a block with it is consumed and refused.
+  setSystemTime(new Date(Date.now() + 10_500));
+  try {
+    expect(listener?.(actionBlock("2".repeat(32), { op: "set_thinking", args: { level: "low" } }, first))).toEqual({ consume: true });
+  } finally {
+    setSystemTime();
+  }
+  await waitFor(() => received.some((request) => request.method === "pane.ack_action" && request.params.action_id === "2".repeat(32)));
+  expect(received.find((request) => request.params?.action_id === "2".repeat(32))?.params.error).toStartWith("failed: the block carried a retired token");
+  // A herdr from before block tokens writes v3 instructions with the runtime id: dropped, not pasted.
+  const runtime = Reflect.get(globalThis, Symbol.for("herdr.omp.runtime"));
+  const v3 = `\x1b[200~herdr-instruction:v3:${"3".repeat(32)}:${Date.now() + 4_000}:2:${runtime}\nhi\x1b[201~`;
+  expect(listener?.(v3)).toEqual({ consume: true });
+  await waitFor(() => received.some((request) => request.method === "pane.ack_instruction" && request.params.instruction_id === "3".repeat(32)));
+  expect(received.find((request) => request.params?.instruction_id === "3".repeat(32))?.params.outcome).toBe("dropped");
+}, 20_000);
+
+test("Oh My Pi registers again when a session change it was warned of does not happen", async () => {
+  process.env.HERDR_OMP_SWITCH_WAIT_MS = "200";
+  const omp = await installOmpForActions("omp-switch-cancelled");
+  const reports = () =>
+    omp.harness.requests.filter((request) => isRecord(request) && request.method === "pane.report_agent_session_v2") as {
+      params: Record<string, any>;
+    }[];
+  // A /fork that fails after OMP asked extensions: no session event follows.
+  await omp.harness.handlers.get("session_before_switch")?.({ reason: "fork" }, omp.harness.context);
+  expect(reports().at(-1)?.params.accepts_instructions).toBe(false);
+  await waitFor(() => reports().at(-1)?.params.accepts_instructions === true, 3_000);
+  delete process.env.HERDR_OMP_SWITCH_WAIT_MS;
+  expect((await omp.act({ op: "abort", args: {} })).ack.ok).toBe(true);
+});
+
+test("Oh My Pi ends an answer at once when herdr refuses its keys", async () => {
+  const received = await startRefusingServer("omp-keys-refused", ["pane.ack_action"]);
+  let listener: TerminalInputHandler | undefined;
+  let editor = "draft";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => false,
+    ui: {
+      onTerminalInput: (handler: TerminalInputHandler) => ((listener = handler), () => {}),
+      getEditorText: () => editor,
+      setEditorText: (text: string) => (editor = text),
+    },
+    sessionManager: { getSessionFile: () => "/tmp/omp-keys.jsonl", getSessionId: () => "k" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await handlers.get("tool_execution_start")?.({ toolCallId: "ask1", toolName: "ask", args: { questions: [{ question: "Q?", options: [{ label: "a" }] }] } }, context);
+  const started = Date.now();
+  expect(listener?.(actionBlock("4".repeat(32), { op: "answer", args: { dialog_id: "ask1", option_index: 0 } }))).toEqual({ consume: true });
+  const final = () => received.find((request) => request.method === "pane.ack_action" && !request.params.keys);
+  await waitFor(() => final() !== undefined, 3_000);
+  expect(Date.now() - started).toBeLessThan(2_000);
+  expect(final()?.params.error).toStartWith("failed: herdr did not write the answer keys");
+  expect(editor).toBe("draft");
+}, 10_000);
+
+test("Oh My Pi cuts a block out of the editor exactly, whatever OMP did to its text", async () => {
+  const omp = await installOmpForActions("omp-scrub-exact");
+  const token = runtimeToken()!;
+  // OMP's paste handling: a tab becomes 3 spaces, text becomes NFC.
+  const sanitize = (text: string) => text.normalize("NFC").replace(/\t/g, "   ");
+  const id = "5".repeat(32);
+  const raw = "a\tb cafe\u0301";
+  const leaked = `herdr-instruction:v4:${id}:${Date.now() + 4_000}:${Buffer.byteLength(raw)}:${token}:${tagOf("/tmp/omp-instruct.jsonl")}\n${sanitize(raw)}\nherdr-end:${id}`;
+  omp.setEditor(`mine1 ${leaked}my draft`);
+  await omp.harness.handlers.get("session_switch")?.({ reason: "resume" }, omp.harness.context);
+  expect(omp.editor()).toBe("mine1 my draft");
+  // A v3 block (no end line) with non-ASCII text: only the header is cut, never the person's text.
+  const v3id = "6".repeat(32);
+  const v3 = `herdr-instruction:v3:${v3id}:${Date.now() + 4_000}:${Buffer.byteLength(raw)}:${runtimeToken()}\n${sanitize(raw)}`;
+  omp.setEditor(`${v3}my draft`);
+  await omp.harness.handlers.get("session_switch")?.({ reason: "resume" }, omp.harness.context);
+  expect(omp.editor()).toBe(`${sanitize(raw)}my draft`);
+});
+
+test("Oh My Pi keeps the previous block token valid while herdr has not taken the new one", async () => {
+  // herdr answers, but does not apply the new registration (it refuses it), so it keeps writing
+  // with the previous token, however long that lasts.
+  const received = await startRefusingServer("omp-unconfirmed-token", []);
+  let listener: TerminalInputHandler | undefined;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+  let file = "/tmp/omp-grace.jsonl";
+  const context = {
+    hasUI: true,
+    mode: "tui",
+    isIdle: () => true,
+    ui: { onTerminalInput: (handler: TerminalInputHandler) => ((listener = handler), () => {}), getEditorText: () => "" },
+    sessionManager: { getSessionFile: () => file, getSessionId: () => "g" },
+  };
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => received.some((request) => request.method === "pane.report_agent_session_v2"));
+  await Bun.sleep(100);
+  const first = runtimeToken()!;
+  refuseSessionReports(received);
+  file = "/tmp/omp-grace-2.jsonl";
+  await handlers.get("session_switch")?.({ reason: "new" }, context);
+  await Bun.sleep(100);
+  setSystemTime(new Date(Date.now() + 30_000));
+  const id = "7".repeat(32);
+  try {
+    expect(listener?.(actionBlock(id, { op: "abort", args: {}, session: tagOf("/tmp/omp-grace.jsonl") }, first))).toEqual({ consume: true });
+  } finally {
+    setSystemTime();
+  }
+  // Taken as herdr's block and refused for its session, not as a retired token.
+  await waitFor(() => received.some((request) => request.method === "pane.ack_action" && request.params.action_id === id));
+  expect(received.find((request) => request.params?.action_id === id)?.params.error).toStartWith("session_changed:");
 });

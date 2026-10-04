@@ -112,8 +112,9 @@ fn instruction_block(
             instruction_id,
             text,
             &format!("{runtime}:{}", session_tag(session)),
+            true,
         ),
-        None => listener_block("herdr-instruction:v3", instruction_id, text, runtime),
+        None => listener_block("herdr-instruction:v3", instruction_id, text, runtime, false),
     }
 }
 
@@ -129,12 +130,20 @@ fn session_tag(session: &str) -> String {
 /// The `agent.action` block: the instruction framing around `{"op","args"}` JSON.
 const ACTION_BLOCK: &str = "herdr-action:v1";
 
-fn listener_block(kind: &str, block_id: &str, body: &str, runtime: &str) -> String {
+/// `end_line` adds a last line `herdr-end:<id>` after the body (action blocks and v4 instruction
+/// blocks), so the integration can cut a block that reached OMP's editor out exactly, although
+/// OMP's paste handling changes the body (tabs, NFC). The header's length counts the body only.
+fn listener_block(kind: &str, block_id: &str, body: &str, runtime: &str, end_line: bool) -> String {
     let expires_ms = (std::time::SystemTime::now() + INSTRUCTION_EXPIRY)
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
+    let end = if end_line {
+        format!("\nherdr-end:{block_id}")
+    } else {
+        String::new()
+    };
     format!(
-        "\x1b[200~{kind}:{block_id}:{expires_ms}:{}:{runtime}\n{body}\x1b[201~",
+        "\x1b[200~{kind}:{block_id}:{expires_ms}:{}:{runtime}\n{body}{end}\x1b[201~",
         body.len()
     )
 }
@@ -554,7 +563,7 @@ impl App {
             .map(|session| session_tag(&session.value));
         let body = serde_json::json!({ "op": params.op, "args": params.args, "session": session })
             .to_string();
-        let block = listener_block(ACTION_BLOCK, &action_id, &body, &block_runtime);
+        let block = listener_block(ACTION_BLOCK, &action_id, &body, &block_runtime, true);
         self.write_listener_block(&id, ws_idx, pane_id, block)?;
         let deadline = Instant::now() + INSTRUCTION_ACK_TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -653,7 +662,7 @@ impl App {
                 id,
                 write.unsupported_code(),
                 format!(
-                    "agent {target} has no {noun} listener registered now: OMP is restarting, exiting or reloading its extensions, or its herdr integration is older than v{}; nothing was written; retry when agent.get shows {}",
+                    "agent {target} has no {noun} listener registered now: OMP is restarting, exiting, switching session or reloading its extensions, or its herdr integration is older than v{}; nothing was written; retry when agent.get shows {}",
                     write.min_integration(),
                     write.accepts_field()
                 ),
@@ -1391,7 +1400,11 @@ mod tests {
         let version = if fields.len() == 5 { "v4" } else { "v3" };
         assert_eq!(
             written,
-            format!("\x1b[200~herdr-instruction:{version}:{header}\n{text}\x1b[201~")
+            if version == "v4" {
+                format!("\x1b[200~herdr-instruction:v4:{header}\n{text}\nherdr-end:{id}\x1b[201~")
+            } else {
+                format!("\x1b[200~herdr-instruction:v3:{header}\n{text}\x1b[201~")
+            }
         );
         assert!(rx.try_recv().is_err(), "nothing follows the paste");
         id.to_string()
@@ -2832,6 +2845,10 @@ mod tests {
             .and_then(|rest| rest.split_once('\n'))
             .expect("marked action block");
         let fields: Vec<_> = header.split(':').collect();
+        // The body ends with the end line that names the block.
+        let body = body
+            .strip_suffix(&format!("\nherdr-end:{}", fields[0]))
+            .expect("end line");
         assert_eq!(fields[2].parse::<usize>().unwrap(), body.len());
         assert_eq!(fields[3], FIXTURE_RUNTIME);
         (fields[0].to_string(), serde_json::from_str(body).unwrap())
@@ -3225,6 +3242,11 @@ mod tests {
         let fields: Vec<_> = header.split(':').collect();
         assert_eq!(fields[3], FIXTURE_RUNTIME);
         assert_eq!(fields[4], session_tag(&fixture_session_path()));
+        // The body ends with the end line, so the integration can cut a pasted block out exactly.
+        assert!(
+            written.ends_with(&format!("\nherdr-end:{}\x1b[201~", fields[0])),
+            "{written:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]

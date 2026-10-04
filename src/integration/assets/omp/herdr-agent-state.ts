@@ -123,17 +123,37 @@ const runtimeInstance = (runtimeSlot[RUNTIME_KEY] ??= crypto.randomUUID());
 // The token herdr puts in instruction and action blocks: only herdr learns it, over the
 // peer-checked socket. It changes on every session registration, and at once when a block is found
 // in OMP's editor (where a person, the session file and the model could read it), so a leaked token
-// stops working. The previous token keeps working for a few seconds after a normal change, for a
-// block herdr wrote before it learned the new one.
-type BlockTokens = { current: string; previous?: string; previousUntil?: number };
+// stops working. After a normal change the previous token keeps working until herdr confirms the
+// new one and 10 s more, for a block herdr wrote before it learned the new one. Retired tokens are
+// remembered: a block that carries one (or the runtime id, the token of a herdr server from before
+// block tokens) is this runtime's but stale, so it is consumed and refused instead of reaching
+// the editor as a paste.
+type BlockTokens = {
+  current: string;
+  previous?: string;
+  previousUntil?: number;
+  retired: string[];
+};
 const tokenSlot = globalThis as { [key: symbol]: BlockTokens | undefined };
 const TOKEN_KEY = Symbol.for("herdr.omp.blockToken");
-const blockTokens = (tokenSlot[TOKEN_KEY] ??= { current: crypto.randomUUID() });
+const blockTokens = (tokenSlot[TOKEN_KEY] ??= { current: crypto.randomUUID(), retired: [] });
+blockTokens.retired ??= [];
+const tokenGraceMs = 10_000;
 
 function rotateBlockToken(keepPrevious: boolean): void {
+  blockTokens.retired.push(blockTokens.current);
+  blockTokens.retired.splice(0, blockTokens.retired.length - 8);
   blockTokens.previous = keepPrevious ? blockTokens.current : undefined;
-  blockTokens.previousUntil = keepPrevious ? Date.now() + 10_000 : undefined;
+  // Valid until herdr confirms the new token (`confirmBlockToken`).
+  blockTokens.previousUntil = keepPrevious ? Number.POSITIVE_INFINITY : undefined;
   blockTokens.current = crypto.randomUUID();
+}
+
+// herdr applied a registration that named `token`.
+function confirmBlockToken(token: string): void {
+  if (token === blockTokens.current && blockTokens.previousUntil === Number.POSITIVE_INFINITY) {
+    blockTokens.previousUntil = Date.now() + tokenGraceMs;
+  }
 }
 
 function isBlockToken(token: string): boolean {
@@ -141,6 +161,16 @@ function isBlockToken(token: string): boolean {
     token === blockTokens.current ||
     (token === blockTokens.previous && Date.now() < (blockTokens.previousUntil ?? 0))
   );
+}
+
+function isStaleBlockToken(token: string): boolean {
+  return !isBlockToken(token) && (token === runtimeInstance || blockTokens.retired.includes(token));
+}
+
+// Action and v4 instruction bodies end with this line, so a block that reached OMP's editor can
+// be cut out exactly, whatever OMP's paste handling did to the text (tabs, NFC).
+function blockEnd(id: string): string {
+  return `\nherdr-end:${id}`;
 }
 // A herdr `agent.instruct` delivery: one bracketed paste with no Enter. The header carries the
 // instruction id, the unix ms after which the block must be discarded, the text's UTF-8 byte
@@ -319,6 +349,8 @@ const DIALOG_TIERS = [
 ];
 // How long an answer waits for its dialog to close; herdr waits 8 s for the final ack.
 const answerWaitMs = 5000;
+// How long a withdrawal before a session change waits for the change before it is undone.
+const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 5000);
 // How long OMP may take to report that a dialog closed after a person's key.
 const closeReportWaitMs = 300;
 
@@ -486,8 +518,15 @@ async function reportSession(sessionStartSource = "startup", attempt = 0): Promi
   // would be rejected as stale and leave the session unregistered with no
   // later session event to recover it. A fresh retry replays the same
   // profile, PID, and session through every server check and converges.
-  const reply = await sendRequest(() => sessionReport(sessionStartSource, sessionRef));
+  let sentToken: string | undefined;
+  let sentListener = false;
+  const reply = await sendRequest(() => {
+    sentToken = blockTokens.current;
+    sentListener = instructionListener;
+    return sessionReport(sessionStartSource, sessionRef);
+  });
   const delivered = reply === "ok";
+  if (delivered && sentListener && sentToken) confirmBlockToken(sentToken);
   if (delivered && currentSessionKey() === sessionKey) {
     registeredSessionKey = sessionKey;
     const lost = reportsLost;
@@ -689,11 +728,28 @@ export default function (pi) {
     if (!match) {
       return undefined;
     }
-    const [, instructionId, expiresMs, byteLength, token, session, text, enter] = match;
-    if (!isBlockToken(token) || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
+    const [, instructionId, expiresMs, byteLength, token, session, framed, enter] = match;
+    const stale = isStaleBlockToken(token);
+    if ((!stale && !isBlockToken(token)) || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
       return undefined;
     }
     const rest = enter ? { data: enter } : { consume: true };
+    // A block for a token this runtime retired, or a herdr from before block tokens: nothing runs.
+    if (stale) {
+      ackInstruction(instructionId, "dropped");
+      return rest;
+    }
+    // v4 bodies end with the end line; v3 bodies have none.
+    const text =
+      session !== undefined && framed.endsWith(blockEnd(instructionId))
+        ? framed.slice(0, -blockEnd(instructionId).length)
+        : session !== undefined
+          ? undefined
+          : framed;
+    if (text === undefined) {
+      void reportSession();
+      return rest;
+    }
     // herdr checked the caller's session against the last one OMP reported; OMP has moved on
     // (`/new`, `/resume`, a branch) before that report reached herdr. Nothing is sent.
     if (session !== undefined && session !== sessionTag()) {
@@ -767,6 +823,8 @@ export default function (pi) {
   let detailTimer: ReturnType<typeof setTimeout> | undefined;
   // herdr refused a detail report; set until the next session event.
   let detailRefused = false;
+  // Counts activations and shutdowns, so a pending withdrawal undo sees that a session event came.
+  let activations = 0;
   let lastDetailAt = 0;
   // Tools the root session started and has not finished, oldest first.
   const runningTools = new Map<string, { name: string; call_id: string; started_ms: number }>();
@@ -1086,12 +1144,22 @@ export default function (pi) {
     if (!match) {
       return undefined;
     }
-    const [, actionId, expiresMs, byteLength, token, body, enter] = match;
-    if (!isBlockToken(token) || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
+    const [, actionId, expiresMs, byteLength, token, framed, enter] = match;
+    const stale = isStaleBlockToken(token);
+    if ((!stale && !isBlockToken(token)) || Number(expiresMs) > Date.now() + instructionExpiryCapMs) {
       return undefined;
     }
     const rest = enter ? { data: enter } : { consume: true };
-    if (Date.now() > Number(expiresMs) || Buffer.byteLength(body, "utf8") !== Number(byteLength)) {
+    if (stale) {
+      void ackAction(actionId, { ok: false, error: "failed: the block carried a retired token; nothing ran; read agent.get again" });
+      return rest;
+    }
+    const body = framed.endsWith(blockEnd(actionId)) ? framed.slice(0, -blockEnd(actionId).length) : undefined;
+    if (
+      body === undefined ||
+      Date.now() > Number(expiresMs) ||
+      Buffer.byteLength(body, "utf8") !== Number(byteLength)
+    ) {
       void reportSession();
       return rest;
     }
@@ -1266,8 +1334,9 @@ export default function (pi) {
     };
     // The first ack hands herdr the keys; the result follows when the dialog closes. If herdr
     // refused or never got them, nothing will arrive.
-    void ackAction(actionId, { ok: true, keys }).then((acked) => {
-      if (!acked && answering?.actionId === actionId) {
+    void ackAction(actionId, { ok: true, keys }).then((reply) => {
+      if (reply === "unreachable") reportLost();
+      if (reply !== "ok" && answering?.actionId === actionId) {
         endAnswer({ ok: false, error: "failed: herdr did not write the answer keys; nothing was answered" });
       }
     });
@@ -1325,23 +1394,38 @@ export default function (pi) {
     const header =
       /herdr-(action:v1|instruction:v[34]|key:v1):([0-9a-f]{32}):(\d+):(\d+):([0-9A-Za-z-]{1,64})(?::[0-9a-f]{32})?\n/g;
     for (let match = header.exec(text); match; match = header.exec(text)) {
-      const [whole, kind, id, second, third, token] = match;
-      const ours = kind === "key:v1" ? answerNonces.includes(token) : isBlockToken(token);
+      const [whole, kind, id, , third, token] = match;
+      const ours =
+        kind === "key:v1"
+          ? answerNonces.includes(token)
+          : isBlockToken(token) || isStaleBlockToken(token);
       if (!ours) continue;
       found = true;
-      // Action and instruction headers give the body's UTF-8 length; a key's body is one line.
       const bodyStart = match.index + whole.length;
       let end = bodyStart;
       if (kind === "key:v1") {
+        // A key's body is one key code (a custom answer has no control characters).
         const newline = text.indexOf("\n", bodyStart);
         end = newline < 0 ? text.length : newline;
       } else {
-        const bytes = Number(third);
-        let used = 0;
-        for (const point of text.slice(bodyStart)) {
-          if (used >= bytes) break;
-          used += Buffer.byteLength(point, "utf8");
-          end += point.length;
+        const marker = text.indexOf(blockEnd(id), bodyStart);
+        if (marker >= 0) {
+          // Cut up to the end line: exact, whatever OMP did to the body.
+          end = marker + blockEnd(id).length;
+        } else {
+          // A v3 block (a herdr from before end lines). Its byte length counts the text herdr
+          // wrote; OMP's paste handling turns a tab into 3 spaces and can shorten text to NFC. Cut
+          // the body only when it is plain ASCII, where counting can only fall short (a tab), so
+          // the person's own text is never cut. Otherwise cut only the header with the token.
+          const bytes = Number(third);
+          let used = 0;
+          let candidate = bodyStart;
+          for (const point of text.slice(bodyStart)) {
+            if (used >= bytes) break;
+            used += Buffer.byteLength(point, "utf8");
+            candidate += point.length;
+          }
+          if (/^[\x20-\x7e\n]*$/.test(text.slice(bodyStart, candidate))) end = candidate;
         }
       }
       kept += text.slice(at, match.index);
@@ -1352,17 +1436,18 @@ export default function (pi) {
       } else if (kind.startsWith("instruction")) {
         ackInstruction(id, "dropped");
       }
-      void second;
     }
     if (!found) return false;
     ui.setEditorText?.(kept + text.slice(at));
     return true;
   }
 
+
   function activateRootSession(ctx: any, sessionStartSource = "startup"): boolean {
     if (ctx?.hasUI !== true) {
       return false;
     }
+    activations += 1;
     rootSession = true;
     // A new or changed session has no compaction of its own running.
     compacting = false;
@@ -1647,12 +1732,27 @@ export default function (pi) {
   // branch), before these events, and registers none until the change ends. Tell herdr at once,
   // so it refuses writes instead of putting a block into the editor. `session_switch` or
   // `session_branch` registers the listener again.
+  // A change can still fail or be cancelled after these events (a failed fork, another
+  // extension's cancel, a `/btw` branch that throws), and then no session event follows. When no
+  // activation came within `switchWaitMs` and OMP still runs the same session, the listener is
+  // registered again. The withdrawal report gets one attempt of at most 1 s, so a herdr that
+  // accepts but does not answer delays the person's switch by that much.
   for (const event of ["session_before_switch", "session_before_branch"]) {
-    pi.on(event, async () => {
+    pi.on(event, async (_event, ctx) => {
       if (!rootSession) return undefined;
       unsubscribeInstructions?.();
       unsubscribeInstructions = undefined;
       instructionListener = false;
+      const activation = activations;
+      const sessionKey = currentSessionKey();
+      const undo = setTimeout(() => {
+        if (activation !== activations || !rootSession) return;
+        updateSessionRef(ctx);
+        if (currentSessionKey() !== sessionKey) return;
+        registerInstructionListener(ctx);
+        void reportSession();
+      }, switchWaitMs);
+      undo.unref?.();
       const sessionRef = currentSessionRef();
       if (sessionRef) {
         await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
@@ -1665,6 +1765,7 @@ export default function (pi) {
     if (!rootSession) {
       return;
     }
+    activations += 1;
     clearPendingTimers();
     clearTimeout(detailTimer);
     detailTimer = undefined;
