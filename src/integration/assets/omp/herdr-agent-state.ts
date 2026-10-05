@@ -2,10 +2,11 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=14
+// HERDR_INTEGRATION_VERSION=15
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
+import { access, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 
@@ -341,8 +342,8 @@ const PASTE_MARKER = /\[Paste #\d+(?:, (?:\+\d+ lines|\d+ chars))?\]/;
 const KEY_BLOCK =
   /^\x1b\[200~herdr-key:v1:([0-9a-f]{32}):(\d+):(\d+):([0-9a-f]{32})\n([\s\S]*)\x1b\[201~(\r\n|\r|\n)?$/;
 const KEY_BYTES: Record<string, string> = { U: "\x1b[A", D: "\x1b[B", E: "\r", S: " ", X: "\x1b" };
-// The detail herdr keeps is at most 16 KiB; a dialog report shrinks to stay under this.
-const detailBudgetBytes = 15 * 1024;
+// The detail herdr keeps is at most 32 KiB; a report shrinks to stay under this (see `buildDetail`).
+const detailBudgetBytes = 30 * 1024;
 // Dialog report sizes, largest first: questions, options per question, characters per text.
 const DIALOG_TIERS = [
   { questions: 10, options: 20, text: 500, label: 200 },
@@ -365,6 +366,159 @@ const switchPollMs = Math.max(parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000)
 const moveWatchMs = Math.max(parseDurationEnv("HERDR_OMP_MOVE_WATCH_MS", 3000), 10);
 // How long OMP may take to report that a dialog closed after a person's key.
 const closeReportWaitMs = 300;
+// The service tiers OMP 18.4.4 accepts per provider family (`ExtensionServiceTier`).
+const SERVICE_TIERS: Record<string, string[]> = {
+  openai: ["auto", "default", "flex", "scale", "priority", "ultrafast"],
+  anthropic: ["priority"],
+  google: ["flex", "priority"],
+};
+// The one status-line key the `status` op uses, so it never touches another extension's status.
+const STATUS_KEY = "herdr-sahur";
+const SUBAGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+const SUBAGENT_STATUSES = new Set(["running", "idle", "parked", "aborted"]);
+// Roster sizes, largest first; the detail uses the first that fits.
+const ROSTER_TIERS = [30, 10, 0];
+const toolListMax = 200;
+// How many of herdr's own steers into one subagent run are remembered until they arrive.
+const steerMemory = 64;
+// How long a subagent cancel waits for OMP's release before it answers.
+const subagentCancelWaitMs = 5000;
+// What the `status` op set. OMP keeps statuses in memory, as this module keeps this: an OMP
+// restart or an extension reload clears both.
+let statusText: string | undefined;
+// What this module adds to OMP's agent registry, keyed by registry id. Subagent bindings fill the
+// agent type, the running tool and `person` (a message that neither the task executor nor herdr
+// sent reached the current run: a person's chat from OMP's agent view, or another client's).
+// The root binding counts runs: OMP's registry flips a subagent between running and idle at every
+// turn of one task run, and a new run starts only once the previous one is over: OMP's executor
+// finished it (with a result or not; it then hands the subagent to the lifecycle manager), it
+// handed over its result, or it was parked. A `task` resume, a wake and a person's chat with the
+// finished subagent each start a new run. Inside a woken run every turn counts as a new run: that
+// over-count only makes a caller read again. `person` stays set until the subagent hands over a
+// result or parks, across such turns. A subagent that a run with `person` set spawns starts with
+// `person` set too: it does that person's work.
+type SubagentInfo = {
+  type?: string;
+  tool?: { name: string; call_id?: string; started_ms: number };
+  run: number;
+  status?: string;
+  accepted: boolean;
+  person: boolean;
+  // Texts herdr steered that have not arrived yet, so their user messages are not taken for a
+  // person's. A steer queued in a run's last step can arrive in the next run.
+  steers: string[];
+};
+const subagentInfo = new Map<string, SubagentInfo>();
+
+function subagentEntry(id: string): SubagentInfo {
+  let info = subagentInfo.get(id);
+  if (!info) {
+    info = { run: 1, accepted: false, person: false, steers: [] };
+    subagentInfo.set(id, info);
+  }
+  return info;
+}
+
+// Follows a subagent's registry ref from one observation to the next; returns its entry.
+function observeRun(ref: any): SubagentInfo {
+  const info = subagentEntry(ref.id);
+  if (info.status === undefined) {
+    info.accepted = ref.lifecycle?.acceptedAt !== undefined;
+    if (typeof ref.parentId === "string" && subagentInfo.get(ref.parentId)?.person) info.person = true;
+  } else if (
+    ref.status === "running" &&
+    info.status !== "running" &&
+    (info.accepted || info.status === "parked" || runFinished(ref))
+  ) {
+    // A later turn of a finished subagent (a provider retry, a compaction continuation, a wake)
+    // keeps `person`: only a handed-over result or a park ends a person's chat.
+    if (info.accepted || info.status === "parked") info.person = false;
+    info.run += 1;
+    info.accepted = false;
+  }
+  if (ref.lifecycle?.acceptedAt !== undefined) info.accepted = true;
+  info.status = ref.status;
+  return info;
+}
+// Set by the root binding: a subagent's binding saw a change.
+let onSubagentChange: (() => void) | undefined;
+// OMP's agent lifecycle manager, loaded once; undefined when it does not load as OMP's own.
+let lifecycleManager: Promise<any> | undefined;
+// The same manager once loaded, for the synchronous registry listener.
+let lifecycleLoaded: any;
+
+// OMP's executor finished the subagent's run: it adopts every finished or failed subagent it keeps
+// alive (`finalizeSubagentLifecycle`), and only then.
+function runFinished(ref: any): boolean {
+  try {
+    return lifecycleLoaded?.global?.().has?.(ref.id, ref) === true;
+  } catch {
+    return false;
+  }
+}
+
+// OMP's `ensurePersistedRoster`, loaded once; undefined when it does not load as OMP's own.
+let persistedRoster: Promise<any> | undefined;
+
+// OMP registers a session's earlier subagents (from the transcripts under its directory) only when
+// something asks for them (the Agent Hub, an `agent://` read, the task tool). After a restart or a
+// resume the roster would be empty until then, so the root activation asks too.
+function loadPersistedRoster(registryClass: unknown): Promise<any> {
+  persistedRoster ??= (async () => {
+    const [persisted, registry] = await Promise.all([
+      import("@oh-my-pi/pi-coding-agent/registry/persisted-agents"),
+      import("@oh-my-pi/pi-coding-agent/registry/agent-registry"),
+    ]);
+    if (registryClass === undefined || registry?.AgentRegistry !== registryClass) return undefined;
+    return typeof persisted?.ensurePersistedRoster === "function" ? persisted.ensurePersistedRoster : undefined;
+  })().catch(() => undefined);
+  return persistedRoster;
+}
+
+function loadLifecycleManager(registryClass: unknown): Promise<any> {
+  lifecycleManager ??= (async () => {
+    const [lifecycle, registry] = await Promise.all([
+      import("@oh-my-pi/pi-coding-agent/registry/agent-lifecycle"),
+      import("@oh-my-pi/pi-coding-agent/registry/agent-registry"),
+    ]);
+    // OMP maps `@oh-my-pi/*` imports to its own bundled modules; a copy would hold another
+    // registry, and a release there would cancel nothing.
+    if (registryClass === undefined || registry?.AgentRegistry !== registryClass) return undefined;
+    const manager = lifecycle?.AgentLifecycleManager;
+    if (typeof manager?.global !== "function") return undefined;
+    lifecycleLoaded = manager;
+    return manager;
+  })().catch(() => undefined);
+  return lifecycleManager;
+}
+
+// C0 and C1 controls, line and paragraph separators, and format characters: OMP's renderer
+// strips some of these and keeps others, so the text a person sees could differ from the text
+// herdr reports, or reorder in a terminal behind herdr.
+// Format characters (every bidi control among them) are invisible; the joiners and tag characters
+// that emoji sequences need stay allowed.
+const UNSAFE_TEXT = /[\x00-\x1f\x7f-\x9f\u2028\u2029]|(?![\u200c\u200d\u{e0020}-\u{e007f}])\p{Cf}/u;
+
+function isOneLine(text: unknown, max: number): text is string {
+  return typeof text === "string" && text.trim().length > 0 && text.length <= max && !UNSAFE_TEXT.test(text);
+}
+
+// The text of a user message's content.
+function messageText(content: unknown): string | undefined {
+  return typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content
+          .filter((part) => part?.type === "text")
+          .map((part) => part.text)
+          .join("\n")
+      : undefined;
+}
+
+function toolNames(names: unknown): string[] {
+  if (!Array.isArray(names)) return [];
+  return names.filter((name): name is string => typeof name === "string" && name.length > 0).slice(0, toolListMax).map((name) => cap(name, 128));
+}
 
 // Matches the text of the user message OMP starts the turn with: the delivered text, with each
 // model mention allowed to have been rewritten.
@@ -415,7 +569,10 @@ function updateSessionRef(ctx: any): void {
     currentAgentSessionId = undefined;
   }
   if (currentSessionKey() !== previousKey) registeredSessionKey = undefined;
-  if (currentAgentSessionId !== previousId) movedSessionTags = [];
+  if (currentAgentSessionId !== previousId) {
+    movedSessionTags = [];
+    movedSessionStems = [];
+  }
 }
 
 // The session OMP runs now, read from `ctx` without storing it.
@@ -466,6 +623,10 @@ function liveSessionMoved(ctx: any): boolean {
 // Tags of earlier files of the current session (`/move`, `/wt`): a block herdr checked against
 // one of them is for this conversation.
 let movedSessionTags: string[] = [];
+// Directory stems of earlier files of the current session. OMP's agent registry keeps each
+// subagent's transcript path from before a `/move` or `/wt` (the move renames the files, not the
+// refs), so the session's subagents are matched against these too.
+let movedSessionStems: string[] = [];
 
 function tagOf(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
@@ -489,6 +650,10 @@ function followSessionMove(ctx: any): boolean {
   if (!isAbsoluteSessionPath(file) || file === before) return false;
   movedSessionTags.push(tagOf(before));
   movedSessionTags.splice(0, movedSessionTags.length - 8);
+  if (before.endsWith(".jsonl")) {
+    movedSessionStems.push(before.slice(0, -".jsonl".length));
+    movedSessionStems.splice(0, movedSessionStems.length - 8);
+  }
   updateSessionRef(ctx);
   // Nothing reports a move again (only the next turn would), so keep trying while herdr is
   // unreachable, as for a lost report: a herdr restart must resume the moved file.
@@ -978,6 +1143,7 @@ export default function (pi) {
   // herdr refused a detail report; set until the next session event.
   let detailRefused = false;
   let moveWatch: ReturnType<typeof setInterval> | undefined;
+  let unsubscribeRegistry: (() => void) | undefined;
   // Counts activations and shutdowns, so a pending withdrawal undo sees that a session event came.
   let activations = 0;
   let lastDetailAt = 0;
@@ -1055,6 +1221,128 @@ export default function (pi) {
     };
   }
 
+  // OMP's process-wide agent registry (`pi.pi` is OMP's own package module); undefined when this
+  // OMP has none.
+  function agentRegistry(): any {
+    try {
+      const registry = pi.pi?.AgentRegistry?.global?.();
+      return typeof registry?.list === "function" && typeof registry?.get === "function" ? registry : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // A subagent of the root session: its transcript sits under the root session file's directory
+  // stem (`<session>/<id>.jsonl`, nested ones deeper). This leaves out advisors, agents of an
+  // earlier session of this process and agents without a file.
+  function isSessionSubagent(ref: any, stem: string | undefined): boolean {
+    const file = ref?.sessionFile;
+    const under = (dir: string) =>
+      file.length > dir.length + 1 && file.startsWith(dir) && (file[dir.length] === "/" || file[dir.length] === "\\");
+    return (
+      stem !== undefined &&
+      ref?.kind === "sub" &&
+      typeof ref.id === "string" &&
+      typeof ref.status === "string" &&
+      typeof file === "string" &&
+      (under(stem) || movedSessionStems.some(under))
+    );
+  }
+
+  function sessionStem(): string | undefined {
+    let file: unknown;
+    try {
+      file = detailCtx?.sessionManager?.getSessionFile?.();
+    } catch {
+      return undefined;
+    }
+    return isAbsoluteSessionPath(file) && file.endsWith(".jsonl") ? file.slice(0, -".jsonl".length) : undefined;
+  }
+
+  function sessionSubagent(registry: any, id: string): any {
+    let ref: any;
+    try {
+      ref = registry.get(id);
+    } catch {
+      return undefined;
+    }
+    return isSessionSubagent(ref, sessionStem()) ? ref : undefined;
+  }
+
+  // Where a subagent's transcript is now when its ref still holds a path under an earlier stem of
+  // this session: OMP's move renamed the directory, so the same relative path under the current
+  // stem. Undefined for a ref under the current stem.
+  function movedTranscript(ref: { sessionFile?: unknown }): string | undefined {
+    const stem = sessionStem();
+    const file = ref.sessionFile;
+    if (stem === undefined || typeof file !== "string") return undefined;
+    const under = (dir: string) =>
+      file.length > dir.length + 1 && file.startsWith(dir) && (file[dir.length] === "/" || file[dir.length] === "\\");
+    if (under(stem)) return undefined;
+    const old = movedSessionStems.findLast(under);
+    return old === undefined ? undefined : stem + file.slice(old.length);
+  }
+
+  // The root session's subagents, running first (newest first), then the rest by last activity.
+  function subagentRoster(): { total: number; running: number; items: Record<string, unknown>[] } | undefined {
+    const registry = agentRegistry();
+    if (!registry) return undefined;
+    let refs: any[];
+    try {
+      refs = registry.list();
+    } catch {
+      return undefined;
+    }
+    for (const id of subagentInfo.keys()) {
+      if (!refs.some((ref) => ref?.id === id)) subagentInfo.delete(id);
+    }
+    const stem = sessionStem();
+    const subs = refs.filter((ref) => isSessionSubagent(ref, stem));
+    for (const ref of subs) observeRun(ref);
+    if (subs.length === 0) return undefined;
+    const ms = (value: unknown) => (Number.isFinite(value) ? Math.max(0, Math.round(value as number)) : 0);
+    subs.sort((a, b) =>
+      (a.status === "running") !== (b.status === "running")
+        ? a.status === "running"
+          ? -1
+          : 1
+        : a.status === "running"
+          ? ms(b.createdAt) - ms(a.createdAt)
+          : ms(b.lastActivity) - ms(a.lastActivity),
+    );
+    const items = subs.slice(0, ROSTER_TIERS[0]).map((ref) => {
+      const info = subagentInfo.get(ref.id);
+      const model = ref.session?.model;
+      return {
+        id: ref.id,
+        name: cap(typeof ref.displayName === "string" && ref.displayName ? ref.displayName : ref.id, 80),
+        ...(info?.type ? { type: cap(info.type, 80) } : {}),
+        ...(typeof ref.parentId === "string" && ref.parentId !== "Main" ? { parent: cap(ref.parentId, 80) } : {}),
+        status: SUBAGENT_STATUSES.has(ref.status) ? ref.status : cap(ref.status, 20),
+        run: info?.run ?? 1,
+        ...((info?.run ?? 1) > 1 ? { revived: true } : {}),
+        ...(info?.person ? { person: true } : {}),
+        ...(typeof ref.activity === "string" && ref.activity ? { activity: cap(ref.activity, 160) } : {}),
+        ...(info?.tool ? { tool: { name: info.tool.name, started_ms: info.tool.started_ms } } : {}),
+        ...(model?.provider && model?.id ? { model: cap(`${model.provider}/${model.id}`, 200) } : {}),
+        started_ms: ms(ref.createdAt),
+        active_ms: ms(ref.lastActivity),
+      };
+    });
+    return { total: subs.length, running: subs.filter((ref) => ref.status === "running").length, items };
+  }
+
+  function serviceTiers(): Record<string, string> {
+    const tiers: Record<string, string> = {};
+    try {
+      const current = pi.getServiceTiers?.();
+      for (const family of Object.keys(SERVICE_TIERS)) {
+        if (typeof current?.[family] === "string") tiers[family] = current[family];
+      }
+    } catch {}
+    return tiers;
+  }
+
   function buildDetail() {
     const ctx = detailCtx;
     const detail: Record<string, unknown> = { updated_ms: Date.now() };
@@ -1078,6 +1366,10 @@ export default function (pi) {
     } catch {}
     const todos = todoSummary(ctx);
     if (todos) detail.todos = todos;
+    const tiers = serviceTiers();
+    if (Object.keys(tiers).length > 0) detail.service_tiers = tiers;
+    if (statusText !== undefined) detail.status_text = statusText;
+    const fits = () => Buffer.byteLength(JSON.stringify(detail), "utf8") <= detailBudgetBytes;
     const head = dialogs[0];
     if (head) {
       // The smallest report that fits herdr's limit; an answer refuses what it had to cut.
@@ -1085,8 +1377,39 @@ export default function (pi) {
         const { truncated, report } = dialogReport(head, tier);
         detail.dialog = report;
         head.truncated = truncated;
-        if (Buffer.byteLength(JSON.stringify(detail), "utf8") <= detailBudgetBytes) break;
+        if (fits()) break;
       }
+    }
+    // The dialog has its room; the roster and the tool lists take what is left, in that order of
+    // priority: fewer roster rows first, then no inactive tools, then no active tools.
+    let active: string[] = [];
+    let inactive: string[] = [];
+    try {
+      active = toolNames(pi.getActiveTools?.());
+      const on = new Set(pi.getActiveTools?.());
+      inactive = toolNames((pi.getAllTools?.() ?? []).map((tool: any) => tool?.name).filter((name: unknown) => !on.has(name)));
+    } catch {}
+    const roster = subagentRoster();
+    const candidates: [number, boolean, boolean][] = [
+      ...ROSTER_TIERS.map((rows): [number, boolean, boolean] => [rows, true, true]),
+      [0, true, false],
+      [0, false, false],
+    ];
+    for (const [rows, withActive, withInactive] of candidates) {
+      delete detail.subagents;
+      delete detail.active_tools;
+      delete detail.inactive_tools;
+      if (roster) {
+        detail.subagents = {
+          total: roster.total,
+          running: roster.running,
+          items: roster.items.slice(0, rows),
+          ...(roster.total > Math.min(rows, roster.items.length) ? { truncated: true } : {}),
+        };
+      }
+      if (withActive && active.length > 0) detail.active_tools = active;
+      if (withInactive && inactive.length > 0) detail.inactive_tools = inactive;
+      if (fits()) break;
     }
     return detail;
   }
@@ -1419,6 +1742,62 @@ export default function (pi) {
         return answerDialog(ctx, actionId, args, finish, refuse, rest);
       case "command":
         return runCommand(args, finish, refuse, rest);
+      case "set_service_tier": {
+        const { family, tier } = args;
+        if (typeof family !== "string" || !Object.hasOwn(SERVICE_TIERS, family)) {
+          return refuse("invalid_args: family must be one of openai, anthropic, google");
+        }
+        if (tier !== null && typeof tier !== "string") {
+          return refuse("invalid_args: tier must be a tier name, or null to clear the session's tier");
+        }
+        if (tier !== null && !SERVICE_TIERS[family].includes(tier)) {
+          return refuse(`invalid_tier: ${family} takes ${SERVICE_TIERS[family].join(", ")}`);
+        }
+        try {
+          pi.setServiceTier(family, tier ?? undefined);
+        } catch (error) {
+          return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+        }
+        finish({ ok: true, data: { service_tiers: serviceTiers() } });
+        return rest;
+      }
+      case "set_tools":
+        return setTools(args, finish, refuse, rest);
+      case "notify": {
+        const level = args.level ?? "info";
+        if (level === "error") {
+          return refuse("invalid_args: level error is refused: OMP's error notice also clears the person's pending input; use warning");
+        }
+        if (level !== "info" && level !== "warning") return refuse("invalid_args: level must be info or warning");
+        if (!isOneLine(args.text, 500)) return refuse("invalid_args: notify needs a one-line text of 1-500 characters");
+        if (typeof ctx?.ui?.notify !== "function") return refuse("unsupported_op: this OMP shows no notices");
+        try {
+          ctx.ui.notify(args.text, level);
+        } catch (error) {
+          return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+        }
+        finish({ ok: true, data: {} });
+        return rest;
+      }
+      case "status": {
+        const text = args.text;
+        if (text !== undefined && text !== null && !isOneLine(text, 80)) {
+          return refuse("invalid_args: status text must be one line of 1-80 characters, or null to clear it");
+        }
+        if (typeof ctx?.ui?.setStatus !== "function") return refuse("unsupported_op: this OMP has no status line");
+        const next = typeof text === "string" ? text : undefined;
+        try {
+          ctx.ui.setStatus(STATUS_KEY, next);
+        } catch (error) {
+          return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+        }
+        statusText = next;
+        finish({ ok: true, data: next === undefined ? {} : { status_text: next } });
+        return rest;
+      }
+      case "subagent_steer":
+      case "subagent_cancel":
+        return subagentAction(request.op, args, finish, refuse, rest);
       default:
         return refuse(`unsupported_op: ${cap(request?.op, 40)}`);
     }
@@ -1504,6 +1883,170 @@ export default function (pi) {
     return rest;
   }
 
+  // Computes the new set from OMP's active tools at apply time, so a caller's older read never
+  // undoes a change made since.
+  function setTools(args: any, finish: any, refuse: any, rest: any) {
+    const list = (value: unknown) =>
+      value === undefined ||
+      (Array.isArray(value) &&
+        value.length <= 64 &&
+        value.every((name) => typeof name === "string" && name.length >= 1 && name.length <= 128));
+    if (!list(args.enable) || !list(args.disable)) {
+      return refuse("invalid_args: enable and disable are lists of at most 64 tool names of 1-128 characters");
+    }
+    const enable: string[] = args.enable ?? [];
+    const disable: string[] = args.disable ?? [];
+    if (enable.length + disable.length === 0) return refuse("invalid_args: set_tools needs enable or disable");
+    const both = enable.find((name) => disable.includes(name));
+    if (both !== undefined) return refuse(`invalid_args: ${cap(both, 128)} is in both enable and disable`);
+    let known: Set<unknown>;
+    let current: string[];
+    try {
+      known = new Set((pi.getAllTools() ?? []).map((tool: any) => tool?.name));
+      current = [...pi.getActiveTools()];
+    } catch (error) {
+      return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+    }
+    const unknown = [...new Set([...enable, ...disable])].filter((name) => !known.has(name));
+    if (unknown.length > 0) {
+      return refuse(`unknown_tool: ${unknown.slice(0, 10).map((name) => cap(name, 128)).join(", ")}`);
+    }
+    const next = [...current.filter((name) => !disable.includes(name)), ...enable.filter((name) => !current.includes(name))];
+    if (next.length === 0) return refuse("invalid_args: no tools would remain");
+    Promise.resolve(pi.setActiveTools(next)).then(
+      () => finish({ ok: true, data: { active_tools: toolNames(pi.getActiveTools?.()) } }),
+      (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
+    );
+    return rest;
+  }
+
+  // Steer and cancel a subagent of the root session in OMP's process, as OMP's Agent Hub and its
+  // RPC mode do: an aside into the running turn, or a release with a tombstone plus an abort.
+  function subagentAction(op: string, args: any, finish: any, refuse: any, rest: any) {
+    const id = args.subagent_id;
+    if (typeof id !== "string" || !SUBAGENT_ID.test(id)) {
+      return refuse("invalid_args: subagent_id must be an id from omp.subagents");
+    }
+    const expectedRun = args.expected_run;
+    if (!Number.isSafeInteger(expectedRun) || expectedRun < 1) {
+      return refuse("invalid_args: expected_run must be the run from omp.subagents");
+    }
+    const text = args.text;
+    if (op === "subagent_steer" && (typeof text !== "string" || !text.trim() || text.length > 3000)) {
+      return refuse("invalid_args: subagent_steer needs text of 1-3000 characters");
+    }
+    const registry = agentRegistry();
+    if (!registry) return refuse("unsupported_op: this OMP has no agent registry");
+    const ref = sessionSubagent(registry, id);
+    if (!ref) return refuse(`no_subagent: ${id} is not a subagent of this session`);
+    const session = ref.session;
+    // Checked in this order: a run that ended reports its end, even when the caller read an older
+    // one.
+    const stillOwned = () => {
+      const info = observeRun(ref);
+      if (ref.status !== "running" || !ref.session) return `subagent_not_running: ${id} is ${cap(ref.status, 20)}`;
+      if (info.run !== expectedRun) {
+        return `subagent_changed: ${id} is on run ${info.run} now, not run ${expectedRun}; read agent.get again`;
+      }
+      if (info.person) {
+        return `subagent_person_chat: someone else (a person in OMP's agent view, or another client) sent ${id}'s run a message; nothing was sent`;
+      }
+      return undefined;
+    };
+    const owned = stillOwned();
+    if (owned) return refuse(owned);
+    if (op === "subagent_steer") {
+      // The run's result is with its parent; an aside now would start a turn after it.
+      if (ref.lifecycle?.responseAt !== undefined) {
+        return refuse(`subagent_not_running: ${id} has handed over its result`);
+      }
+      // Between turns an aside would start a new turn; the executor's own reminders run there.
+      if (session.isStreaming !== true) {
+        return refuse(`subagent_busy: ${id} is between turns; retry in a few seconds`);
+      }
+      const info = subagentEntry(id);
+      // Queued asides reach the subagent together at its next step boundary, so every one queued in
+      // this run is kept (up to a bound far above what one step boundary sees).
+      info.steers = [...info.steers.slice(-(steerMemory - 1)), text];
+      Promise.resolve(session.sendUserMessage(text, { deliverAs: "aside" })).then(
+        () => finish({ ok: true, data: { subagent_id: id, delivered: "aside" } }),
+        (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
+      );
+      return rest;
+    }
+    void (async () => {
+      const manager = await loadLifecycleManager(pi.pi?.AgentRegistry);
+      if (!manager) {
+        return finish({
+          ok: false,
+          error: "unsupported_op: OMP's agent lifecycle module did not load as OMP's own; reload the extension or restart OMP",
+        });
+      }
+      // The import awaited: the subagent may have ended or moved on meanwhile.
+      if (registry.get(id) !== ref || ref.session !== session) {
+        return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
+      }
+      const changed = stillOwned();
+      if (changed) return finish({ ok: false, error: changed });
+      // OMP's release writes the tombstone at the ref's path, which a `/move` or `/wt` left stale:
+      // herdr writes it where the transcript is now. Mapped before the release can await.
+      const moved = movedTranscript(ref);
+      // Release first: it marks the ref aborted at once, which the task executor turns into the
+      // task's abort; a bare abort would only end the subagent's turn.
+      const releasing = Promise.resolve().then(() => manager.global().release(id, ref, { tombstone: true }));
+      // Once the release ends (also after the wait below gave up): whether it cancelled the ref, and
+      // whether a tombstone is next to the transcript. Release makes the ref terminal before its
+      // first await, so a ref still registered, aborted and detached was cancelled even when the
+      // release rejects afterwards (its own tombstone write).
+      let known: { aborted: boolean; persisted: boolean } | undefined;
+      const afterRelease = releasing.then(
+        () => false,
+        () => true,
+      ).then(async (rejected) => {
+        const aborted = registry.get(id) === ref && ref.status === "aborted" && !ref.session;
+        // A rejected release lost OMP's own tombstone; a fulfilled one wrote it at the ref's path.
+        let persisted = !rejected;
+        // Only next to a transcript that is there: a subagent from before the move still puts the
+        // subagents it spawns after it under the old stem, where OMP's own tombstone is right.
+        if (aborted && moved !== undefined && (await access(moved).then(() => true, () => false))) {
+          // OMP's kill marker (`persistAgentTombstone`): an empty `<transcript>.tombstone`, which
+          // OMP's scan after a restart reads as `aborted`, not `parked`. Herdr's write replaces
+          // OMP's at the stale path as the one that counts.
+          persisted = await writeFile(`${moved}.tombstone`, "", { encoding: "utf8", flag: "wx", mode: 0o600 }).then(
+            () => true,
+            (error: NodeJS.ErrnoException) => error?.code === "EEXIST",
+          );
+        }
+        known = { aborted, persisted };
+        return known;
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([
+        Promise.allSettled([releasing, Promise.resolve().then(() => session.abort({ reason: "Interrupted by herdr" }))]),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(resolve, subagentCancelWaitMs);
+        }),
+      ]);
+      clearTimeout(timer);
+      const done = (persisted: boolean, fields: Record<string, unknown> = {}) =>
+        finish({ ok: true, data: { subagent_id: id, cancelled: true, ...fields, ...(persisted ? {} : { persisted }) } });
+      // Not settled: the release or the subagent's abort is still running. A missing tombstone is
+      // said only when the release has already ended without one.
+      if (!result) return done(!(known?.aborted && !known.persisted), { settled: false });
+      const [released] = result;
+      const { aborted, persisted } = await afterRelease;
+      if (released.status === "rejected") {
+        if (!aborted) return finish({ ok: false, error: `failed: ${cap(released.reason?.message ?? released.reason, 200)}` });
+        return done(persisted);
+      }
+      if (released.value !== true) {
+        return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
+      }
+      return done(persisted);
+    })();
+    return rest;
+  }
+
   // `name` is the only session command that 18.4.4 lets an extension run without driving the
   // editor (session changes need a command handler, and an editor submit can reach a picker).
   function runCommand(args: any, finish: any, refuse: any, rest: any) {
@@ -1511,7 +2054,7 @@ export default function (pi) {
     const sub = args.args && typeof args.args === "object" ? args.args : {};
     if (name !== "name") return refuse(`unsupported_op: command ${cap(name, 40)}`);
     const title = sub.title;
-    if (typeof title !== "string" || !title.trim() || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) {
+    if (!isOneLine(title, 200)) {
       return refuse("invalid_args: name needs a one-line title of at most 200 characters");
     }
     Promise.resolve(pi.setSessionName(title.trim())).then(
@@ -1635,6 +2178,40 @@ export default function (pi) {
       if (lost) publishState(true);
       if (instructionListener) scheduleDetail(undefined, true);
     };
+    // Subagent changes show in the roster: registry events (start, status, end) and the tool
+    // events of subagent bindings, at most one report a second.
+    onSubagentChange = () => {
+      if (rootSession) scheduleDetail();
+    };
+    // Run counting needs to know when OMP's executor finished a run (`runFinished`).
+    void loadLifecycleManager(pi.pi?.AgentRegistry);
+    // List the session's earlier subagents now, not only once something in OMP asks for them.
+    const registryNow = agentRegistry();
+    const activation = activations;
+    let sessionFile: unknown;
+    try {
+      sessionFile = ctx?.sessionManager?.getSessionFile?.();
+    } catch {}
+    if (registryNow && isAbsoluteSessionPath(sessionFile)) {
+      void loadPersistedRoster(pi.pi?.AgentRegistry).then(async (ensure) => {
+        if (!ensure || activation !== activations) return;
+        try {
+          await ensure(registryNow, sessionFile);
+        } catch {
+          return;
+        }
+        if (activation === activations && rootSession) scheduleDetail();
+      });
+    }
+    if (!unsubscribeRegistry) {
+      try {
+        const off = agentRegistry()?.onChange?.((event: any) => {
+          if (event?.ref?.kind === "sub" && typeof event.ref.id === "string") observeRun(event.ref);
+          onSubagentChange?.();
+        });
+        if (typeof off === "function") unsubscribeRegistry = off;
+      } catch {}
+    }
     registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
@@ -1676,7 +2253,31 @@ export default function (pi) {
     activateBlocked(data.label);
   });
 
+  // A subagent's binding of this module adds what OMP's registry lacks: the agent type and the
+  // tool the subagent runs. Returns whether `ctx` is a subagent's.
+  function noteSubagent(event: string, data: any, ctx: any): boolean {
+    const agent = ctx?.agent;
+    if (agent?.kind !== "sub" || typeof agent.id !== "string") return false;
+    const info = subagentEntry(agent.id);
+    if (typeof agent.name === "string" && agent.name) info.type = agent.name;
+    if (event === "message_start") {
+      const message = data?.message;
+      if (message?.role !== "user" || message.attribution === "agent") return true;
+      const text = messageText(message.content);
+      const steer = text === undefined ? -1 : info.steers.indexOf(text);
+      if (steer >= 0) info.steers.splice(steer, 1);
+      else info.person = true;
+    } else if (event === "tool_execution_start") {
+      info.tool = { name: cap(data?.toolName || "tool", 120), call_id: data?.toolCallId, started_ms: Date.now() };
+    } else if (event === "tool_execution_end" && info.tool?.call_id === data?.toolCallId) {
+      info.tool = undefined;
+    }
+    onSubagentChange?.();
+    return true;
+  }
+
   pi.on("session_start", (_event, ctx) => {
+    if (noteSubagent("session_start", _event, ctx)) return;
     if (!activateRootSession(ctx)) {
       return;
     }
@@ -1721,21 +2322,13 @@ export default function (pi) {
     });
   }
 
-  pi.on("message_start", (event) => {
+  pi.on("message_start", (event, ctx) => {
+    if (noteSubagent("message_start", event, ctx)) return;
     const message = event?.message;
     if (!rootSession || awaitingAdmission.length === 0 || message?.role !== "user") {
       return;
     }
-    const content = message.content;
-    const text =
-      typeof content === "string"
-        ? content
-        : Array.isArray(content)
-          ? content
-              .filter((part) => part?.type === "text")
-              .map((part) => part.text)
-              .join("\n")
-          : undefined;
+    const text = messageText(message.content);
     // Only the delivered text starts its turn; a person's own prompt never claims it.
     const index =
       typeof text === "string"
@@ -1805,6 +2398,7 @@ export default function (pi) {
   });
 
   pi.on("tool_execution_start", (event, ctx) => {
+    if (noteSubagent("tool_execution_start", event, ctx)) return;
     if (event?.toolName !== "ask") {
       if (rootSession && event?.toolCallId) {
         toolInputs.set(event.toolCallId, event.args);
@@ -1840,6 +2434,7 @@ export default function (pi) {
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
+    if (noteSubagent("tool_execution_end", event, ctx)) return;
     if (event?.toolName !== "ask") {
       if (rootSession) {
         runningTools.delete(event?.toolCallId);
@@ -1968,6 +2563,9 @@ export default function (pi) {
     activations += 1;
     clearInterval(moveWatch);
     moveWatch = undefined;
+    unsubscribeRegistry?.();
+    unsubscribeRegistry = undefined;
+    onSubagentChange = undefined;
     clearPendingTimers();
     clearTimeout(detailTimer);
     detailTimer = undefined;

@@ -296,6 +296,22 @@ pub enum AgentActionOp {
     Answer,
     /// `args.name` and its `args.args`: run an allow-listed session command while idle.
     Command,
+    /// `args.family` (`openai`, `anthropic`, `google`) and `args.tier` (`null` clears): set the
+    /// session's service tier for that provider family.
+    SetServiceTier,
+    /// `args.enable` and `args.disable`: tool names to turn on and off, applied to the tools active
+    /// when the action runs.
+    SetTools,
+    /// `args.text` (one line) and `args.level` (`info` or `warning`): show the person a notice.
+    Notify,
+    /// `args.text` (one line; `null` or omitted clears): set Herdr's status-line text in OMP.
+    Status,
+    /// `args.subagent_id`, `args.expected_run` (the `run` of the subagent's row the caller read)
+    /// and `args.text`: queue an aside into that run of a running subagent of the session.
+    SubagentSteer,
+    /// `args.subagent_id` and `args.expected_run` (the `run` of the subagent's row the caller
+    /// read): cancel that run of a running subagent of the session.
+    SubagentCancel,
 }
 
 /// What became of an `agent.action`, as `AgentInfo.last_action` shows it.
@@ -386,8 +402,88 @@ pub struct OmpDetail {
     /// The approval or `ask` dialog OMP shows now (the oldest open one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialog: Option<OmpDialog>,
+    /// The session's service tier overrides, per provider family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tiers: Option<OmpServiceTiers>,
+    /// The tools the model can use now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tools: Option<Vec<String>>,
+    /// OMP's other tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_tools: Option<Vec<String>>,
+    /// The status-line text the `status` op set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_text: Option<String>,
+    /// The session's subagents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<OmpSubagents>,
     /// When the integration built the report, unix ms.
     pub updated_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpServiceTiers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpSubagents {
+    pub total: u32,
+    pub running: u32,
+    /// Running first (newest first), then the rest by last activity.
+    pub items: Vec<OmpSubagent>,
+    /// `items` shows fewer than `total`.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpSubagent {
+    /// OMP's agent registry id; the `subagent_*` ops take it.
+    pub id: String,
+    pub name: String,
+    /// The agent definition name (`task`, `explore`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// The spawning subagent's id, when it is not the session's main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// `running`, `idle`, `parked` or `aborted`.
+    pub status: String,
+    /// Which run of this subagent the row shows, from 1. A new run starts when the subagent runs
+    /// again after OMP finished its previous run (with a result or without one) or parked it: a
+    /// `task` resume, a wake, or a person's chat. Inside such a later run every turn can count as
+    /// a new run. `subagent_steer` and `subagent_cancel` take it as `expected_run`.
+    #[serde(default)]
+    pub run: u32,
+    /// The run is not the subagent's first.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub revived: bool,
+    /// A message that neither the task nor Herdr sent reached this subagent (a person's chat in
+    /// OMP's agent view, or another client), or reached the run that spawned it. It stays set until
+    /// the subagent hands over a result or parks; the `subagent_*` ops refuse it.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub person: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<OmpSubagentTool>,
+    /// The subagent's model, `provider/id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub started_ms: u64,
+    pub active_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OmpSubagentTool {
+    pub name: String,
+    pub started_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

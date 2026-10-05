@@ -3063,6 +3063,80 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn omp_detail_keeps_up_to_32_kib_with_tools_and_subagents() {
+        let (mut app, instruct, _rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        let detail = |tool_bytes: usize| -> crate::api::schema::OmpDetail {
+            serde_json::from_value(serde_json::json!({
+                "updated_ms": 1,
+                "service_tiers": {"openai": "flex"},
+                "active_tools": ["t".repeat(tool_bytes)],
+                "inactive_tools": ["bash"],
+                "status_text": "sahur: reviewing",
+                "subagents": {
+                    "total": 2,
+                    "running": 1,
+                    "items": [{
+                        "id": "0-Explore",
+                        "name": "Explore",
+                        "type": "explore",
+                        "status": "running",
+                        "run": 2,
+                        "revived": true,
+                        "person": true,
+                        "tool": {"name": "grep", "started_ms": 5},
+                        "started_ms": 3,
+                        "active_ms": 4
+                    }],
+                    "truncated": true
+                }
+            }))
+            .unwrap()
+        };
+        let report = |app: &mut App, omp: crate::api::schema::OmpDetail| {
+            app.handle_pane_report_omp_detail(
+                "detail".into(),
+                crate::api::schema::PaneReportOmpDetailParams {
+                    pane_id: target.clone(),
+                    agent_pid: std::process::id(),
+                    runtime_instance: FIXTURE_RUNTIME.into(),
+                    omp,
+                    peer_pid: Some(std::process::id()),
+                },
+            )
+        };
+        let kept = detail(20 * 1024);
+        assert!(report(&mut app, kept.clone()).contains("\"ok\""));
+        let info = app.agent_info_for_target(&target).unwrap();
+        assert_eq!(info.omp, Some(kept.clone()));
+        let json = serde_json::to_value(&info.omp).unwrap();
+        assert_eq!(json["subagents"]["items"][0]["type"], "explore");
+        assert_eq!(json["subagents"]["truncated"], true);
+        assert_eq!(json["subagents"]["items"][0]["run"], 2);
+        assert_eq!(json["subagents"]["items"][0]["person"], true);
+        assert!(report(&mut app, detail(33 * 1024)).contains("too large"));
+        assert_eq!(app.agent_info_for_target(&target).unwrap().omp, Some(kept));
+    }
+
+    #[test]
+    fn agent_action_takes_the_v2_ops() {
+        use crate::api::schema::AgentActionOp as Op;
+        for (op, expected) in [
+            ("set_service_tier", Op::SetServiceTier),
+            ("set_tools", Op::SetTools),
+            ("notify", Op::Notify),
+            ("status", Op::Status),
+            ("subagent_steer", Op::SubagentSteer),
+            ("subagent_cancel", Op::SubagentCancel),
+        ] {
+            let parsed: Op = serde_json::from_value(serde_json::json!(op)).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(serde_json::to_value(parsed).unwrap(), serde_json::json!(op));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn omp_detail_comes_only_from_the_registered_listener_and_ends_with_it() {
         let (mut app, instruct, _rx) = guarded_fixture(AgentState::Idle);
         let target = instruct.target.clone();
@@ -3077,6 +3151,11 @@ mod tests {
             }),
             todos: None,
             dialog: None,
+            service_tiers: None,
+            active_tools: None,
+            inactive_tools: None,
+            status_text: None,
+            subagents: None,
             updated_ms: 1,
         };
         let report = |app: &mut App, runtime: &str, peer_pid: u32| {
