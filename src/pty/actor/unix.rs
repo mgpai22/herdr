@@ -1623,6 +1623,8 @@ mod tests {
         use portable_pty::{CommandBuilder, PtySize};
         use std::os::fd::BorrowedFd;
 
+        let _guard = fd::pty_fd_test_lock();
+
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: 24,

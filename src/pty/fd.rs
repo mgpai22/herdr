@@ -239,3 +239,11 @@ pub(crate) fn resize_pty_fd(
     }
     Ok(())
 }
+
+/// Serializes tests that open real PTYs against the test that counts the
+/// process's PTY fds.
+#[cfg(all(test, unix))]
+pub(crate) fn pty_fd_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
