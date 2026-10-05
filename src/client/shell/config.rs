@@ -56,6 +56,7 @@ impl ClientShellState {
             sidebar_collapsed: self
                 .sidebar_collapsed_manual
                 .then_some(self.sidebar_collapsed),
+            sidebar_agents: self.sidebar_agents_override,
             agent_panel_sort: self
                 .agent_panel_sort_manual
                 .then_some(self.config.agent_panel_sort),
@@ -89,6 +90,17 @@ impl ClientShellState {
                 if self.agent_panel_sort_manual {
                     self.config.agent_panel_sort = agent_panel_sort;
                 }
+                if self
+                    .sidebar_agents_override
+                    .is_some_and(|stored| stored.config_show != self.config.agents.show)
+                {
+                    // An edited `ui.sidebar.agents.show` wins over a stored runtime toggle.
+                    self.sidebar_agents_override = None;
+                    self.persist_chrome_preferences(&mut ClientShellInput::default());
+                }
+                self.sidebar_agents_visible = self
+                    .sidebar_agents_override
+                    .map_or(self.config.agents.visible(), |stored| stored.visible);
                 self.set_local_config_diagnostic(self.config.local_config_diagnostic(&diagnostics));
                 if let Some(snapshot) = self.snapshot.as_deref() {
                     let profile = snapshot.server_keybindings_toml.clone();

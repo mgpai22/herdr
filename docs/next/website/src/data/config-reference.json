@@ -836,6 +836,12 @@
           "description": "Toggle sidebar collapse."
         },
         {
+          "key": "keys.toggle_sidebar_agents",
+          "type": "keybinding",
+          "default": "unset",
+          "description": "Show or hide the sidebar Agents section. The choice is saved per client like keys.toggle_sidebar; any edit of ui.sidebar.agents.show replaces it, including one made while no client runs. Unset by default."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",
@@ -1053,6 +1059,12 @@
             "dots",
             "symbols"
           ]
+        },
+        {
+          "key": "ui.sidebar.agents.show",
+          "type": "boolean",
+          "default": "true",
+          "description": "Show the Agents section below Spaces in the sidebar. When false, Spaces use the sidebar height down to the collapse toggle row, and the sidebar shows no per-agent states. Applies to open clients on herdr server reload-config."
         },
         {
           "key": "ui.sidebar.agents.row_gap",

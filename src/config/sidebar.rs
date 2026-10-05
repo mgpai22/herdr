@@ -422,6 +422,10 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentsSidebarConfig {
+    /// Show the Agents section below Spaces in the sidebar. Default: true.
+    /// Unset and an explicit `true` differ only for the per-client runtime toggle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show: Option<bool>,
     #[serde(deserialize_with = "deserialize_sidebar_rows")]
     pub rows: AgentSidebarRows,
     #[serde(default, deserialize_with = "deserialize_rows_by_agent")]
@@ -434,6 +438,10 @@ impl AgentsSidebarConfig {
         agent
             .and_then(|agent| self.rows_by_agent.get(crate::detect::agent_label(agent)))
             .unwrap_or(&self.rows)
+    }
+
+    pub(crate) fn visible(&self) -> bool {
+        self.show.unwrap_or(true)
     }
 }
 
@@ -449,6 +457,7 @@ impl Default for AgentsSidebarConfig {
                 ],
                 vec![AgentSidebarToken::Agent],
             ],
+            show: None,
             rows_by_agent: BTreeMap::new(),
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
         }

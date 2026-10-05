@@ -47,11 +47,20 @@ fn sidebar_section_heights(total_height: u16, split_ratio: f32) -> (u16, u16) {
     )
 }
 
-pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: f32) -> (Rect, Rect) {
+/// `split_ratio` is `None` when the Agents section is hidden; Spaces then take the full height
+/// except the bottom row, which keeps the sidebar collapse toggle clear of the Spaces footer.
+pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: Option<f32>) -> (Rect, Rect) {
     let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
     if content.is_empty() {
         return (Rect::default(), Rect::default());
     }
+    let Some(split_ratio) = split_ratio else {
+        let height = content.height.saturating_sub(1);
+        return (
+            Rect::new(content.x, content.y, content.width, height),
+            Rect::default(),
+        );
+    };
 
     let (workspace_height, detail_height) = sidebar_section_heights(content.height, split_ratio);
     (
@@ -65,8 +74,11 @@ pub(crate) fn expanded_sidebar_sections(area: Rect, split_ratio: f32) -> (Rect, 
     )
 }
 
-pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: f32) -> Rect {
+pub(crate) fn sidebar_section_divider_rect(area: Rect, split_ratio: Option<f32>) -> Rect {
     let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let Some(split_ratio) = split_ratio else {
+        return Rect::default();
+    };
     if content.width == 0 || content.height < 6 {
         return Rect::default();
     }
