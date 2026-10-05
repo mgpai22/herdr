@@ -768,6 +768,24 @@ fn machine_events_subscribe_reports_a_failed_connection_as_one_plain_line() {
 }
 
 #[test]
+fn remote_api_bridge_reports_a_missing_server_as_one_plain_line() {
+    let harness = Harness::new();
+    let output = harness
+        .command(&["remote-api-bridge"])
+        .env("HERDR_SOCKET_PATH", harness.root.join("missing.sock"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("error: failed to connect to remote Herdr API socket"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.trim_end().lines().count(), 1, "{stderr}");
+    assert!(!stderr.contains("Custom {"), "{stderr}");
+}
+
+#[test]
 fn machine_api_server_stop_is_sent_only_to_the_selected_machine() {
     let harness = Harness::new();
     let server = harness.serve(json!({"result":{"type":"ok"}}), harness.protocol);
