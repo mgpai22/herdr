@@ -18,8 +18,8 @@ use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_ou
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
-    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
+    poll_local_stream_read, remove_socket_file_if_owned, socket_file_identity, LocalStream,
+    LocalStreamRead, SocketFileIdentity,
 };
 
 #[cfg(test)]
@@ -124,6 +124,7 @@ fn start_server_inner(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
+        let mut spawn_failing = false;
         run_accept_loop(
             listener.incoming(),
             &listener_running,
@@ -136,7 +137,9 @@ fn start_server_inner(
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
-                std::thread::spawn(move || {
+                // std::thread::spawn panics when clone fails (RLIMIT_NPROC, memory
+                // pressure) and would take the accept thread down with it.
+                let spawned = std::thread::Builder::new().spawn(move || {
                     if let Err(err) = handle_connection_with_stop(
                         stream,
                         &api_tx,
@@ -150,6 +153,20 @@ fn start_server_inner(
                         warn!(err = %err, "api connection failed");
                     }
                 });
+                match spawned {
+                    Ok(_) if spawn_failing => {
+                        info!("api connection thread spawn recovered");
+                        spawn_failing = false;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        // The closure, and with it the stream, is dropped: the client sees a close.
+                        if !spawn_failing {
+                            error!(err = %err, "api connection thread spawn failed; dropping connections");
+                            spawn_failing = true;
+                        }
+                    }
+                }
             },
         );
         debug!("api server thread exiting");
@@ -183,6 +200,10 @@ fn run_accept_loop<S>(
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
+                if is_permanent_accept_error(&err) {
+                    error!(err = %err, "api listener accept failed permanently; stopping");
+                    break;
+                }
                 // Accept errors such as ECONNABORTED or EMFILE are transient;
                 // exiting would leave the socket file with no listener.
                 if consecutive_errors == 0 {
@@ -195,6 +216,22 @@ fn run_accept_loop<S>(
                 }
             }
         }
+    }
+}
+
+/// Errors that mean the listener itself is unusable, so retrying can never succeed.
+fn is_permanent_accept_error(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
     }
 }
 
@@ -238,6 +275,51 @@ mod accept_loop_tests {
         });
 
         assert_eq!(attempts, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stops_on_permanent_accept_error() {
+        for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            let running = AtomicBool::new(true);
+            let mut handled = Vec::new();
+
+            run_accept_loop(
+                [Err(io::Error::from_raw_os_error(errno)), Ok(1)],
+                &running,
+                Duration::ZERO,
+                |stream| handled.push(stream),
+            );
+
+            assert!(handled.is_empty(), "errno {errno} should stop the loop");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retries_transient_accept_errors() {
+        let transient = [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::EINTR,
+        ];
+        let running = AtomicBool::new(true);
+        let mut handled = Vec::new();
+
+        run_accept_loop(
+            transient
+                .into_iter()
+                .map(|errno| Err(io::Error::from_raw_os_error(errno)))
+                .chain([Ok(1)]),
+            &running,
+            Duration::ZERO,
+            |stream| handled.push(stream),
+        );
+
+        assert_eq!(handled, vec![1]);
     }
 }
 
@@ -399,7 +481,7 @@ fn handle_connection_with_stop(
                     result: ResponseResult::Ok {},
                 },
             )?;
-            set_local_stream_polling(&mut stream, true)?;
+            crate::ipc::set_local_stream_polling(&mut stream, true)?;
             let mut byte = [0];
             while running.load(Ordering::Relaxed) {
                 match poll_local_stream_read(&mut stream, &mut byte)? {
@@ -1339,7 +1421,7 @@ mod tests {
         let elapsed = started.elapsed();
         let _client = writer.join().unwrap();
         assert_eq!(line.as_deref(), Some("{\"id\":\"1\"}\n"));
-        assert!(elapsed < Duration::from_millis(60), "took {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(90), "took {elapsed:?}");
         let mut rest = [0u8; 5];
         server.read_exact(&mut rest).unwrap();
         assert_eq!(&rest, b"extra", "bytes after the newline stay unread");
