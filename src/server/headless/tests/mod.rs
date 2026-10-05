@@ -109,6 +109,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         native_graphics: Default::default(),
         #[cfg(unix)]
         next_client_id: 1,
+        #[cfg(unix)]
+        client_handshake_threads: crate::ipc::ConnectionThreads::new("client"),
         foreground_client_id: None,
         tab_geometry_controllers: HashMap::new(),
         popup_owner_tab_id: None,

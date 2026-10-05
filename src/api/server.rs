@@ -18,8 +18,8 @@ use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_ou
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    poll_local_stream_read, remove_socket_file_if_owned, socket_file_identity, LocalStream,
-    LocalStreamRead, SocketFileIdentity,
+    poll_local_stream_read, remove_socket_file_if_owned, socket_file_identity, ConnectionThreads,
+    LocalStream, LocalStreamRead, SocketFileIdentity,
 };
 
 #[cfg(test)]
@@ -124,7 +124,7 @@ fn start_server_inner(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
-        let mut spawn_failing = false;
+        let mut connection_threads = ConnectionThreads::new("api");
         run_accept_loop(
             listener.incoming(),
             &listener_running,
@@ -137,9 +137,7 @@ fn start_server_inner(
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
-                // std::thread::spawn panics when clone fails (RLIMIT_NPROC, memory
-                // pressure) and would take the accept thread down with it.
-                let spawned = std::thread::Builder::new().spawn(move || {
+                connection_threads.spawn(move || {
                     if let Err(err) = handle_connection_with_stop(
                         stream,
                         &api_tx,
@@ -153,20 +151,6 @@ fn start_server_inner(
                         warn!(err = %err, "api connection failed");
                     }
                 });
-                match spawned {
-                    Ok(_) if spawn_failing => {
-                        info!("api connection thread spawn recovered");
-                        spawn_failing = false;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        // The closure, and with it the stream, is dropped: the client sees a close.
-                        if !spawn_failing {
-                            error!(err = %err, "api connection thread spawn failed; dropping connections");
-                            spawn_failing = true;
-                        }
-                    }
-                }
             },
         );
         debug!("api server thread exiting");

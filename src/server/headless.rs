@@ -40,8 +40,8 @@ use crate::app;
 use crate::config;
 use crate::events::AppEvent;
 use crate::ipc::{
-    bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
-    SocketFileIdentity,
+    bind_local_listener, remove_socket_file_if_owned, socket_file_identity, ConnectionThreads,
+    LocalListener, SocketFileIdentity,
 };
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
@@ -200,6 +200,8 @@ pub struct HeadlessServer {
     native_graphics: native_graphics::NativeGraphics,
     #[cfg(unix)]
     next_client_id: u64,
+    #[cfg(unix)]
+    client_handshake_threads: ConnectionThreads,
     /// The client currently driving session-wide host presentation and side effects.
     foreground_client_id: Option<u64>,
     /// Ephemeral shell connection controlling PTY geometry for each stable tab id.
@@ -259,6 +261,7 @@ fn spawn_windows_client_accept_thread(
 ) {
     std::thread::spawn(move || {
         let mut next_client_id = 1_u64;
+        let mut handshake_threads = ConnectionThreads::new("client");
         while !should_quit.load(Ordering::Acquire) {
             let stream = match listener.accept() {
                 Ok(stream) => stream,
@@ -282,7 +285,7 @@ fn spawn_windows_client_accept_thread(
 
             let should_quit = should_quit.clone();
             let server_event_tx = server_event_tx.clone();
-            std::thread::spawn(move || {
+            handshake_threads.spawn(move || {
                 if let Err(err) = crate::server::client_transport::handle_client_handshake(
                     stream,
                     client_id,
@@ -348,6 +351,8 @@ impl HeadlessServer {
             native_graphics: Default::default(),
             #[cfg(unix)]
             next_client_id: 1,
+            #[cfg(unix)]
+            client_handshake_threads: ConnectionThreads::new("client"),
             foreground_client_id: None,
             tab_geometry_controllers: HashMap::new(),
             popup_owner_tab_id: None,
@@ -1005,6 +1010,7 @@ impl HeadlessServer {
         accept_pending_client_connections(
             &self.client_listener,
             &mut self.next_client_id,
+            &mut self.client_handshake_threads,
             &self.should_quit,
             &self.server_event_tx,
         )
