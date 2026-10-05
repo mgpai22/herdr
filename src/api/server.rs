@@ -31,6 +31,7 @@ pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -123,37 +124,34 @@ fn start_server_inner(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let api_tx = api_tx.clone();
-                    let event_hub = event_hub.clone();
-                    let capabilities = capabilities.clone();
-                    let server_stop = server_stop.clone();
-                    let connection_running = Arc::clone(&listener_running);
-                    #[cfg(unix)]
-                    let ssh_agents = ssh_agents.clone();
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_connection_with_stop(
-                            stream,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                            server_stop.as_ref(),
-                            #[cfg(unix)]
-                            ssh_agents.as_ref(),
-                        ) {
-                            warn!(err = %err, "api connection failed");
-                        }
-                    });
-                }
-                Err(err) => {
-                    error!(err = %err, "api listener accept failed");
-                    break;
-                }
-            }
-        }
+        run_accept_loop(
+            listener.incoming(),
+            &listener_running,
+            ACCEPT_ERROR_BACKOFF,
+            |stream| {
+                let api_tx = api_tx.clone();
+                let event_hub = event_hub.clone();
+                let capabilities = capabilities.clone();
+                let server_stop = server_stop.clone();
+                let connection_running = Arc::clone(&listener_running);
+                #[cfg(unix)]
+                let ssh_agents = ssh_agents.clone();
+                std::thread::spawn(move || {
+                    if let Err(err) = handle_connection_with_stop(
+                        stream,
+                        &api_tx,
+                        &event_hub,
+                        &connection_running,
+                        capabilities,
+                        server_stop.as_ref(),
+                        #[cfg(unix)]
+                        ssh_agents.as_ref(),
+                    ) {
+                        warn!(err = %err, "api connection failed");
+                    }
+                });
+            },
+        );
         debug!("api server thread exiting");
     });
 
@@ -163,6 +161,84 @@ fn start_server_inner(
         identity,
         running,
     })
+}
+
+fn run_accept_loop<S>(
+    incoming: impl IntoIterator<Item = io::Result<S>>,
+    running: &AtomicBool,
+    error_backoff: Duration,
+    mut handle: impl FnMut(S),
+) {
+    let mut consecutive_errors = 0_u64;
+    for stream in incoming {
+        match stream {
+            Ok(stream) => {
+                if consecutive_errors > 0 {
+                    info!(consecutive_errors, "api listener accept recovered");
+                    consecutive_errors = 0;
+                }
+                handle(stream);
+            }
+            Err(err) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Accept errors such as ECONNABORTED or EMFILE are transient;
+                // exiting would leave the socket file with no listener.
+                if consecutive_errors == 0 {
+                    error!(err = %err, "api listener accept failed; retrying");
+                }
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                std::thread::sleep(error_backoff);
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::*;
+
+    fn accept_error() -> io::Result<u32> {
+        Err(io::Error::other("transient accept failure"))
+    }
+
+    #[test]
+    fn keeps_serving_after_repeated_errors() {
+        let running = AtomicBool::new(true);
+        let mut handled = Vec::new();
+
+        run_accept_loop(
+            [Ok(1), accept_error(), accept_error(), Ok(2)],
+            &running,
+            Duration::ZERO,
+            |stream| handled.push(stream),
+        );
+
+        assert_eq!(handled, vec![1, 2]);
+    }
+
+    #[test]
+    fn exits_when_shutdown_happens_while_errors_continue() {
+        let running = AtomicBool::new(true);
+        let mut attempts = 0;
+        let incoming = std::iter::from_fn(|| {
+            attempts += 1;
+            if attempts == 3 {
+                running.store(false, Ordering::Relaxed);
+            }
+            Some(accept_error())
+        });
+
+        run_accept_loop(incoming, &running, Duration::ZERO, |_| {
+            panic!("no connection should be handled")
+        });
+
+        assert_eq!(attempts, 3);
+    }
 }
 
 fn retired_pane_graphics_method_error(line: &str, id: &str) -> Option<ErrorResponse> {
@@ -646,32 +722,111 @@ fn read_initial_request_line_with_timeout(
     read_initial_request_line_with_limits(stream, timeout, MAX_INITIAL_REQUEST_BYTES)
 }
 
+/// Reads the first request line without consuming bytes past its newline:
+/// later code probes the same stream for disconnects.
+#[cfg(unix)]
 fn read_initial_request_line_with_limits(
     stream: &mut LocalStream,
     timeout: Duration,
     max_bytes: usize,
 ) -> std::io::Result<Option<String>> {
-    set_local_stream_polling(stream, true)?;
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    let fd = match stream {
+        LocalStream::UdSocket(stream) => stream.inner().as_raw_fd(),
+    };
+    let deadline = Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        // Allow one byte past max_bytes for the newline, as the old byte loop did.
+        let want = buf.len().min(max_bytes + 1 - bytes.len());
+        // SAFETY: fd is owned by `stream` and outlives the call; buf holds `want` bytes.
+        let peeked = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr().cast(),
+                want,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if peeked < 0 {
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {}
+                _ => return Err(err),
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out reading api request",
+                ));
+            }
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: pollfd is a valid single-entry array for the call's duration.
+            if unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+            continue;
+        }
+        let peeked = peeked as usize;
+        if peeked == 0 {
+            return Ok(None);
+        }
+        let take = buf[..peeked]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(peeked, |newline| newline + 1);
+        stream.read_exact(&mut buf[..take])?;
+        bytes.extend_from_slice(&buf[..take]);
+        if bytes.last() == Some(&b'\n') {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+        }
+        if bytes.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "api request line is too large",
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_initial_request_line_with_limits(
+    stream: &mut LocalStream,
+    timeout: Duration,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     let mut byte = [0u8; 1];
 
-    let result = loop {
-        let read = match poll_local_stream_read(stream, &mut byte) {
-            Ok(read) => read,
-            Err(err) => break Err(err),
-        };
-        match read {
-            LocalStreamRead::Closed => break Ok(None),
+    loop {
+        match poll_local_stream_read(stream, &mut byte)? {
+            LocalStreamRead::Closed => return Ok(None),
             LocalStreamRead::Data => {
                 bytes.push(byte[0]);
                 if byte[0] == b'\n' {
-                    break String::from_utf8(bytes)
+                    return String::from_utf8(bytes)
                         .map(Some)
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
                 }
                 if bytes.len() > max_bytes {
-                    break Err(io::Error::new(
+                    return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "api request line is too large",
                     ));
@@ -679,7 +834,7 @@ fn read_initial_request_line_with_limits(
             }
             LocalStreamRead::Pending => {
                 if Instant::now() >= deadline {
-                    break Err(io::Error::new(
+                    return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out reading api request",
                     ));
@@ -687,9 +842,7 @@ fn read_initial_request_line_with_limits(
                 std::thread::sleep(CONNECTION_POLL_INTERVAL);
             }
         }
-    };
-    set_local_stream_polling(stream, false)?;
-    result
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1169,6 +1322,53 @@ mod tests {
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
         (client, server, path)
+    }
+
+    #[test]
+    fn initial_request_line_arriving_after_accept_is_read_without_poll_delay() {
+        let (mut client, mut server, _path) = local_stream_pair("late-line");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            client.write_all(b"{\"id\":").unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            client.write_all(b"\"1\"}\nextra").unwrap();
+            client
+        });
+        let started = Instant::now();
+        let line = read_initial_request_line(&mut server).unwrap();
+        let elapsed = started.elapsed();
+        let _client = writer.join().unwrap();
+        assert_eq!(line.as_deref(), Some("{\"id\":\"1\"}\n"));
+        assert!(elapsed < Duration::from_millis(60), "took {elapsed:?}");
+        let mut rest = [0u8; 5];
+        server.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"extra", "bytes after the newline stay unread");
+    }
+
+    #[test]
+    fn initial_request_line_keeps_timeout_size_limit_and_close() {
+        let (_client, mut server, _path) = local_stream_pair("idle-line");
+        let started = Instant::now();
+        let err = read_initial_request_line_with_timeout(&mut server, Duration::from_millis(50))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+
+        let (mut client, mut server, _path) = local_stream_pair("big-line");
+        client.write_all(b"12345\n").unwrap();
+        let err = read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let (mut client, mut server, _path) = local_stream_pair("max-line");
+        client.write_all(b"1234\n").unwrap();
+        let line =
+            read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4).unwrap();
+        assert_eq!(line.as_deref(), Some("1234\n"));
+
+        let (client, mut server, _path) = local_stream_pair("closed-line");
+        drop(client);
+        assert!(read_initial_request_line(&mut server).unwrap().is_none());
     }
 
     #[test]
