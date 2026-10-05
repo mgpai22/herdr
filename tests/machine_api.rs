@@ -570,6 +570,8 @@ fn machine_events_subscribe_streams_each_line_until_the_remote_stream_ends() {
             return request;
         }
     });
+    let tmp = harness.root.join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
     let mut child = harness
         .command(&[
             "--machine",
@@ -579,6 +581,7 @@ fn machine_events_subscribe_streams_each_line_until_the_remote_stream_ends() {
             "--json",
             r#"{"subscriptions":[{"type":"pane.agent_status_changed"}]}"#,
         ])
+        .env("TMPDIR", &tmp)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -591,6 +594,14 @@ fn machine_events_subscribe_streams_each_line_until_the_remote_stream_ends() {
     };
     assert_eq!(next_line()["result"]["type"], "subscription_started");
     assert_eq!(next_line()["data"]["agent_status"], "done");
+    // The stream is open: the bridge socket and SSH config are already gone, so
+    // a SIGKILL from here on (hp's way to stop a stream) leaves nothing behind.
+    let left: Vec<_> = fs::read_dir(&tmp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("herdr-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
     next_tx.send(()).unwrap();
     assert_eq!(next_line()["data"]["agent_status"], "idle");
 
@@ -729,6 +740,31 @@ fn machine_api_rejects_old_bridges_and_disconnected_machines() {
         );
         harness.assert_local_untouched();
     }
+}
+
+#[test]
+fn machine_events_subscribe_reports_a_failed_connection_as_one_plain_line() {
+    let harness = Harness::new();
+    let output = harness
+        .command(&[
+            "--machine",
+            "mac",
+            "events",
+            "subscribe",
+            "--json",
+            r#"{"subscriptions":[{"type":"pane.agent_status_changed"}]}"#,
+        ])
+        .env("TEST_MODE", "offline")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("error: machine 'mac'"), "{stderr}");
+    assert_eq!(stderr.trim_end().lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("test remote connection failed"), "{stderr}");
+    assert!(!stderr.contains("Custom {"), "{stderr}");
+    harness.assert_local_untouched();
 }
 
 #[test]

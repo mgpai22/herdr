@@ -848,6 +848,19 @@ no pane, and the optional `agent_status` filter still applies. Servers that
 accept a subscription without `pane_id` advertise `events_any_pane: true` in
 the `ping` capabilities; older servers reject it as an invalid request.
 
+Order holds only within one subscription entry. Lines from different entries of
+one request can arrive out of order within one 100 ms poll, for example a
+`pane.agent_status_changed` line before the `pane.agent_detected` line Herdr
+emitted first. A reader that stops reading for 5 seconds is disconnected (EOF)
+without an `events_lost` line; recover the same way. Without `pane_id`, a status
+change that comes only from a person viewing the pane (`done` to `idle`) is not
+an event, so read `agent.list` for the current status; a turn that ends in a
+viewed pane shows as `working` to `idle`. With an `agent_status` filter, a
+presentation change repeats a line with the same status and `state_change_seq`,
+so drop a line whose `pane_id` and `state_change_seq` you already saw.
+`state_change_seq` grows only within one server process; it restarts after a
+server restart or live handoff.
+
 From the CLI, `herdr events subscribe --json '<params>'` sends
 `events.subscribe` with those params and prints every line the server sends,
 starting with the `subscription_started` response. It exits with status 1

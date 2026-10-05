@@ -30,28 +30,49 @@ fn subscribe(params: &str) -> std::io::Result<i32> {
             return Ok(2);
         }
     };
-    let mut stream = super::open_stream(&Request {
+    let request = Request {
         id: "cli:events:subscribe".into(),
         method: Method::EventsSubscribe(params),
-    })?;
+    };
+    let mut stream = match super::open_stream(&request) {
+        Ok(stream) => stream,
+        // These were already reported as JSON on stderr, or main prints them so.
+        Err(err)
+            if super::protocol_mismatch_was_reported(&err)
+                || super::server_not_running_was_reported(&err) =>
+        {
+            return Err(err)
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            return Ok(1);
+        }
+    };
+    let mut released = false;
     let mut line = String::new();
     loop {
         line.clear();
-        if stream
-            .read_line(&mut line)
-            .map_err(super::target::remote_error)?
-            == 0
-        {
-            let closed =
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "event stream closed");
-            eprintln!("error: {}", super::target::remote_error(closed));
-            return Ok(1);
+        let read = stream.read_line(&mut line);
+        if !released {
+            // The server answered, so the SSH child read its config and the stream
+            // needs neither the bridge socket nor the config any more.
+            super::target::release_machine_files();
+            released = true;
         }
-        let text = line.trim_end();
-        if serde_json::from_str::<StreamLine>(text).is_ok_and(|line| line.error.is_some()) {
-            eprintln!("{text}");
-            return Ok(1);
-        }
-        println!("{text}");
+        let error = match read {
+            Ok(0) => std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "event stream closed"),
+            Ok(_) => {
+                let text = line.trim_end();
+                if serde_json::from_str::<StreamLine>(text).is_ok_and(|line| line.error.is_some()) {
+                    eprintln!("{text}");
+                    return Ok(1);
+                }
+                println!("{text}");
+                continue;
+            }
+            Err(err) => err,
+        };
+        eprintln!("error: {}", super::target::remote_error(error));
+        return Ok(1);
     }
 }
