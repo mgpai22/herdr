@@ -350,6 +350,7 @@ status_indicators = "symbols"
 
 ```toml
 [ui.sidebar.agents]
+show = true
 row_gap = 0
 rows = [
   ["state_icon", "machine", "workspace", "tab"],
@@ -420,6 +421,8 @@ rows = [
 规则适用于 Agent 行、`rows_by_agent` 覆盖和 Space 行中的文本值内置 token 及自定义 `$name` token。上例中，`$load` 报告 `"90"` 时显示红色粗体，`"60"` 时显示黄色，`"90%"` 时保持白色。未报告的 token 仍然不显示。`state_icon` 和复合 token `git_status` 仅接受固定样式，不支持规则。未知条件或格式错误的规则会在加载配置时被拒绝；不支持正则表达式、模糊匹配或脚本。
 
 `row_gap` 分别控制 Agent 和 Space 面板中条目之间的空白终端行数。默认值为 `0`，会紧密排列条目；设为 `1` 可恢复之前的间距。它不会在 `rows` 声明的内容行之间添加间距。连续缩进的 worktree 子项仍会作为一个 Space 组紧密排列。
+
+将 `show` 设为 `false` 会在展开的侧边栏和折叠栏中隐藏 Spaces 下方的 Agent 面板；Spaces 随后占用整个侧边栏高度，面板分隔线也无法拖动。修改该值后运行 `herdr server reload-config`，已打开的客户端会立即应用。`keys.toggle_sidebar_agents`（默认未设置）可在运行时显示或隐藏该面板。与 `keys.toggle_sidebar` 一样，运行时的选择按客户端保存并在重启后保留；下次修改 `show` 时会被新值替换。
 
 在 `rows_by_agent` 下为已知智能体覆盖完整的 Agent 布局：
 

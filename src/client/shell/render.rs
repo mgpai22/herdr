@@ -242,7 +242,8 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) reveal_focused_workspace: &'a mut bool,
     pub(super) reveal_focused_tab: &'a mut bool,
     pub(super) sidebar_collapsed: bool,
-    pub(super) sidebar_section_split: f32,
+    /// `None` while the Agents section is hidden.
+    pub(super) sidebar_section_split: Option<f32>,
     pub(super) tab_drag_insert_index: Option<usize>,
     pub(super) selected_workspace_id: Option<&'a WorkspaceNavigationTarget>,
     pub(super) reveal_navigation_workspace: &'a mut bool,
@@ -296,6 +297,7 @@ pub(super) fn render_shell(
                 state
                     .selected_workspace_id
                     .map(|target| target.workspace_id.as_str()),
+                state.sidebar_section_split.is_some(),
                 &mut hits,
             );
         } else {

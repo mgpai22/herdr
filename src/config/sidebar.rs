@@ -422,6 +422,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentsSidebarConfig {
+    /// Show the Agents section below Spaces in the sidebar. Default: true.
+    pub show: bool,
     #[serde(deserialize_with = "deserialize_sidebar_rows")]
     pub rows: AgentSidebarRows,
     #[serde(default, deserialize_with = "deserialize_rows_by_agent")]
@@ -449,6 +451,7 @@ impl Default for AgentsSidebarConfig {
                 ],
                 vec![AgentSidebarToken::Agent],
             ],
+            show: true,
             rows_by_agent: BTreeMap::new(),
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
         }

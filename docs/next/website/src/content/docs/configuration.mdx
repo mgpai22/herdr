@@ -354,6 +354,7 @@ The expanded desktop sidebar renders each inner array in `rows` as one line. The
 
 ```toml
 [ui.sidebar.agents]
+show = true
 row_gap = 0
 rows = [
   ["state_icon", "machine", "workspace", "tab"],
@@ -424,6 +425,8 @@ The first matching rule wins. Its specified style fields override the occurrence
 Rules work with text-valued built-ins and custom `$name` tokens in Agent rows, `rows_by_agent` overrides, and Space rows. Custom tokens match their reported value: `$load` reporting `"90"` selects red and bold above, `"60"` selects yellow, and `"90%"` keeps white. Unreported tokens still disappear. `state_icon` and composite `git_status` accept fixed styles only, not rules. Unknown conditions and malformed rules are rejected when loading config; regex, fuzzy matching, and scripts are not supported.
 
 `row_gap` controls the blank terminal rows between entries, independently for the Agent and Space panels. It defaults to `0`, which packs entries together; set it to `1` to restore the previous spacing. It does not add spacing between the content lines declared in `rows`. Consecutive indented worktree children remain packed as one Space group.
+
+`show` hides the Agent panel below Spaces when set to `false`, in the expanded sidebar and the collapsed rail; Spaces then use the full sidebar height and the panel divider cannot be dragged. Running `herdr server reload-config` applies an edited value to open clients. `keys.toggle_sidebar_agents` (unset by default) shows or hides the panel at runtime. Like `keys.toggle_sidebar`, the runtime choice is saved per client and survives a restart; the next edit of `show` replaces it.
 
 Override the complete Agent layout for a known agent under `rows_by_agent`:
 

@@ -19,6 +19,14 @@ impl ClientShellState {
                 outcome.resize = true;
                 self.persist_chrome_preferences(outcome);
             }
+            crate::input::KeybindMatch::Action(
+                crate::input::KeybindAction::ToggleSidebarAgents,
+            ) => {
+                self.sidebar_agents_visible = !self.sidebar_agents_visible;
+                self.sidebar_agents_visible_manual = true;
+                outcome.repaint = true;
+                self.persist_chrome_preferences(outcome);
+            }
             crate::input::KeybindMatch::Action(action) => {
                 if self.workspace_preview_action_blocked()
                     && matches!(

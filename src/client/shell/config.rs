@@ -56,6 +56,9 @@ impl ClientShellState {
             sidebar_collapsed: self
                 .sidebar_collapsed_manual
                 .then_some(self.sidebar_collapsed),
+            sidebar_agents_visible: self
+                .sidebar_agents_visible_manual
+                .then_some(self.sidebar_agents_visible),
             agent_panel_sort: self
                 .agent_panel_sort_manual
                 .then_some(self.config.agent_panel_sort),
@@ -72,6 +75,7 @@ impl ClientShellState {
         match crate::config::load_live_config() {
             Ok(loaded) => {
                 let agent_panel_sort = self.config.agent_panel_sort;
+                let show_agents = self.config.agents.show;
                 let diagnostics = self.config.apply_live_config(
                     &loaded.config,
                     &loaded.diagnostics,
@@ -88,6 +92,13 @@ impl ClientShellState {
                 }
                 if self.agent_panel_sort_manual {
                     self.config.agent_panel_sort = agent_panel_sort;
+                }
+                if self.config.agents.show != show_agents {
+                    // An edited `ui.sidebar.agents.show` wins over a stored runtime toggle.
+                    self.sidebar_agents_visible = self.config.agents.show;
+                    if std::mem::take(&mut self.sidebar_agents_visible_manual) {
+                        self.persist_chrome_preferences(&mut ClientShellInput::default());
+                    }
                 }
                 self.set_local_config_diagnostic(self.config.local_config_diagnostic(&diagnostics));
                 if let Some(snapshot) = self.snapshot.as_deref() {

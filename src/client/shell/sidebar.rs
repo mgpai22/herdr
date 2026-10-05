@@ -26,12 +26,13 @@ pub(in crate::client::shell) fn workspace_active_background(
 
 pub(in crate::client::shell) fn collapsed_sidebar_sections(
     area: Rect,
+    show_agents: bool,
 ) -> (Rect, Option<u16>, Rect) {
     let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
     if content.is_empty() {
         return (Rect::default(), None, Rect::default());
     }
-    if content.height < 7 {
+    if !show_agents || content.height < 7 {
         return (content, None, Rect::default());
     }
     let workspace_height = content.height.div_ceil(2);
@@ -50,13 +51,14 @@ pub(crate) fn render_collapsed_sidebar(
     snapshot: &ClientShellSnapshot,
     config: &ClientShellConfig,
     selected_workspace_id: Option<&str>,
+    show_agents: bool,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
     let selection_background = workspace_selection_background(palette);
     let active_background = workspace_active_background(palette, selected_workspace_id.is_some());
     render_sidebar_background(buffer, area, palette);
-    let (workspace_area, divider_y, detail_area) = collapsed_sidebar_sections(area);
+    let (workspace_area, divider_y, detail_area) = collapsed_sidebar_sections(area, show_agents);
     for (index, workspace) in snapshot
         .workspaces
         .iter()

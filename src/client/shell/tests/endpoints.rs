@@ -2591,3 +2591,27 @@ fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
         }] if activated == &endpoint_id && workspace_id == "ws_1"
     ));
 }
+
+#[test]
+fn machine_sidebar_hides_agents_section_like_the_local_sidebar() {
+    let (mut state, _) = state_with_remote();
+    state.compose(100, 28).expect("machine sidebar with agents");
+    assert_ne!(state.hits.sidebar_section_divider, Rect::default());
+    assert_ne!(state.hits.agent_body, Rect::default());
+    let shown_body = state.hits.workspace_body.height;
+
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebarAgents),
+        &mut ClientShellInput::default(),
+    );
+    let frame = state
+        .compose(100, 28)
+        .expect("machine sidebar without agents");
+    let text = frame_rows(&frame).join("\n");
+    assert!(text.contains(" machines"));
+    assert!(!text.contains(" agents"));
+    assert_eq!(state.hits.sidebar_section_divider, Rect::default());
+    assert_eq!(state.hits.agent_body, Rect::default());
+    assert!(state.hits.endpoint_agents.is_empty());
+    assert!(state.hits.workspace_body.height > shown_body);
+}

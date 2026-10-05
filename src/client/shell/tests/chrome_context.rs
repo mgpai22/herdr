@@ -523,3 +523,124 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close(
             if params.workspace_id == "ws_1" && params.close_group
     ));
 }
+
+fn sidebar_text(frame: &crate::protocol::FrameData, width: u16) -> String {
+    frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .take(width as usize)
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn hidden_agents_section_gives_spaces_the_full_sidebar() {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.show = false;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 30).expect("sidebar without agents");
+
+    assert!(!sidebar_text(&frame, state.sidebar_width).contains(" agents"));
+    assert_eq!(state.hits.sidebar_section_divider, Rect::default());
+    assert_eq!(state.hits.agent_body, Rect::default());
+    assert_eq!(state.hits.agent_sort_toggle, Rect::default());
+    // Only the spaces header, the footer and the collapse-toggle row stay outside the list.
+    assert_eq!(
+        state.hits.workspace_body.height,
+        30 - WORKSPACE_HEADER_ROWS - 2
+    );
+    assert!(state.hits.new_workspace.bottom() <= state.hits.sidebar_toggle.y);
+
+    // Dragging where the divider sits when shown must not move the hidden split.
+    let split = state.sidebar_section_split;
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+    ] {
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 2,
+            row: if matches!(kind, MouseEventKind::Down(_)) {
+                15
+            } else {
+                25
+            },
+            modifiers: KeyModifiers::empty(),
+        })]);
+    }
+    assert_eq!(state.sidebar_section_split, split);
+    assert!(!state.sidebar_section_split_manual);
+}
+
+#[test]
+fn toggle_sidebar_agents_action_flips_the_section() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 30).expect("default sidebar");
+    assert!(sidebar_text(&frame, state.sidebar_width).contains(" agents"));
+    assert_ne!(state.hits.sidebar_section_divider, Rect::default());
+
+    for visible in [false, true] {
+        let mut outcome = ClientShellInput::default();
+        state.record_binding(
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebarAgents),
+            &mut outcome,
+        );
+        assert!(outcome.repaint);
+        assert!(state.sidebar_agents_visible_manual);
+        let frame = state.compose(106, 30).expect("toggled sidebar");
+        assert_eq!(
+            sidebar_text(&frame, state.sidebar_width).contains(" agents"),
+            visible
+        );
+        assert_eq!(
+            state.hits.sidebar_section_divider == Rect::default(),
+            !visible
+        );
+    }
+}
+
+#[test]
+fn config_reload_applies_agents_visibility_over_a_runtime_toggle() {
+    let _guard = crate::config::test_config_env_lock().lock().unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "herdr-sidebar-agents-reload-{}.toml",
+        std::process::id()
+    ));
+    std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+
+    std::fs::write(&path, "[ui.sidebar.agents]\nshow = false\n").unwrap();
+    state.reload_client_config();
+    assert!(!state.sidebar_agents_visible);
+    let frame = state.compose(106, 30).expect("reloaded hidden");
+    assert!(!sidebar_text(&frame, state.sidebar_width).contains(" agents"));
+
+    // A runtime toggle holds until the config value changes again.
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebarAgents),
+        &mut ClientShellInput::default(),
+    );
+    state.reload_client_config();
+    assert!(state.sidebar_agents_visible);
+
+    std::fs::write(&path, "[ui.sidebar.agents]\nshow = true\n").unwrap();
+    state.reload_client_config();
+    std::fs::write(&path, "[ui.sidebar.agents]\nshow = false\n").unwrap();
+    state.reload_client_config();
+    assert!(!state.sidebar_agents_visible);
+    assert!(!state.sidebar_agents_visible_manual);
+
+    std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+    let _ = std::fs::remove_file(path);
+}
