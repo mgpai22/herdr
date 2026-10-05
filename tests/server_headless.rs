@@ -438,6 +438,86 @@ fn server_persists_after_client_disconnect() {
     cleanup_spawned_herdr(spawned, base);
 }
 
+#[cfg(target_os = "linux")]
+fn set_nproc_soft_limit(pid: libc::pid_t, soft: libc::rlim_t) -> libc::rlim_t {
+    let mut old = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::prlimit(pid, libc::RLIMIT_NPROC, std::ptr::null(), &mut old) },
+        0,
+        "read server RLIMIT_NPROC: {}",
+        std::io::Error::last_os_error()
+    );
+    let new = libc::rlimit {
+        rlim_cur: soft,
+        rlim_max: old.rlim_max,
+    };
+    assert_eq!(
+        unsafe { libc::prlimit(pid, libc::RLIMIT_NPROC, &new, std::ptr::null_mut()) },
+        0,
+        "set server RLIMIT_NPROC: {}",
+        std::io::Error::last_os_error()
+    );
+    old.rlim_cur
+}
+
+/// A client that connects while the server cannot start threads gets a close,
+/// and the server keeps running. `std::thread::spawn` on the main loop used to
+/// panic the server, which closed every pane.
+#[cfg(target_os = "linux")]
+#[test]
+fn client_connect_during_thread_spawn_failure_keeps_server_running() {
+    let _lock = test_lock();
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores RLIMIT_NPROC");
+        return;
+    }
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_file(&client_socket, Duration::from_secs(10));
+    let pid = spawned.child.process_id().expect("server pid") as libc::pid_t;
+
+    // This user already runs more than one process, so every clone in the
+    // server fails with EAGAIN.
+    let old_soft = set_nproc_soft_limit(pid, 1);
+    let mut stream = UnixStream::connect(&client_socket).expect("connect client socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let closed = match stream.read(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(err) => err.kind() == std::io::ErrorKind::ConnectionReset,
+    };
+    set_nproc_soft_limit(pid, old_soft);
+    assert!(
+        closed,
+        "the server should drop the connection it cannot serve"
+    );
+
+    assert!(
+        spawned.child.try_wait().unwrap().is_none(),
+        "server exited after a failed thread spawn"
+    );
+    let response = ping_socket(&api_socket);
+    assert!(response.contains("pong"), "API after recovery: {response}");
+    let mut stream = UnixStream::connect(&client_socket).expect("reconnect client socket");
+    let (_, error) =
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake after recovery");
+    assert!(error.is_none(), "handshake error: {error:?}");
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
 #[test]
 fn duplicate_server_start_fails_gracefully() {
     let _lock = test_lock();

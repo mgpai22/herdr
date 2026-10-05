@@ -21,6 +21,8 @@ use tracing::{error, info, warn};
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
+#[cfg(unix)]
+use crate::pty::actor::ForegroundGroupReader;
 use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
 use crate::render_signal::RenderSignal;
 
@@ -759,6 +761,15 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
+/// Reads the kernel foreground group from the PTY master without a `/proc`
+/// read; falls back to the shell's `tpgid` when the PTY is gone or unset.
+#[cfg(unix)]
+fn observe_foreground_pgid(reader: Option<&ForegroundGroupReader>, pid: u32) -> Option<u32> {
+    reader
+        .and_then(ForegroundGroupReader::read)
+        .or_else(|| crate::detect::foreground_process_group_id(pid))
+}
+
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
@@ -767,6 +778,7 @@ fn spawn_basic_detection_task(
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     state_events: mpsc::Sender<AppEvent>,
+    foreground_group: Option<ForegroundGroupReader>,
 ) -> (
     tokio::task::AbortHandle,
     Arc<Notify>,
@@ -846,7 +858,7 @@ fn spawn_basic_detection_task(
             let lifecycle_authority_active =
                 full_lifecycle_authority_active.load(Ordering::Acquire);
             let foreground_pgid = (pid > 0)
-                .then(|| crate::detect::foreground_process_group_id(pid))
+                .then(|| observe_foreground_pgid(foreground_group.as_ref(), pid))
                 .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
@@ -1369,6 +1381,15 @@ impl PaneRuntimeIo {
     fn foreground_process_group_id(&self) -> Option<u32> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.foreground_process_group_id(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn foreground_group_reader(&self) -> Option<ForegroundGroupReader> {
+        match self {
+            PaneRuntimeIo::Actor(actor) => Some(actor.foreground_group_reader()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => None,
         }
@@ -2470,6 +2491,7 @@ impl PaneRuntime {
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
             events,
+            io.foreground_group_reader(),
         );
 
         Ok(Self {
@@ -2657,6 +2679,7 @@ impl PaneRuntime {
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
             == AgentDetection::Enabled
         {
+            #[cfg(not(unix))]
             use crate::detect;
             use std::time::{Duration, Instant};
 
@@ -2675,6 +2698,8 @@ impl PaneRuntime {
             let detect_reset = detect_reset_notify.clone();
             let pending_release = Arc::new(Mutex::new(None));
             let pending_release_for_task = pending_release.clone();
+            #[cfg(unix)]
+            let foreground_group = io.foreground_group_reader();
 
             let handle = tokio::spawn(async move {
                 let mut agent_presence =
@@ -2786,6 +2811,9 @@ impl PaneRuntime {
                     let foreground_observation_due = true;
                     let foreground_pgid = match (pid, foreground_observation_due) {
                         (0, _) => None,
+                        #[cfg(unix)]
+                        (_, true) => observe_foreground_pgid(foreground_group.as_ref(), pid),
+                        #[cfg(not(unix))]
                         (_, true) => detect::foreground_process_group_id(pid),
                         _ => last_foreground_pgid,
                     };
@@ -3632,7 +3660,6 @@ impl PaneRuntime {
         #[cfg(unix)]
         {
             let pid = self.child_pid.load(Ordering::Acquire);
-            let shell_cwd = absolute_process_cwd(pid);
             let foreground_pgid = self
                 .io
                 .foreground_process_group_id()
@@ -3643,8 +3670,9 @@ impl PaneRuntime {
             // process that chdirs elsewhere inside the same foreground group
             // must not override it. Scan other members only when the leader's
             // cwd cannot be read at all.
-            leader_cwd
-                .or_else(|| foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()))
+            leader_cwd.or_else(|| {
+                foreground_member_cwd_different_from_shell(pid, absolute_process_cwd(pid).as_ref())
+            })
         }
 
         #[cfg(not(unix))]
@@ -3690,6 +3718,13 @@ impl PaneRuntime {
 
     pub(crate) fn test_with_screen_bytes(cols: u16, rows: u16, bytes: &[u8]) -> Self {
         Self::test_with_scrollback_bytes(cols, rows, 0, bytes)
+    }
+
+    pub(crate) fn test_scroll_metrics_reads(&self) -> usize {
+        self.terminal
+            .ghostty
+            .scroll_metrics_reads
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn test_contend_during_dirty_collection(

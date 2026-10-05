@@ -44,12 +44,6 @@ pub(crate) fn spawn_with_portable_pty(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn pty_fd_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn parent_pty_fd_targets() -> Vec<String> {
         let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
@@ -71,7 +65,7 @@ mod tests {
 
     #[test]
     fn portable_pty_setup_leaves_one_parent_pty_fd() {
-        let _guard = pty_fd_test_lock().lock().expect("pty fd test lock");
+        let _guard = crate::pty::fd::pty_fd_test_lock();
         let before = parent_pty_fd_count();
         let mut cmd = CommandBuilder::new("/bin/cat");
         cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);

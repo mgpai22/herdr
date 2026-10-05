@@ -337,6 +337,48 @@ pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Resul
     Ok(())
 }
 
+/// Starts one thread per accepted connection without risking the accepting
+/// thread. `std::thread::spawn` panics when `clone` fails (RLIMIT_NPROC,
+/// memory pressure); here a failed spawn drops the closure and the stream it
+/// owns, so the client sees a close and can retry. Logs once per run of
+/// failures and once on recovery.
+pub(crate) struct ConnectionThreads {
+    listener: &'static str,
+    failing: bool,
+}
+
+impl ConnectionThreads {
+    pub(crate) const fn new(listener: &'static str) -> Self {
+        Self {
+            listener,
+            failing: false,
+        }
+    }
+
+    pub(crate) fn spawn(&mut self, connection: impl FnOnce() + Send + 'static) {
+        match std::thread::Builder::new().spawn(connection) {
+            Ok(_) if self.failing => {
+                tracing::info!(
+                    listener = self.listener,
+                    "connection thread spawn recovered"
+                );
+                self.failing = false;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                if !self.failing {
+                    tracing::error!(
+                        listener = self.listener,
+                        err = %err,
+                        "connection thread spawn failed; dropping connections"
+                    );
+                    self.failing = true;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

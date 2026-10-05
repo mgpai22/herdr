@@ -5,13 +5,14 @@ use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-use crate::ipc::LocalListener;
+use crate::ipc::{ConnectionThreads, LocalListener};
 use crate::server::client_transport::{self, ServerEvent};
 
 /// Accepts pending thin-client connections and starts their handshake readers.
 pub(crate) fn accept_pending_client_connections(
     listener: &LocalListener,
     next_client_id: &mut u64,
+    handshake_threads: &mut ConnectionThreads,
     should_quit: &Arc<AtomicBool>,
     server_event_tx: &mpsc::Sender<ServerEvent>,
 ) -> io::Result<()> {
@@ -31,7 +32,7 @@ pub(crate) fn accept_pending_client_connections(
 
                 let should_quit = should_quit.clone();
                 let server_event_tx = server_event_tx.clone();
-                std::thread::spawn(move || {
+                handshake_threads.spawn(move || {
                     if let Err(err) = client_transport::handle_client_handshake(
                         stream,
                         client_id,
