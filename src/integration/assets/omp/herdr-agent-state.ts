@@ -6,6 +6,7 @@
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
+import { writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 
@@ -1268,6 +1269,20 @@ export default function (pi) {
     return isSessionSubagent(ref, sessionStem()) ? ref : undefined;
   }
 
+  // Where a subagent's transcript is now when its ref still holds a path under an earlier stem of
+  // this session: OMP's move renamed the directory, so the same relative path under the current
+  // stem. Undefined for a ref under the current stem.
+  function movedTranscript(ref: { sessionFile?: unknown }): string | undefined {
+    const stem = sessionStem();
+    const file = ref.sessionFile;
+    if (stem === undefined || typeof file !== "string") return undefined;
+    const under = (dir: string) =>
+      file.length > dir.length + 1 && file.startsWith(dir) && (file[dir.length] === "/" || file[dir.length] === "\\");
+    if (under(stem)) return undefined;
+    const old = movedSessionStems.findLast(under);
+    return old === undefined ? undefined : stem + file.slice(old.length);
+  }
+
   // The root session's subagents, running first (newest first), then the rest by last activity.
   function subagentRoster(): { total: number; running: number; items: Record<string, unknown>[] } | undefined {
     const registry = agentRegistry();
@@ -1973,6 +1988,9 @@ export default function (pi) {
       }
       const changed = stillOwned();
       if (changed) return finish({ ok: false, error: changed });
+      // OMP's release writes the tombstone at the ref's path, which a `/move` or `/wt` left stale:
+      // herdr writes it where the transcript is now. Mapped before the release can await.
+      const moved = movedTranscript(ref);
       // Release first: it marks the ref aborted at once, which the task executor turns into the
       // task's abort; a bare abort would only end the subagent's turn.
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1986,15 +2004,32 @@ export default function (pi) {
         }),
       ]);
       clearTimeout(timer);
-      if (!result) return finish({ ok: true, data: { subagent_id: id, cancelled: true, settled: false } });
+      // Release makes the ref terminal before its first await, so a ref still registered, aborted
+      // and detached was cancelled even when the release rejects afterwards (its tombstone write).
+      const aborted = registry.get(id) === ref && ref.status === "aborted" && !ref.session;
+      // OMP's kill marker (`persistAgentTombstone`): an empty `<transcript>.tombstone`, which OMP's
+      // scan after a restart reads as `aborted`, not `parked`.
+      let persisted = true;
+      if (moved !== undefined && aborted) {
+        persisted = await writeFile(`${moved}.tombstone`, "", { encoding: "utf8", flag: "wx", mode: 0o600 }).then(
+          () => true,
+          (error: NodeJS.ErrnoException) => error?.code === "EEXIST",
+        );
+      }
+      const done = (fields: Record<string, unknown>) =>
+        finish({ ok: true, data: { subagent_id: id, cancelled: true, ...fields, ...(persisted ? {} : { persisted }) } });
+      if (!result) return done({ settled: false });
       const [released] = result;
       if (released.status === "rejected") {
-        return finish({ ok: false, error: `failed: ${cap(released.reason?.message ?? released.reason, 200)}` });
+        if (!aborted) return finish({ ok: false, error: `failed: ${cap(released.reason?.message ?? released.reason, 200)}` });
+        // OMP's own tombstone failed; herdr's at the moved path counts when there was one.
+        if (moved === undefined) persisted = false;
+        return done({});
       }
       if (released.value !== true) {
         return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
       }
-      return finish({ ok: true, data: { subagent_id: id, cancelled: true } });
+      return done({});
     })();
     return rest;
   }

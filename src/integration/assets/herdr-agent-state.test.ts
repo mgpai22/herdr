@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, expect, mock, setSystemTime, test } from "bun:test";
-import { rm } from "node:fs/promises";
+import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3204,11 +3204,14 @@ test("Oh My Pi keeps listing and acting on the session's subagents after a move"
   const ref: any = subRef("Nb", {
     session: { isStreaming: true, sendUserMessage: async (...args: unknown[]) => void sent.push(args) },
   });
-  const { registry, pi } = fakeRegistry([ref]);
+  // A subagent's own subagent sits one directory deeper.
+  const kid: any = subRef("Nb.Kid", { sessionFile: "/tmp/omp-instruct/Nb/Nb.Kid.jsonl" });
+  const { registry, pi } = fakeRegistry([ref, kid]);
   const omp = await installOmpForActions("omp-subagent-moved", { pi });
   delete process.env.HERDR_OMP_MOVE_WATCH_MS;
   let file = "/tmp/omp-instruct.jsonl";
-  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+  let id = "omp-instruct";
+  omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => id } as never;
   // A person's /move: OMP renames the session file and its transcript directory, while its
   // registry keeps each subagent's old path.
   file = "/tmp/moved-roster/omp-instruct.jsonl";
@@ -3217,8 +3220,65 @@ test("Oh My Pi keeps listing and acting on the session's subagents after a move"
     3_000,
   );
   registry.changed();
-  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.id === "Nb", 3_000);
-  const steer = (await omp.act({ op: "subagent_steer", args: { subagent_id: "Nb", text: "[sahur] still there", expected_run: 1 } })).ack;
-  expect(steer.ok).toBe(true);
+  const ids = () => (omp.details().at(-1)?.subagents?.items ?? []).map((item: { id: string }) => item.id).sort();
+  await waitFor(() => ids().join() === "Nb,Nb.Kid", 3_000);
+  const steer = async () =>
+    (await omp.act({ op: "subagent_steer", args: { subagent_id: "Nb", text: "[sahur] still there", expected_run: 1 } })).ack;
+  expect((await steer()).ok).toBe(true);
   expect(sent).toHaveLength(1);
+  // Another session (a /resume): the earlier stems were this conversation's, not the new one's.
+  id = "omp-other";
+  file = "/tmp/omp-other.jsonl";
+  await omp.harness.handlers.get("session_switch")?.({ reason: "resume" }, omp.harness.context);
+  registry.changed();
+  await waitFor(() => ids().length === 0, 3_000);
+  expect((await steer()).error).toBe("no_subagent: Nb is not a subagent of this session");
+  expect(sent).toHaveLength(1);
+});
+
+test("Oh My Pi cancels a moved subagent and writes its tombstone next to the moved transcript", async () => {
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "50";
+  const dir = join(tmpdir(), `omp-move-cancel-${process.pid}-${Date.now()}`);
+  const nest = `gone-${process.pid}`;
+  const calls: string[] = [];
+  const session = () => ({ isStreaming: true, abort: async () => void calls.push("abort") });
+  // A nested ref under the harness's session stem before the move (`/tmp/omp-instruct`), in a
+  // directory that does not exist: the move renamed it.
+  const moved: any = subRef("Mc", { session: session(), sessionFile: join("/tmp/omp-instruct", nest, "Mc.jsonl") });
+  const here: any = subRef("Hc", { session: session(), sessionFile: join(dir, "new", "missing", "Hc.jsonl") });
+  const { pi } = fakeRegistry([moved, here]);
+  // OMP 18.4.4's release with a tombstone: terminal first, then the sidecar at the ref's path,
+  // which rejects when that directory is gone.
+  lifecycle.manager = {
+    release: async (_id: string, ref: { id: string; status: string; session: unknown; sessionFile: string }) => {
+      calls.push(`release ${ref.id}`);
+      ref.status = "aborted";
+      ref.session = null;
+      await writeFile(`${ref.sessionFile}.tombstone`, "", { flag: "wx" });
+      return true;
+    },
+  };
+  try {
+    await mkdir(join(dir, "new", nest), { recursive: true });
+    const omp = await installOmpForActions("omp-subagent-moved-cancel", { pi });
+    delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+    let file = "/tmp/omp-instruct.jsonl";
+    omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+    file = join(dir, "new.jsonl");
+    await waitFor(
+      () => omp.harness.requests.some((request) => isRecord(request) && (request as any).params?.agent_session_path === file),
+      3_000,
+    );
+    const cancel = async (id: string) =>
+      (await omp.act({ op: "subagent_cancel", args: { subagent_id: id, expected_run: 1 } })).ack;
+    // OMP's write fails (the old directory is gone), but the subagent was cancelled, and herdr
+    // wrote the tombstone where OMP's scan finds it after a restart.
+    expect((await cancel("Mc")).data).toEqual({ subagent_id: "Mc", cancelled: true });
+    await access(join(dir, "new", nest, "Mc.jsonl.tombstone"));
+    // A ref under the current stem whose tombstone write fails: cancelled, not persisted.
+    expect((await cancel("Hc")).data).toEqual({ subagent_id: "Hc", cancelled: true, persisted: false });
+    expect(calls).toEqual(["release Mc", "abort", "release Hc", "abort"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
