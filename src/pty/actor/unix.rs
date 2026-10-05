@@ -18,6 +18,7 @@ use crate::pty::fd;
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const READ_BUFFER_LEN: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -449,6 +450,7 @@ impl PtyIoActor {
             on_reader_exit: config.on_reader_exit,
             poll_observer,
             foreground_group,
+            read_buf: vec![0; READ_BUFFER_LEN].into_boxed_slice(),
         };
         std::thread::Builder::new()
             .name(format!("herdr-pty-{}", config.pane_id))
@@ -483,6 +485,7 @@ struct PtyIoActorRunner {
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
     foreground_group: ForegroundGroupReader,
+    read_buf: Box<[u8]>,
     poll_observer: Option<std_mpsc::Sender<()>>,
 }
 
@@ -843,39 +846,50 @@ impl PtyIoActorRunner {
         self.enqueue_terminal_responses(terminal_responses);
     }
 
+    /// Reads until the PTY has no more data or the buffer is full, then hands the
+    /// whole batch to `on_read` once. Bytes read before EOF or an error are
+    /// delivered before the actor reports the PTY closed.
     fn read_once(&mut self) -> bool {
-        let mut buf = [0u8; 8192];
-        match self.file.read(&mut buf) {
-            Ok(0) => false,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
-            Err(err) => {
-                debug!(pane = self.pane_id, err = %err, "PTY actor read failed");
-                false
+        let mut filled = 0;
+        let open = loop {
+            match self.file.read(&mut self.read_buf[filled..]) {
+                Ok(0) => break false,
+                Ok(n) => {
+                    filled += n;
+                    if filled == self.read_buf.len() {
+                        break true;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break true,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    debug!(pane = self.pane_id, err = %err, "PTY actor read failed");
+                    break false;
+                }
             }
-            Ok(n) => {
-                let response_order = Arc::clone(&self.response_order);
-                let _order = response_order
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let result = (self.on_read)(&buf[..n]);
-                self.controls
+        };
+        if filled > 0 {
+            let response_order = Arc::clone(&self.response_order);
+            let _order = response_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let result = (self.on_read)(&self.read_buf[..filled]);
+            self.controls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .terminal_responses
+                .extend(result.terminal_responses);
+            drop(_order);
+            let terminal_responses = std::mem::take(
+                &mut self
+                    .controls
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .terminal_responses
-                    .extend(result.terminal_responses);
-                drop(_order);
-                let terminal_responses = std::mem::take(
-                    &mut self
-                        .controls
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .terminal_responses,
-                );
-                self.enqueue_terminal_responses(terminal_responses);
-                true
-            }
+                    .terminal_responses,
+            );
+            self.enqueue_terminal_responses(terminal_responses);
         }
+        open
     }
 
     fn enqueue_terminal_responses(&mut self, terminal_responses: Vec<Bytes>) {
@@ -1143,6 +1157,7 @@ mod tests {
             on_reader_exit: None,
             poll_observer: None,
             foreground_group: ForegroundGroupReader(Arc::default()),
+            read_buf: vec![0; READ_BUFFER_LEN].into_boxed_slice(),
         };
         (runner, peer)
     }
@@ -1154,6 +1169,39 @@ mod tests {
         assert!(!runner.handle_data_command(PtyIoDataCommand::WriteUserInput(Bytes::new())));
 
         assert!(runner.pending_writes.is_empty());
+    }
+
+    fn record_reads(runner: &mut PtyIoActorRunner) -> std_mpsc::Receiver<usize> {
+        let (tx, rx) = std_mpsc::channel();
+        runner.on_read = Box::new(move |bytes| {
+            tx.send(bytes.len()).expect("read receiver alive");
+            PtyReadResult::empty()
+        });
+        rx
+    }
+
+    #[test]
+    fn read_once_hands_pending_output_to_one_callback() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let reads = record_reads(&mut runner);
+        peer.write_all(&[b'x'; 20_000]).expect("peer write");
+
+        assert!(runner.read_once());
+
+        assert_eq!(reads.try_iter().collect::<Vec<_>>(), vec![20_000]);
+    }
+
+    #[test]
+    fn read_once_delivers_output_before_reporting_eof() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let reads = record_reads(&mut runner);
+        peer.write_all(b"last words").expect("peer write");
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("peer close");
+
+        assert!(!runner.read_once(), "EOF ends the actor");
+
+        assert_eq!(reads.try_iter().collect::<Vec<_>>(), vec![10]);
     }
 
     #[test]
@@ -1778,6 +1826,7 @@ mod tests {
             on_reader_exit: None,
             poll_observer: None,
             foreground_group: ForegroundGroupReader(Arc::default()),
+            read_buf: vec![0; READ_BUFFER_LEN].into_boxed_slice(),
         };
         let handle = PtyIoActorHandle {
             data_tx,
@@ -1908,6 +1957,7 @@ mod tests {
             on_reader_exit: None,
             poll_observer: None,
             foreground_group: ForegroundGroupReader(Arc::default()),
+            read_buf: vec![0; READ_BUFFER_LEN].into_boxed_slice(),
         };
 
         runner.begin_handoff().expect("handoff drains queued write");
