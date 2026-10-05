@@ -2622,12 +2622,18 @@ test("Oh My Pi keeps a move report retrying when an older report fails after the
 }, 30_000);
 
 // OMP's registry and lifecycle modules as an extension imports them. `lifecycle.manager` is what
-// `AgentLifecycleManager.global()` returns in the test that runs.
+// `AgentLifecycleManager.global()` returns in the test that runs; `lifecycle.loads` counts reads of
+// `global`, which the extension makes once its import of the module resolved.
 class FakeAgentRegistry {}
-const lifecycle: { manager: any } = { manager: undefined };
+const lifecycle: { manager: any; loads: number } = { manager: undefined, loads: 0 };
 mock.module("@oh-my-pi/pi-coding-agent/registry/agent-registry", () => ({ AgentRegistry: FakeAgentRegistry }));
 mock.module("@oh-my-pi/pi-coding-agent/registry/agent-lifecycle", () => ({
-  AgentLifecycleManager: { global: () => lifecycle.manager },
+  AgentLifecycleManager: {
+    get global() {
+      lifecycle.loads += 1;
+      return () => lifecycle.manager;
+    },
+  },
 }));
 // OMP's scan of a session's earlier subagent transcripts; `persisted.scan` runs in the test.
 const persisted: { scan: (registry: any, sessionFile: string) => Promise<void> } = { scan: async () => {} };
@@ -3088,8 +3094,11 @@ test("Oh My Pi starts a new run when a subagent whose run OMP finished without a
       return true;
     },
   };
+  const loads = lifecycle.loads;
   const omp = await installOmpForActions("omp-subagent-failed-wake", { pi });
   await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.run === 1);
+  // Run counting asks OMP's lifecycle manager, which the activation loads without waiting.
+  await waitFor(() => lifecycle.loads > loads, 3_000);
   // A provider error ends the run without a result; OMP's executor keeps the subagent alive.
   ref.status = "idle";
   registry.changed();
@@ -3146,7 +3155,12 @@ test("Oh My Pi keeps a person's chat protected across a retry turn of a finished
       return true;
     },
   };
+  const loads = lifecycle.loads;
   const omp = await installOmpForActions("omp-subagent-person-retry", { pi });
+  // The finished subagent as the activation saw it, and OMP's lifecycle manager, which run
+  // counting asks and the activation loads without waiting: both before the person's chat.
+  await waitFor(() => omp.details().at(-1)?.subagents?.items?.[0]?.status === "idle", 3_000);
+  await waitFor(() => lifecycle.loads > loads, 3_000);
   const sub = { hasUI: false, agent: { kind: "sub", id: "K1", name: "task", depth: 1 } };
   // The person chats with the finished subagent.
   ref.status = "running";
@@ -3335,5 +3349,41 @@ test("Oh My Pi writes a moved subagent's tombstone when OMP's release ends after
     await waitFor(() => existsSync(join(dir, "new", nest, "Lc.jsonl.tombstone")), 3_000);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("Oh My Pi keeps a known missing tombstone when only the subagent's abort outlasts the cancel wait", async () => {
+  // The abort waits for the turn to stop (a tool that ignores it); the release ended at once, and
+  // its tombstone write failed (the transcript's directory is gone).
+  let stopped = () => {};
+  const turn = new Promise<void>((resolve) => (stopped = resolve));
+  const ref: any = subRef("Sa", {
+    session: { isStreaming: true, abort: () => turn },
+    sessionFile: join("/tmp/omp-instruct", `slow-abort-${process.pid}`, "Sa.jsonl"),
+  });
+  const { pi } = fakeRegistry([ref]);
+  lifecycle.manager = {
+    release: async (_id: string, released: { status: string; session: unknown; sessionFile: string }) => {
+      released.status = "aborted";
+      released.session = null;
+      await writeFile(`${released.sessionFile}.tombstone`, "", { flag: "wx" });
+      return true;
+    },
+  };
+  try {
+    const omp = await installOmpForActions("omp-subagent-slow-abort", { pi });
+    const actionId = "e".repeat(32);
+    expect(omp.listener(actionBlock(actionId, { op: "subagent_cancel", args: { subagent_id: "Sa", expected_run: 1 } }))).toEqual({
+      consume: true,
+    });
+    // The ack comes after the 5 s cancel wait.
+    expect((await omp.finalAck(actionId, 8_000)).data).toEqual({
+      subagent_id: "Sa",
+      cancelled: true,
+      settled: false,
+      persisted: false,
+    });
+  } finally {
+    stopped();
   }
 }, 20_000);

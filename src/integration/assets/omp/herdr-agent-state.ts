@@ -1995,25 +1995,30 @@ export default function (pi) {
       // task's abort; a bare abort would only end the subagent's turn.
       const releasing = Promise.resolve().then(() => manager.global().release(id, ref, { tombstone: true }));
       // Once the release ends (also after the wait below gave up): whether it cancelled the ref, and
-      // whether herdr's tombstone went down (undefined: not tried). Release makes the ref terminal
-      // before its first await, so a ref still registered, aborted and detached was cancelled even
-      // when the release rejects afterwards (its own tombstone write).
+      // whether a tombstone is next to the transcript. Release makes the ref terminal before its
+      // first await, so a ref still registered, aborted and detached was cancelled even when the
+      // release rejects afterwards (its own tombstone write).
+      let known: { aborted: boolean; persisted: boolean } | undefined;
       const afterRelease = releasing.then(
-        () => {},
-        () => {},
-      ).then(async () => {
+        () => false,
+        () => true,
+      ).then(async (rejected) => {
         const aborted = registry.get(id) === ref && ref.status === "aborted" && !ref.session;
-        if (!aborted || moved === undefined) return { aborted, wrote: undefined };
+        // A rejected release lost OMP's own tombstone; a fulfilled one wrote it at the ref's path.
+        let persisted = !rejected;
         // Only next to a transcript that is there: a subagent from before the move still puts the
         // subagents it spawns after it under the old stem, where OMP's own tombstone is right.
-        if (!(await access(moved).then(() => true, () => false))) return { aborted, wrote: undefined };
-        // OMP's kill marker (`persistAgentTombstone`): an empty `<transcript>.tombstone`, which
-        // OMP's scan after a restart reads as `aborted`, not `parked`.
-        const wrote = await writeFile(`${moved}.tombstone`, "", { encoding: "utf8", flag: "wx", mode: 0o600 }).then(
-          () => true,
-          (error: NodeJS.ErrnoException) => error?.code === "EEXIST",
-        );
-        return { aborted, wrote };
+        if (aborted && moved !== undefined && (await access(moved).then(() => true, () => false))) {
+          // OMP's kill marker (`persistAgentTombstone`): an empty `<transcript>.tombstone`, which
+          // OMP's scan after a restart reads as `aborted`, not `parked`. Herdr's write replaces
+          // OMP's at the stale path as the one that counts.
+          persisted = await writeFile(`${moved}.tombstone`, "", { encoding: "utf8", flag: "wx", mode: 0o600 }).then(
+            () => true,
+            (error: NodeJS.ErrnoException) => error?.code === "EEXIST",
+          );
+        }
+        known = { aborted, persisted };
+        return known;
       });
       let timer: ReturnType<typeof setTimeout> | undefined;
       const result = await Promise.race([
@@ -2023,21 +2028,21 @@ export default function (pi) {
         }),
       ]);
       clearTimeout(timer);
-      // Not settled: no tombstone is known yet, so nothing is said about it.
-      if (!result) return finish({ ok: true, data: { subagent_id: id, cancelled: true, settled: false } });
+      const done = (persisted: boolean, fields: Record<string, unknown> = {}) =>
+        finish({ ok: true, data: { subagent_id: id, cancelled: true, ...fields, ...(persisted ? {} : { persisted }) } });
+      // Not settled: the release or the subagent's abort is still running. A missing tombstone is
+      // said only when the release has already ended without one.
+      if (!result) return done(!(known?.aborted && !known.persisted), { settled: false });
       const [released] = result;
-      const { aborted, wrote } = await afterRelease;
-      const done = (persisted: boolean) =>
-        finish({ ok: true, data: { subagent_id: id, cancelled: true, ...(persisted ? {} : { persisted }) } });
+      const { aborted, persisted } = await afterRelease;
       if (released.status === "rejected") {
         if (!aborted) return finish({ ok: false, error: `failed: ${cap(released.reason?.message ?? released.reason, 200)}` });
-        // OMP's own tombstone failed; herdr's next to the moved transcript counts.
-        return done(wrote === true);
+        return done(persisted);
       }
       if (released.value !== true) {
         return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
       }
-      return done(wrote !== false);
+      return done(persisted);
     })();
     return rest;
   }
