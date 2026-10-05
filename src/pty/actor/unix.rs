@@ -84,10 +84,33 @@ enum PtyIoDataCommand {
 enum PtyIoControlCommand {
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
-    ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
     RollbackHandoff(std_mpsc::Sender<std::io::Result<()>>),
     ReleaseAfterCommit(std_mpsc::Sender<std::io::Result<()>>),
     Shutdown,
+}
+
+/// Reads the PTY foreground process group on the caller's thread with the
+/// actor's own master fd, so a query never wakes the actor and a pane keeps one
+/// master fd. The fd number is only used under the lock, and the runner clears
+/// it before its `File` closes, so a query can never reach a reused fd number.
+#[derive(Clone)]
+pub(crate) struct ForegroundGroupReader(Arc<Mutex<Option<RawFd>>>);
+
+impl ForegroundGroupReader {
+    pub(crate) fn read(&self) -> Option<u32> {
+        let fd = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::platform::foreground_process_group_id_for_tty_fd((*fd)?)
+    }
+
+    fn close(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
 }
 
 #[derive(Clone)]
@@ -98,6 +121,7 @@ pub(crate) struct PtyIoActorHandle {
     user_writes: Arc<Mutex<UserWriteGate>>,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
+    foreground_group: ForegroundGroupReader,
 }
 
 #[derive(Debug)]
@@ -300,12 +324,11 @@ impl PtyIoActorHandle {
     }
 
     pub(crate) fn foreground_process_group_id(&self) -> Option<u32> {
-        let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.control_tx
-            .send(PtyIoControlCommand::ForegroundProcessGroup(reply_tx))
-            .ok()?;
-        self.wake_actor();
-        reply_rx.recv_timeout(Duration::from_secs(1)).ok()?
+        self.foreground_group.read()
+    }
+
+    pub(crate) fn foreground_group_reader(&self) -> ForegroundGroupReader {
+        self.foreground_group.clone()
     }
 
     pub(crate) fn rollback_handoff(&self) -> std::io::Result<()> {
@@ -393,6 +416,8 @@ impl PtyIoActor {
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
+        let foreground_group =
+            ForegroundGroupReader(Arc::new(Mutex::new(Some(config.master_fd.as_raw_fd()))));
         let handle = PtyIoActorHandle {
             data_tx,
             control_tx,
@@ -400,6 +425,7 @@ impl PtyIoActor {
             user_writes,
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
+            foreground_group: foreground_group.clone(),
         };
 
         let mut runner = PtyIoActorRunner {
@@ -422,6 +448,7 @@ impl PtyIoActor {
             on_read: config.on_read,
             on_reader_exit: config.on_reader_exit,
             poll_observer,
+            foreground_group,
         };
         std::thread::Builder::new()
             .name(format!("herdr-pty-{}", config.pane_id))
@@ -455,7 +482,15 @@ struct PtyIoActorRunner {
     response_order: Arc<Mutex<()>>,
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
+    foreground_group: ForegroundGroupReader,
     poll_observer: Option<std_mpsc::Sender<()>>,
+}
+
+impl Drop for PtyIoActorRunner {
+    // Runs before the fields drop, so the reader forgets the fd before `file` closes.
+    fn drop(&mut self) {
+        self.foreground_group.close();
+    }
 }
 
 struct ActiveSubmission {
@@ -684,11 +719,6 @@ impl PtyIoActorRunner {
                         "PTY actor must be quiesced before handoff duplication",
                     ))
                 };
-                let _ = reply.send(result);
-            }
-            PtyIoControlCommand::ForegroundProcessGroup(reply) => {
-                let result =
-                    crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd());
                 let _ = reply.send(result);
             }
             PtyIoControlCommand::RollbackHandoff(reply) => {
@@ -1112,6 +1142,7 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            foreground_group: ForegroundGroupReader(Arc::default()),
         };
         (runner, peer)
     }
@@ -1540,6 +1571,62 @@ mod tests {
     }
 
     #[test]
+    fn foreground_group_query_does_not_wait_for_busy_actor() {
+        use portable_pty::{CommandBuilder, PtySize};
+        use std::os::fd::BorrowedFd;
+
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open pty");
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "echo ready; exec sleep 30"]);
+        let mut child = pair.slave.spawn_command(command).expect("spawn child");
+        let child_pid = child.process_id().expect("child pid");
+        let master_fd = unsafe { BorrowedFd::borrow_raw(pair.master.as_raw_fd().expect("fd")) }
+            .try_clone_to_owned()
+            .expect("dup master");
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel::<()>();
+        let handle = PtyIoActor::spawn(PtyIoActorConfig {
+            pane_id: 1,
+            master_fd,
+            initially_quiesced: false,
+            on_read: Box::new(move |_| {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                PtyReadResult::empty()
+            }),
+            on_reader_exit: None,
+        })
+        .expect("actor spawn");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("actor is busy in its read callback");
+
+        let start = Instant::now();
+        assert_eq!(handle.foreground_process_group_id(), Some(child_pid));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "foreground query must not wait for the actor thread"
+        );
+
+        drop(release_tx);
+        handle.shutdown();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.foreground_process_group_id().is_some() {
+            assert!(Instant::now() < deadline, "actor exit must stop fd queries");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
     fn begin_handoff_stops_reads_and_rejects_user_writes_until_rollback() {
         let (handle, mut peer, read_rx) = actor_with_socket_pair(false);
 
@@ -1618,6 +1705,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
+            foreground_group: ForegroundGroupReader(Arc::default()),
         };
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
@@ -1689,6 +1777,7 @@ mod tests {
             }),
             on_reader_exit: None,
             poll_observer: None,
+            foreground_group: ForegroundGroupReader(Arc::default()),
         };
         let handle = PtyIoActorHandle {
             data_tx,
@@ -1697,6 +1786,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls,
             response_order,
+            foreground_group: ForegroundGroupReader(Arc::default()),
         };
         let (changed_tx, changed_rx) = std_mpsc::channel();
         let (continue_tx, continue_rx) = std_mpsc::channel();
@@ -1766,6 +1856,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            foreground_group: ForegroundGroupReader(Arc::default()),
         };
 
         let handoff = std::thread::spawn(move || handle.begin_handoff(Duration::from_secs(1)));
@@ -1816,6 +1907,7 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            foreground_group: ForegroundGroupReader(Arc::default()),
         };
 
         runner.begin_handoff().expect("handoff drains queued write");
