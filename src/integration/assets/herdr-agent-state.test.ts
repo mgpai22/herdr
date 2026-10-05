@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, expect, mock, setSystemTime, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -3245,8 +3246,11 @@ test("Oh My Pi cancels a moved subagent and writes its tombstone next to the mov
   // A nested ref under the harness's session stem before the move (`/tmp/omp-instruct`), in a
   // directory that does not exist: the move renamed it.
   const moved: any = subRef("Mc", { session: session(), sessionFile: join("/tmp/omp-instruct", nest, "Mc.jsonl") });
+  // Also under the old stem, but OMP put no transcript at the moved path (a subagent spawned
+  // after the move by one from before it): herdr writes nothing there.
+  const orphan: any = subRef("Oc", { session: session(), sessionFile: join("/tmp/omp-instruct", nest, "Oc.jsonl") });
   const here: any = subRef("Hc", { session: session(), sessionFile: join(dir, "new", "missing", "Hc.jsonl") });
-  const { pi } = fakeRegistry([moved, here]);
+  const { pi } = fakeRegistry([moved, orphan, here]);
   // OMP 18.4.4's release with a tombstone: terminal first, then the sidecar at the ref's path,
   // which rejects when that directory is gone.
   lifecycle.manager = {
@@ -3260,6 +3264,7 @@ test("Oh My Pi cancels a moved subagent and writes its tombstone next to the mov
   };
   try {
     await mkdir(join(dir, "new", nest), { recursive: true });
+    await writeFile(join(dir, "new", nest, "Mc.jsonl"), "");
     const omp = await installOmpForActions("omp-subagent-moved-cancel", { pi });
     delete process.env.HERDR_OMP_MOVE_WATCH_MS;
     let file = "/tmp/omp-instruct.jsonl";
@@ -3277,8 +3282,58 @@ test("Oh My Pi cancels a moved subagent and writes its tombstone next to the mov
     await access(join(dir, "new", nest, "Mc.jsonl.tombstone"));
     // A ref under the current stem whose tombstone write fails: cancelled, not persisted.
     expect((await cancel("Hc")).data).toEqual({ subagent_id: "Hc", cancelled: true, persisted: false });
-    expect(calls).toEqual(["release Mc", "abort", "release Hc", "abort"]);
+    // No transcript at the moved path: no orphan tombstone, and OMP's failed write is reported.
+    expect((await cancel("Oc")).data).toEqual({ subagent_id: "Oc", cancelled: true, persisted: false });
+    expect(existsSync(join(dir, "new", nest, "Oc.jsonl.tombstone"))).toBe(false);
+    expect(calls).toEqual(["release Mc", "abort", "release Hc", "abort", "release Oc", "abort"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("Oh My Pi writes a moved subagent's tombstone when OMP's release ends after the cancel wait", async () => {
+  process.env.HERDR_OMP_MOVE_WATCH_MS = "50";
+  const dir = join(tmpdir(), `omp-move-late-${process.pid}-${Date.now()}`);
+  const nest = `late-${process.pid}`;
+  const ref: any = subRef("Lc", {
+    session: { isStreaming: true, abort: async () => {} },
+    sessionFile: join("/tmp/omp-instruct", nest, "Lc.jsonl"),
+  });
+  const { pi } = fakeRegistry([ref]);
+  // OMP's release first waits for a park in progress, so the ref turns aborted only after the
+  // wait; then its tombstone write at the stale path rejects.
+  let parked = () => {};
+  const park = new Promise<void>((resolve) => (parked = resolve));
+  lifecycle.manager = {
+    release: async (_id: string, released: { status: string; session: unknown; sessionFile: string }) => {
+      await park;
+      released.status = "aborted";
+      released.session = null;
+      await writeFile(`${released.sessionFile}.tombstone`, "", { flag: "wx" });
+      return true;
+    },
+  };
+  try {
+    await mkdir(join(dir, "new", nest), { recursive: true });
+    await writeFile(join(dir, "new", nest, "Lc.jsonl"), "");
+    const omp = await installOmpForActions("omp-subagent-moved-late", { pi });
+    delete process.env.HERDR_OMP_MOVE_WATCH_MS;
+    let file = "/tmp/omp-instruct.jsonl";
+    omp.harness.context.sessionManager = { getSessionFile: () => file, getSessionId: () => "omp-instruct" } as never;
+    file = join(dir, "new.jsonl");
+    await waitFor(
+      () => omp.harness.requests.some((request) => isRecord(request) && (request as any).params?.agent_session_path === file),
+      3_000,
+    );
+    // The ack comes after the 5 s cancel wait.
+    const actionId = "d".repeat(32);
+    expect(omp.listener(actionBlock(actionId, { op: "subagent_cancel", args: { subagent_id: "Lc", expected_run: 1 } }))).toEqual({
+      consume: true,
+    });
+    expect((await omp.finalAck(actionId, 8_000)).data).toEqual({ subagent_id: "Lc", cancelled: true, settled: false });
+    parked();
+    await waitFor(() => existsSync(join(dir, "new", nest, "Lc.jsonl.tombstone")), 3_000);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}, 20_000);

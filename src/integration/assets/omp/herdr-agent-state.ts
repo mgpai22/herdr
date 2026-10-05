@@ -6,7 +6,7 @@
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { access, writeFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 
@@ -1993,43 +1993,51 @@ export default function (pi) {
       const moved = movedTranscript(ref);
       // Release first: it marks the ref aborted at once, which the task executor turns into the
       // task's abort; a bare abort would only end the subagent's turn.
+      const releasing = Promise.resolve().then(() => manager.global().release(id, ref, { tombstone: true }));
+      // Once the release ends (also after the wait below gave up): whether it cancelled the ref, and
+      // whether herdr's tombstone went down (undefined: not tried). Release makes the ref terminal
+      // before its first await, so a ref still registered, aborted and detached was cancelled even
+      // when the release rejects afterwards (its own tombstone write).
+      const afterRelease = releasing.then(
+        () => {},
+        () => {},
+      ).then(async () => {
+        const aborted = registry.get(id) === ref && ref.status === "aborted" && !ref.session;
+        if (!aborted || moved === undefined) return { aborted, wrote: undefined };
+        // Only next to a transcript that is there: a subagent from before the move still puts the
+        // subagents it spawns after it under the old stem, where OMP's own tombstone is right.
+        if (!(await access(moved).then(() => true, () => false))) return { aborted, wrote: undefined };
+        // OMP's kill marker (`persistAgentTombstone`): an empty `<transcript>.tombstone`, which
+        // OMP's scan after a restart reads as `aborted`, not `parked`.
+        const wrote = await writeFile(`${moved}.tombstone`, "", { encoding: "utf8", flag: "wx", mode: 0o600 }).then(
+          () => true,
+          (error: NodeJS.ErrnoException) => error?.code === "EEXIST",
+        );
+        return { aborted, wrote };
+      });
       let timer: ReturnType<typeof setTimeout> | undefined;
       const result = await Promise.race([
-        Promise.allSettled([
-          Promise.resolve().then(() => manager.global().release(id, ref, { tombstone: true })),
-          Promise.resolve().then(() => session.abort({ reason: "Interrupted by herdr" })),
-        ]),
+        Promise.allSettled([releasing, Promise.resolve().then(() => session.abort({ reason: "Interrupted by herdr" }))]),
         new Promise<undefined>((resolve) => {
           timer = setTimeout(resolve, subagentCancelWaitMs);
         }),
       ]);
       clearTimeout(timer);
-      // Release makes the ref terminal before its first await, so a ref still registered, aborted
-      // and detached was cancelled even when the release rejects afterwards (its tombstone write).
-      const aborted = registry.get(id) === ref && ref.status === "aborted" && !ref.session;
-      // OMP's kill marker (`persistAgentTombstone`): an empty `<transcript>.tombstone`, which OMP's
-      // scan after a restart reads as `aborted`, not `parked`.
-      let persisted = true;
-      if (moved !== undefined && aborted) {
-        persisted = await writeFile(`${moved}.tombstone`, "", { encoding: "utf8", flag: "wx", mode: 0o600 }).then(
-          () => true,
-          (error: NodeJS.ErrnoException) => error?.code === "EEXIST",
-        );
-      }
-      const done = (fields: Record<string, unknown>) =>
-        finish({ ok: true, data: { subagent_id: id, cancelled: true, ...fields, ...(persisted ? {} : { persisted }) } });
-      if (!result) return done({ settled: false });
+      // Not settled: no tombstone is known yet, so nothing is said about it.
+      if (!result) return finish({ ok: true, data: { subagent_id: id, cancelled: true, settled: false } });
       const [released] = result;
+      const { aborted, wrote } = await afterRelease;
+      const done = (persisted: boolean) =>
+        finish({ ok: true, data: { subagent_id: id, cancelled: true, ...(persisted ? {} : { persisted }) } });
       if (released.status === "rejected") {
         if (!aborted) return finish({ ok: false, error: `failed: ${cap(released.reason?.message ?? released.reason, 200)}` });
-        // OMP's own tombstone failed; herdr's at the moved path counts when there was one.
-        if (moved === undefined) persisted = false;
-        return done({});
+        // OMP's own tombstone failed; herdr's next to the moved transcript counts.
+        return done(wrote === true);
       }
       if (released.value !== true) {
         return finish({ ok: false, error: `subagent_not_running: ${id} ended before the cancel` });
       }
-      return done({});
+      return done(wrote !== false);
     })();
     return rest;
   }
