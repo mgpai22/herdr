@@ -19,6 +19,11 @@ const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_BUFFER_LEN: usize = 64 * 1024;
+// A batch also ends after this many reads or this much time, so a pane that
+// trickles output cannot hold the actor (and the user input it writes) in one
+// read loop for several milliseconds.
+const MAX_READS_PER_BATCH: usize = 16;
+const MAX_BATCH_TIME: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -846,17 +851,24 @@ impl PtyIoActorRunner {
         self.enqueue_terminal_responses(terminal_responses);
     }
 
-    /// Reads until the PTY has no more data or the buffer is full, then hands the
-    /// whole batch to `on_read` once. Bytes read before EOF or an error are
-    /// delivered before the actor reports the PTY closed.
+    /// Reads until the PTY has no more data, the buffer is full, or the batch
+    /// hits its read or time bound, then hands the whole batch to `on_read`
+    /// once. Bytes read before EOF or an error are delivered before the actor
+    /// reports the PTY closed.
     fn read_once(&mut self) -> bool {
+        let started = Instant::now();
         let mut filled = 0;
+        let mut reads = 0;
         let open = loop {
             match self.file.read(&mut self.read_buf[filled..]) {
                 Ok(0) => break false,
                 Ok(n) => {
                     filled += n;
-                    if filled == self.read_buf.len() {
+                    reads += 1;
+                    if filled == self.read_buf.len()
+                        || reads == MAX_READS_PER_BATCH
+                        || started.elapsed() >= MAX_BATCH_TIME
+                    {
                         break true;
                     }
                 }
@@ -1083,7 +1095,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         os::fd::{AsRawFd, FromRawFd, IntoRawFd},
-        os::unix::net::UnixStream,
+        os::unix::net::{UnixDatagram, UnixStream},
         sync::atomic::{AtomicBool, Ordering},
     };
 
@@ -1136,11 +1148,14 @@ mod tests {
         actor_socket
             .set_nonblocking(true)
             .expect("actor socket nonblocking");
-        let owned = unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) };
+        (actor_runner_with_fd(OwnedFd::from(actor_socket)), peer)
+    }
+
+    fn actor_runner_with_fd(owned: OwnedFd) -> PtyIoActorRunner {
         let (_data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
         let (_control_tx, control_rx) = std_mpsc::channel();
         let wake_pipe = fd::create_wake_pipe().expect("wake pipe");
-        let runner = PtyIoActorRunner {
+        PtyIoActorRunner {
             pane_id: 1,
             file: std::fs::File::from(owned),
             data_rx,
@@ -1158,8 +1173,7 @@ mod tests {
             poll_observer: None,
             foreground_group: ForegroundGroupReader(Arc::default()),
             read_buf: vec![0; READ_BUFFER_LEN].into_boxed_slice(),
-        };
-        (runner, peer)
+        }
     }
 
     #[test]
@@ -1202,6 +1216,29 @@ mod tests {
         assert!(!runner.read_once(), "EOF ends the actor");
 
         assert_eq!(reads.try_iter().collect::<Vec<_>>(), vec![10]);
+    }
+
+    #[test]
+    fn read_once_ends_batch_after_read_bound() {
+        // Each datagram read returns one byte, like a pane that trickles output.
+        let (actor_socket, peer) = UnixDatagram::pair().expect("datagram pair");
+        actor_socket
+            .set_nonblocking(true)
+            .expect("actor socket nonblocking");
+        let mut runner = actor_runner_with_fd(OwnedFd::from(actor_socket));
+        let reads = record_reads(&mut runner);
+        for _ in 0..=MAX_READS_PER_BATCH {
+            peer.send(b"x").expect("peer send");
+        }
+
+        assert!(runner.read_once());
+        assert_eq!(
+            reads.try_iter().collect::<Vec<_>>(),
+            vec![MAX_READS_PER_BATCH]
+        );
+
+        assert!(runner.read_once());
+        assert_eq!(reads.try_iter().collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
