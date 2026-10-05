@@ -833,6 +833,28 @@ Terminal-title changes can emit `pane.updated`, but spinner-only raw-title chang
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.
+`pane.agent_status_changed` emits `pane_id`, `workspace_id`, `agent_status`,
+and, when set, `agent`, `title`, `display_agent`, `state_labels` and
+`state_change_seq` (the pane's `AgentInfo.state_change_seq` when Herdr emitted
+the event), under `{"event":"pane.agent_status_changed","data":{...}}`. It is
+sent when the public status or the presentation (title, display agent, state
+labels) changes, so compare `agent_status` to detect status edges. With a
+`pane_id` the subscription checks that the pane exists, sends the current state
+first when it equals the `agent_status` filter, and also samples the pane every
+100 ms; events it builds from such a sample carry no `state_change_seq`. Omit
+`pane_id` to watch every pane on one connection: Herdr then matches status
+events of all panes from its event history, sends no initial event and samples
+no pane, and the optional `agent_status` filter still applies. Servers that
+accept a subscription without `pane_id` advertise `events_any_pane: true` in
+the `ping` capabilities; older servers reject it as an invalid request.
+
+From the CLI, `herdr events subscribe --json '<params>'` sends
+`events.subscribe` with those params and prints every line the server sends,
+starting with the `subscription_started` response. It exits with status 1
+after printing an error line to stderr, or when the stream ends, for example
+because the server stopped. `herdr --machine <label-or-id> events subscribe`
+holds the same stream through the saved machine's SSH bridge.
+
 Layout event subscriptions include `layout.updated`. The event carries the
 updated `PaneLayoutSnapshot` for one tab. Clients maintaining a cache with
 `session.snapshot` should use this event to refresh the affected layout through

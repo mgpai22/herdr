@@ -680,6 +680,14 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "state_change_seq": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "state_labels": {
                   "additionalProperties": {
                     "type": "string"
@@ -5043,6 +5051,7 @@
               "type": "object"
             },
             {
+              "description": "Without `pane_id` the subscription matches every pane's status events from\nevent history, with no initial event and no per-pane snapshot sampling.",
               "properties": {
                 "agent_status": {
                   "anyOf": [
@@ -5055,7 +5064,10 @@
                   ]
                 },
                 "pane_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "pane.agent_status_changed",
@@ -5063,8 +5075,7 @@
                 }
               },
               "required": [
-                "type",
-                "pane_id"
+                "type"
               ],
               "type": "object"
             },
@@ -7281,6 +7292,15 @@
             "pane_id": {
               "type": "string"
             },
+            "state_change_seq": {
+              "description": "The pane's `AgentInfo.state_change_seq` when the event was emitted. Absent on\nevents a per-pane subscription built from a pane snapshot.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "state_labels": {
               "additionalProperties": {
                 "type": "string"
@@ -8477,6 +8497,14 @@
                 },
                 "pane_id": {
                   "type": "string"
+                },
+                "state_change_seq": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "state_labels": {
                   "additionalProperties": {
@@ -12138,6 +12166,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "events_any_pane": {
+              "default": false,
+              "description": "Supports `pane.agent_status_changed` subscriptions without `pane_id`.",
+              "type": "boolean"
             },
             "health_check": {
               "default": false,

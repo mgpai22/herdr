@@ -72,9 +72,12 @@ pub enum Subscription {
         #[serde(default = "super::common::default_true")]
         strip_ansi: bool,
     },
+    /// Without `pane_id` the subscription matches every pane's status events from
+    /// event history, with no initial event and no per-pane snapshot sampling.
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged {
-        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
     },
@@ -408,6 +411,10 @@ pub struct PaneAgentStatusChangedEvent {
     pub display_agent: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
+    /// The pane's `AgentInfo.state_change_seq` when the event was emitted. Absent on
+    /// events a per-pane subscription built from a pane snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_change_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -549,6 +556,8 @@ pub enum EventData {
         display_agent: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state_change_seq: Option<u64>,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

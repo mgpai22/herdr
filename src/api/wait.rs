@@ -765,7 +765,7 @@ fn event_match_subscription(
             pane_id,
             agent_status,
         } => Ok(Subscription::PaneAgentStatusChanged {
-            pane_id,
+            pane_id: Some(pane_id),
             agent_status: Some(agent_status),
         }),
         _ => Err(ErrorResponse {
@@ -814,6 +814,7 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
                     title: data.title,
                     display_agent: data.display_agent,
                     state_labels: data.state_labels,
+                    state_change_seq: data.state_change_seq,
                 },
             },
         },

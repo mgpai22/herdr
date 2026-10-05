@@ -79,7 +79,7 @@ herdr --machine "Build machine" worktree create --cwd /srv/project --branch revi
 
 The selector must match an enabled saved profile ID or a unique, case-sensitive label, not an arbitrary SSH hostname. The saved remote session is used; combining `--machine` with `--session` or `--remote` is an error. Without the prefix, commands retain their existing local session/socket behavior.
 
-Supported commands are `workspace`, `worktree`, `tab`, `pane`, `notification`, `agent` (except `attach` and local `explain --file`), `api snapshot`, `status server`, and API-backed plugin commands (`link`, `unlink`, `enable`, `disable`, `list`, `action`, `log`, `pane`). Server commands support `stop`, `reload-config`, `agent-manifests`, and `reload-agent-manifests`. Local installation/configuration commands, plugin installation, session management, and interactive terminal attachment are not forwarded.
+Supported commands are `workspace`, `worktree`, `tab`, `pane`, `notification`, `agent` (except `attach` and local `explain --file`), `api snapshot`, `events subscribe`, `status server`, and API-backed plugin commands (`link`, `unlink`, `enable`, `disable`, `list`, `action`, `log`, `pane`). Server commands support `stop`, `reload-config`, `agent-manifests`, and `reload-agent-manifests`. Local installation/configuration commands, plugin installation, session management, and interactive terminal attachment are not forwarded.
 
 Requests and responses travel through the JSON API over non-interactive SSH; API payloads are not interpolated into the SSH shell command. No open TUI is required, and the bridge never installs, starts, or restarts a server. Update the local CLI and remote Herdr installation to support machine forwarding, and keep the running remote server's API protocol compatible. Authentication, unavailable machines, and incompatible versions fail without falling back to Local. Requests are not automatically retried after connection failure.
 
@@ -407,6 +407,17 @@ Use `pane wait-output` for normal commands and servers. Use `agent wait` for cod
 A timeout or `agent_prompt_stalled` does not prove the prompt was never delivered. Inspect the agent before retrying.
 
 `pane wait-output` and `agent wait` wait indefinitely when `--timeout` is omitted. For `agent prompt --wait`, the settled-state wait is indefinite after activity is observed or when the prompt starts in `working`; a non-working prompt still returns `agent_prompt_stalled` after five seconds without observed activity. A timeout or server error is emitted as JSON on stderr with exit status 1. CLI usage errors exit with status 2.
+
+## Events
+
+Print an `events.subscribe` stream as JSON lines:
+
+```bash
+herdr events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed"},{"type":"pane.agent_detected"}]}'
+herdr --machine "Build machine" events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed","agent_status":"done"}]}'
+```
+
+`--json` takes the `events.subscribe` params. The first line is the `subscription_started` response; each later line is one event, flushed as it arrives. An error line goes to stderr and the command exits with status 1; it also exits with status 1 when the stream ends, for example when the server stops. Invalid params are a usage error (status 2). A `pane.agent_status_changed` entry without `pane_id` watches every pane; see [Socket API](/docs/socket-api/#event-subscriptions).
 
 ## Integrations
 

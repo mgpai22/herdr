@@ -37,6 +37,7 @@ pub(super) fn command() -> Command {
         .subcommand(machine::command())
         .subcommand(server_command())
         .subcommand(api_command())
+        .subcommand(events_command())
         .subcommand(workspace_command())
         .subcommand(worktree_command())
         .subcommand(tab_command())
@@ -186,6 +187,20 @@ fn api_command() -> Command {
                 .about("Print or write the bundled API schema")
                 .arg(json_flag())
                 .arg(path_option("output", "PATH")),
+        )
+}
+
+fn events_command() -> Command {
+    Command::new("events")
+        .about("Stream socket API events")
+        .subcommand(
+            Command::new("subscribe")
+                .about("Print an events.subscribe stream as JSON lines")
+                .arg(
+                    option("json", "PARAMS")
+                        .required(true)
+                        .help("events.subscribe params, for example {\"subscriptions\":[...]}"),
+                ),
         )
 }
 

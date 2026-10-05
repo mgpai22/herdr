@@ -298,6 +298,7 @@ fn validate_machine_command(args: &[String]) -> Result<(), String> {
         }
         "api" => subcommand == "snapshot",
         "status" => subcommand == "server",
+        "events" => subcommand == "subscribe",
         "plugin" => matches!(
             subcommand,
             "link" | "unlink" | "enable" | "disable" | "list" | "action" | "log" | "logs" | "pane"
@@ -462,6 +463,7 @@ mod tests {
             &["worktree", "create", "--branch", "feature"],
             &["tab", "list"],
             &["api", "snapshot"],
+            &["events", "subscribe", "--json", "{}"],
             &["server", "stop"],
         ] {
             let mut input = args(&["herdr"]);

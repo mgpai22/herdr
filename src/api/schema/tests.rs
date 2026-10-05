@@ -645,6 +645,9 @@ fn subscribe_request_parses_parameterized_subscriptions() {
                 {
                     "type": "pane.scroll_changed",
                     "pane_id": "p_1_1"
+                },
+                {
+                    "type": "pane.agent_status_changed"
                 }
             ]
         }
@@ -655,7 +658,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
     let Method::EventsSubscribe(params) = request.method else {
         panic!("wrong method parsed");
     };
-    assert_eq!(params.subscriptions.len(), 3);
+    assert_eq!(params.subscriptions.len(), 4);
     assert!(matches!(
         &params.subscriptions[0],
         Subscription::PaneOutputMatched {
@@ -669,7 +672,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
     assert!(matches!(
         &params.subscriptions[1],
         Subscription::PaneAgentStatusChanged {
-            pane_id,
+            pane_id: Some(pane_id),
             agent_status: Some(AgentStatus::Done),
         } if pane_id == "p_1_1"
     ));
@@ -677,6 +680,13 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         &params.subscriptions[2],
         Subscription::PaneScrollChanged { pane_id } if pane_id == "p_1_1"
     ));
+    assert_eq!(
+        params.subscriptions[3],
+        Subscription::PaneAgentStatusChanged {
+            pane_id: None,
+            agent_status: None,
+        }
+    );
 }
 
 #[test]
@@ -749,6 +759,7 @@ fn success_response_round_trips() {
                 agent_start_profile: true,
                 agent_instruct: true,
                 agent_action: true,
+                events_any_pane: true,
             }),
         },
     };

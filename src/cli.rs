@@ -25,6 +25,7 @@ macro_rules! println {
 mod agent;
 mod api;
 mod completion;
+mod events;
 mod integration;
 mod machine;
 mod notification;
@@ -115,6 +116,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
             exit_code
         }
         "api" => api::run_api_command(&args[2..])?,
+        "events" => events::run_events_command(&args[2..])?,
         "status" => status::run_status_command(&args[2..])?,
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
@@ -778,6 +780,18 @@ pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde
     let client = target::api_client()?;
     client
         .request_value(request)
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
+}
+
+/// Sends a request whose response is a stream of JSON lines and returns the open
+/// connection. Remote streams stay open while the command's machine scope lives.
+pub(super) fn open_stream(
+    request: &Request,
+) -> std::io::Result<std::io::BufReader<crate::ipc::LocalStream>> {
+    let client = target::api_client()?;
+    ensure_server_protocol_compatible(&client, &request.id)?;
+    client
+        .open_stream(request)
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 

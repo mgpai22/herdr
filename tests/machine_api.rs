@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -531,6 +531,114 @@ fn machine_api_remote_paths_and_wait_parameters_reach_the_server() {
 }
 
 #[test]
+fn machine_events_subscribe_streams_each_line_until_the_remote_stream_ends() {
+    let harness = Harness::new();
+    let listener = harness.remote.try_clone().unwrap();
+    let protocol = harness.protocol;
+    let (next_tx, next_rx) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "remote request did not arrive");
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            if request["method"] == "ping" {
+                let pong = json!({"id": request["id"], "result": {"type": "pong", "version": "test", "protocol": protocol}});
+                writeln!(stream, "{pong}").unwrap();
+                continue;
+            }
+            let started = json!({"id": request["id"], "result": {"type": "subscription_started"}});
+            writeln!(stream, "{started}").unwrap();
+            let event = |status: &str| json!({"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p1", "workspace_id": "w1", "agent_status": status}});
+            writeln!(stream, "{}", event("done")).unwrap();
+            // The second event waits until the client printed the first: a buffered
+            // CLI never prints it and this receive times out.
+            next_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            writeln!(stream, "{}", event("idle")).unwrap();
+            return request;
+        }
+    });
+    let mut child = harness
+        .command(&[
+            "--machine",
+            "mac",
+            "events",
+            "subscribe",
+            "--json",
+            r#"{"subscriptions":[{"type":"pane.agent_status_changed"}]}"#,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next_line = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    assert_eq!(next_line()["result"]["type"], "subscription_started");
+    assert_eq!(next_line()["data"]["agent_status"], "done");
+    next_tx.send(()).unwrap();
+    assert_eq!(next_line()["data"]["agent_status"], "idle");
+
+    let request = server.join().unwrap();
+    assert_eq!(request["method"], "events.subscribe");
+    assert_eq!(
+        request["params"],
+        json!({"subscriptions": [{"type": "pane.agent_status_changed"}]})
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("event stream closed"), "{stderr}");
+    assert!(stderr.contains("machine 'mac'"), "{stderr}");
+    harness.assert_local_untouched();
+}
+
+#[test]
+fn machine_events_subscribe_reports_an_error_line_on_stderr_and_exits_1() {
+    let harness = Harness::new();
+    let server = harness.serve(
+        json!({"error": {"code": "invalid_request", "message": "missing field `pane_id`"}}),
+        harness.protocol,
+    );
+    let output = harness
+        .command(&[
+            "--machine",
+            "mac",
+            "events",
+            "subscribe",
+            "--json",
+            r#"{"subscriptions":[{"type":"pane.agent_status_changed"}]}"#,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(server.join().unwrap()["method"], "events.subscribe");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error: Value = serde_json::from_slice(&output.stderr)
+        .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stderr)));
+    assert_eq!(error["error"]["code"], "invalid_request");
+}
+
+#[test]
 fn machine_api_status_reports_remote_identity_not_local_installation_state() {
     let harness = Harness::new();
     let server = harness.serve(json!({}), 0);
@@ -581,6 +689,16 @@ fn machine_api_usage_errors_do_not_connect() {
             "right",
         ],
         vec!["--machine", "mac", "--session", "local", "agent", "list"],
+        vec!["--machine", "mac", "events", "subscribe"],
+        vec![
+            "--machine",
+            "mac",
+            "events",
+            "subscribe",
+            "--json",
+            "{\"subscriptions\":[{\"type\":\"nope\"}]}",
+        ],
+        vec!["--machine", "mac", "events", "wait"],
     ] {
         assert_eq!(
             harness.command(&args).output().unwrap().status.code(),

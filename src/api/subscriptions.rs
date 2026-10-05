@@ -48,7 +48,8 @@ pub(super) struct ActiveOutputMatchedSubscription {
 }
 
 pub(super) struct ActiveAgentStatusChangedSubscription {
-    pane_id: String,
+    /// `None` matches every pane from event history only.
+    pane_id: Option<String>,
     status_filter: Option<crate::api::schema::AgentStatus>,
     last_status: Option<crate::api::schema::AgentStatus>,
     last_presentation: Option<PanePresentationSnapshot>,
@@ -204,7 +205,21 @@ impl ActiveSubscription {
                 }))
             }
             Subscription::PaneAgentStatusChanged {
-                pane_id,
+                pane_id: None,
+                agent_status,
+            } => Ok(Self::AgentStatusChanged(Box::new(
+                ActiveAgentStatusChangedSubscription {
+                    pane_id: None,
+                    status_filter: agent_status,
+                    last_status: None,
+                    last_presentation: None,
+                    last_sequence: event_start_sequence,
+                    initial_event: None,
+                    request_prefix: format!("{request_id}:sub:{index}"),
+                },
+            ))),
+            Subscription::PaneAgentStatusChanged {
+                pane_id: Some(pane_id),
                 agent_status,
             } => {
                 let last_sequence = event_hub.current_sequence();
@@ -221,11 +236,12 @@ impl ActiveSubscription {
                         title: probe.title,
                         display_agent: probe.display_agent,
                         state_labels: probe.state_labels,
+                        state_change_seq: None,
                     });
 
                 Ok(Self::AgentStatusChanged(Box::new(
                     ActiveAgentStatusChangedSubscription {
-                        pane_id: probe.pane_id,
+                        pane_id: Some(probe.pane_id),
                         status_filter: agent_status,
                         last_status: Some(last_status),
                         last_presentation: Some(last_presentation),
@@ -433,11 +449,16 @@ impl ActiveAgentStatusChangedSubscription {
             title,
             display_agent,
             state_labels,
+            state_change_seq,
         } = event.data
         else {
             return None;
         };
-        if pane_id != self.pane_id {
+        if self
+            .pane_id
+            .as_ref()
+            .is_some_and(|wanted| *wanted != pane_id)
+        {
             return None;
         }
         self.last_status = Some(agent_status);
@@ -464,6 +485,7 @@ impl ActiveAgentStatusChangedSubscription {
                 title,
                 display_agent,
                 state_labels,
+                state_change_seq,
             }),
         })
     }
@@ -473,6 +495,9 @@ impl ActiveAgentStatusChangedSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Result<Option<SubscriptionEventEnvelope>, ErrorResponse> {
+        let Some(pane_id) = self.pane_id.as_deref() else {
+            return Ok(None);
+        };
         if event_hub.current_sequence() != self.last_sequence {
             return Ok(None);
         } else if let Some(event) = self.initial_event.take() {
@@ -483,11 +508,7 @@ impl ActiveAgentStatusChangedSubscription {
         }
 
         let before_snapshot_sequence = self.last_sequence;
-        let pane = pane_get(
-            format!("{}:pane", self.request_prefix),
-            &self.pane_id,
-            api_tx,
-        );
+        let pane = pane_get(format!("{}:pane", self.request_prefix), pane_id, api_tx);
         let after_snapshot_sequence = event_hub.current_sequence();
         if after_snapshot_sequence != before_snapshot_sequence {
             return Ok(None);
@@ -533,6 +554,7 @@ impl ActiveAgentStatusChangedSubscription {
                 title: pane.title,
                 display_agent: pane.display_agent,
                 state_labels: pane.state_labels,
+                state_change_seq: None,
             }),
         })
     }
@@ -679,6 +701,7 @@ mod tests {
                 title: title.map(str::to_string),
                 display_agent: None,
                 state_labels: HashMap::new(),
+                state_change_seq: None,
             },
         }
     }
@@ -807,7 +830,7 @@ mod tests {
             let event_hub = EventHub::default();
             let mut subscription = ActiveSubscription::AgentStatusChanged(Box::new(
                 ActiveAgentStatusChangedSubscription {
-                    pane_id: "pane_1".into(),
+                    pane_id: Some("pane_1".into()),
                     status_filter: filtered.then_some(AgentStatus::Working),
                     last_status: Some(AgentStatus::Working),
                     last_presentation: None,
@@ -820,6 +843,7 @@ mod tests {
                         title: Some("stale initial snapshot".into()),
                         display_agent: None,
                         state_labels: HashMap::new(),
+                        state_change_seq: None,
                     }),
                     request_prefix: "batch".into(),
                 },
@@ -897,7 +921,7 @@ mod tests {
     fn agent_status_subscription_replays_queued_metadata_set_and_expiry_events() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
-            pane_id: "pane_1".into(),
+            pane_id: Some("pane_1".into()),
             status_filter: None,
             last_status: Some(AgentStatus::Working),
             last_presentation: Some(PanePresentationSnapshot {
@@ -934,7 +958,7 @@ mod tests {
     fn agent_status_subscription_prefers_setup_window_events_over_initial_snapshot() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
-            pane_id: "pane_1".into(),
+            pane_id: Some("pane_1".into()),
             status_filter: Some(AgentStatus::Working),
             last_status: Some(AgentStatus::Working),
             last_presentation: Some(PanePresentationSnapshot {
@@ -951,6 +975,7 @@ mod tests {
                 title: None,
                 display_agent: None,
                 state_labels: HashMap::new(),
+                state_change_seq: None,
             }),
             request_prefix: "test".into(),
         };
@@ -979,7 +1004,7 @@ mod tests {
     fn agent_status_subscription_emits_setup_window_event_already_reflected_by_probe() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
-            pane_id: "pane_1".into(),
+            pane_id: Some("pane_1".into()),
             status_filter: Some(AgentStatus::Working),
             last_status: Some(AgentStatus::Working),
             last_presentation: Some(PanePresentationSnapshot {
@@ -996,6 +1021,7 @@ mod tests {
                 title: Some("short lived".into()),
                 display_agent: None,
                 state_labels: HashMap::new(),
+                state_change_seq: None,
             }),
             request_prefix: "test".into(),
         };

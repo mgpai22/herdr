@@ -79,6 +79,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         // callers keep using `agent.prompt`.
         agent_instruct: crate::app::INSTRUCTIONS_SUPPORTED,
         agent_action: crate::app::INSTRUCTIONS_SUPPORTED,
+        events_any_pane: true,
     })
 }
 
@@ -1735,6 +1736,7 @@ mod tests {
                 agent_start_profile: true,
                 agent_instruct: true,
                 agent_action: true,
+                events_any_pane: true,
             }),
             None,
             None,
@@ -1750,6 +1752,8 @@ mod tests {
         // `agent start --profile` refuses to run against a server without this flag.
         let capabilities = default_capabilities().unwrap();
         assert!(capabilities.agent_start_profile);
+        // hp picks the one-stream event loop or the per-pane fallback from this flag.
+        assert!(capabilities.events_any_pane);
         // An advertised `agent.instruct` must be able to verify a live process incarnation.
         assert!(
             !capabilities.agent_instruct
