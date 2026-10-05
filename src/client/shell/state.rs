@@ -863,7 +863,7 @@ pub(crate) struct ClientShellState {
     pub(super) sidebar_section_split: f32,
     pub(super) sidebar_section_split_manual: bool,
     pub(super) sidebar_agents_visible: bool,
-    pub(super) sidebar_agents_visible_manual: bool,
+    pub(super) sidebar_agents_override: Option<super::preferences::SidebarAgentsOverride>,
     pub(super) agent_panel_sort_manual: bool,
     pub(super) last_sidebar_divider_click: Option<std::time::Instant>,
     pub(super) chrome_drag: Option<ClientChromeDrag>,
@@ -996,9 +996,11 @@ impl ClientShellState {
             .filter(|split| split.is_finite())
             .map(|split| split.clamp(0.1, 0.9))
             .unwrap_or(0.5);
-        let sidebar_agents_visible = preferences
-            .sidebar_agents_visible
-            .unwrap_or(config.agents.show);
+        let stored_agents_override = preferences.sidebar_agents;
+        let sidebar_agents_override =
+            stored_agents_override.filter(|stored| stored.config_show == config.agents.show);
+        let sidebar_agents_visible =
+            sidebar_agents_override.map_or(config.agents.visible(), |stored| stored.visible);
         if let Some(sort) = preferences.agent_panel_sort {
             config.agent_panel_sort = sort;
         }
@@ -1012,7 +1014,7 @@ impl ClientShellState {
                 .or_default()
                 .extend(saved.collapsed_groups);
         }
-        Self {
+        let mut state = Self {
             machine_diagnostics: Default::default(),
             config,
             snapshot: None,
@@ -1033,7 +1035,7 @@ impl ClientShellState {
             sidebar_section_split,
             sidebar_section_split_manual: preferences.sidebar_section_split.is_some(),
             sidebar_agents_visible,
-            sidebar_agents_visible_manual: preferences.sidebar_agents_visible.is_some(),
+            sidebar_agents_override,
             agent_panel_sort_manual: preferences.agent_panel_sort.is_some(),
             last_sidebar_divider_click: None,
             chrome_drag: None,
@@ -1109,7 +1111,12 @@ impl ClientShellState {
             endpoint_error: None,
             endpoint_error_deadline: None,
             dismissed_product_announcement: None,
+        };
+        if stored_agents_override != sidebar_agents_override {
+            // The config changed while no client ran; drop the stale toggle from disk too.
+            state.persist_chrome_preferences(&mut ClientShellInput::default());
         }
+        state
     }
 
     pub(super) fn resume_mobile_switcher_if_ready(&mut self) -> bool {

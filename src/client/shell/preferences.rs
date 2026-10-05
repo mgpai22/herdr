@@ -14,6 +14,15 @@ pub(super) struct ClientRemoteCollapsedGroups {
     pub(super) collapsed_groups: Vec<String>,
 }
 
+/// A runtime Agents-section toggle and the `ui.sidebar.agents.show` setting it was made under.
+/// Any other setting means the config was edited since, so the toggle no longer applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct SidebarAgentsOverride {
+    pub(super) visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) config_show: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(super) struct ClientChromePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,7 +32,7 @@ pub(super) struct ClientChromePreferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) sidebar_collapsed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) sidebar_agents_visible: Option<bool>,
+    pub(super) sidebar_agents: Option<SidebarAgentsOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) agent_panel_sort: Option<crate::config::AgentPanelSortConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

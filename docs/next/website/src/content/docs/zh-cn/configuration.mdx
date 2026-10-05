@@ -422,7 +422,9 @@ rows = [
 
 `row_gap` 分别控制 Agent 和 Space 面板中条目之间的空白终端行数。默认值为 `0`，会紧密排列条目；设为 `1` 可恢复之前的间距。它不会在 `rows` 声明的内容行之间添加间距。连续缩进的 worktree 子项仍会作为一个 Space 组紧密排列。
 
-将 `show` 设为 `false` 会在展开的侧边栏和折叠栏中隐藏 Spaces 下方的 Agent 面板；Spaces 随后占用整个侧边栏高度，面板分隔线也无法拖动。修改该值后运行 `herdr server reload-config`，已打开的客户端会立即应用。`keys.toggle_sidebar_agents`（默认未设置）可在运行时显示或隐藏该面板。与 `keys.toggle_sidebar` 一样，运行时的选择按客户端保存并在重启后保留；下次修改 `show` 时会被新值替换。
+将 `show` 设为 `false` 会在展开的侧边栏和折叠栏中隐藏 Spaces 下方的 Agent 面板；Spaces 随后占用侧边栏高度直到折叠按钮所在行，面板分隔线也无法拖动。修改该值后运行 `herdr server reload-config`，已打开的客户端会立即应用。`keys.toggle_sidebar_agents`（默认未设置）可在运行时显示或隐藏该面板。与 `keys.toggle_sidebar` 一样，运行时的选择按客户端保存并在重启后保留，但任何对 `show` 的修改都会替换它，包括没有客户端运行时所做的修改，以及在未设置时写入 `show = true`。
+
+面板隐藏时，侧边栏不显示各智能体的状态（包括 blocked）。Space 行图标、折叠栏、toast 和声音仍会报告这些状态。插件（例如 herdr-projects）设置的智能体视图在隐藏时仍会筛选并排序 `next_agent`、`previous_agent` 和 `focus_agent`，但屏幕上不会显示该视图。
 
 在 `rows_by_agent` 下为已知智能体覆盖完整的 Agent 布局：
 

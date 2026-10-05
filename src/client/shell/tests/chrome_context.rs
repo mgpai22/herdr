@@ -541,7 +541,7 @@ fn sidebar_text(frame: &crate::protocol::FrameData, width: u16) -> String {
 #[test]
 fn hidden_agents_section_gives_spaces_the_full_sidebar() {
     let mut config = Config::default();
-    config.ui.sidebar.agents.show = false;
+    config.ui.sidebar.agents.show = Some(false);
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
@@ -595,7 +595,10 @@ fn toggle_sidebar_agents_action_flips_the_section() {
             &mut outcome,
         );
         assert!(outcome.repaint);
-        assert!(state.sidebar_agents_visible_manual);
+        assert_eq!(
+            state.sidebar_agents_override.map(|stored| stored.visible),
+            Some(visible)
+        );
         let frame = state.compose(106, 30).expect("toggled sidebar");
         assert_eq!(
             sidebar_text(&frame, state.sidebar_width).contains(" agents"),
@@ -608,39 +611,158 @@ fn toggle_sidebar_agents_action_flips_the_section() {
     }
 }
 
+fn agents_prefs_path(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-sidebar-agents-{name}-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
+fn agents_state(show: Option<bool>, prefs: &std::path::Path) -> ClientShellState {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.show = show;
+    let mut state = ClientShellState::new(
+        ClientShellConfig::from_config(&config).with_preferences_path(prefs.to_path_buf()),
+    );
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state
+}
+
+fn stored_agents_override(prefs: &std::path::Path) -> Option<serde_json::Value> {
+    let stored = std::fs::read_to_string(prefs).ok()?;
+    serde_json::from_str::<serde_json::Value>(&stored)
+        .ok()?
+        .get("sidebar_agents")
+        .cloned()
+}
+
+fn toggle_agents(state: &mut ClientShellState) {
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebarAgents),
+        &mut ClientShellInput::default(),
+    );
+}
+
+#[test]
+fn agents_toggle_is_saved_and_restored_while_config_is_unchanged() {
+    let prefs = agents_prefs_path("roundtrip");
+    let mut state = agents_state(None, &prefs);
+    toggle_agents(&mut state);
+    assert_eq!(
+        stored_agents_override(&prefs),
+        Some(serde_json::json!({ "visible": false }))
+    );
+
+    let restarted = agents_state(None, &prefs);
+    assert!(!restarted.sidebar_agents_visible);
+    assert!(restarted.sidebar_agents_override.is_some());
+    let _ = std::fs::remove_file(prefs);
+}
+
+#[test]
+fn agents_toggle_is_dropped_at_startup_after_an_offline_config_edit() {
+    let prefs = agents_prefs_path("offline");
+    let mut state = agents_state(None, &prefs);
+    toggle_agents(&mut state);
+    toggle_agents(&mut state);
+    assert_eq!(
+        stored_agents_override(&prefs),
+        Some(serde_json::json!({ "visible": true }))
+    );
+
+    // `show = false` written while no client runs wins over the saved "visible" toggle.
+    let restarted = agents_state(Some(false), &prefs);
+    assert!(!restarted.sidebar_agents_visible);
+    assert!(restarted.sidebar_agents_override.is_none());
+    assert_eq!(stored_agents_override(&prefs), None);
+    let _ = std::fs::remove_file(prefs);
+}
+
 #[test]
 fn config_reload_applies_agents_visibility_over_a_runtime_toggle() {
     let _guard = crate::config::test_config_env_lock().lock().unwrap();
-    let path = std::env::temp_dir().join(format!(
+    let config_path = std::env::temp_dir().join(format!(
         "herdr-sidebar-agents-reload-{}.toml",
         std::process::id()
     ));
-    std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.set_snapshot(Box::new(snapshot()));
-    state.set_pane_surface(surface());
+    let _ = std::fs::remove_file(&config_path);
+    std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &config_path);
+    let prefs = agents_prefs_path("reload");
+    let mut state = agents_state(None, &prefs);
 
-    std::fs::write(&path, "[ui.sidebar.agents]\nshow = false\n").unwrap();
+    std::fs::write(&config_path, "[ui.sidebar.agents]\nshow = false\n").unwrap();
     state.reload_client_config();
     assert!(!state.sidebar_agents_visible);
     let frame = state.compose(106, 30).expect("reloaded hidden");
     assert!(!sidebar_text(&frame, state.sidebar_width).contains(" agents"));
 
-    // A runtime toggle holds until the config value changes again.
-    state.record_binding(
-        crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebarAgents),
-        &mut ClientShellInput::default(),
-    );
+    // A runtime toggle holds across a reload that does not change `show`.
+    toggle_agents(&mut state);
     state.reload_client_config();
     assert!(state.sidebar_agents_visible);
+    assert!(stored_agents_override(&prefs).is_some());
 
-    std::fs::write(&path, "[ui.sidebar.agents]\nshow = true\n").unwrap();
+    // Removing `show` is an edit too: the default (shown) applies and the toggle is dropped.
+    std::fs::write(&config_path, "").unwrap();
+    toggle_agents(&mut state);
     state.reload_client_config();
-    std::fs::write(&path, "[ui.sidebar.agents]\nshow = false\n").unwrap();
-    state.reload_client_config();
+    assert!(state.sidebar_agents_visible);
+    assert!(state.sidebar_agents_override.is_none());
+    assert_eq!(stored_agents_override(&prefs), None);
+
+    // An explicit `show = true` after a key-hide under the default brings the section back.
+    toggle_agents(&mut state);
     assert!(!state.sidebar_agents_visible);
-    assert!(!state.sidebar_agents_visible_manual);
+    std::fs::write(&config_path, "[ui.sidebar.agents]\nshow = true\n").unwrap();
+    state.reload_client_config();
+    assert!(state.sidebar_agents_visible);
+    assert!(state.sidebar_agents_override.is_none());
+    assert_eq!(stored_agents_override(&prefs), None);
 
     std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
-    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(config_path);
+    let _ = std::fs::remove_file(prefs);
+}
+
+#[test]
+fn hidden_agents_collapsed_rail_keeps_its_toggle_row_clear() {
+    let mut config = Config::default();
+    config.ui.sidebar.agents.show = Some(false);
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let mut many = snapshot();
+    let template = many.workspaces[0].clone();
+    many.workspaces = (0..41)
+        .map(|index| {
+            let mut workspace = template.clone();
+            workspace.workspace_id = format!("ws_{index}");
+            workspace.focused = index == 0;
+            workspace
+        })
+        .collect();
+    state.set_snapshot(Box::new(many));
+    state.set_pane_surface(surface());
+    state.sidebar_collapsed = true;
+    let frame = state
+        .compose(106, 20)
+        .expect("collapsed rail without agents");
+
+    let rail = frame_rows(&frame)
+        .iter()
+        .map(|row| row.chars().take(3).collect::<String>())
+        .collect::<Vec<_>>();
+    assert!(
+        rail.iter().all(|row| !row.contains('─')),
+        "hidden rail must not draw the agents divider: {rail:?}"
+    );
+    let toggle = state.hits.sidebar_toggle;
+    assert_ne!(toggle, Rect::default());
+    assert!(state
+        .hits
+        .workspaces
+        .iter()
+        .all(|hit| hit.rect.intersection(toggle).is_empty()));
+    assert_eq!(state.hits.workspaces.len(), 19);
 }

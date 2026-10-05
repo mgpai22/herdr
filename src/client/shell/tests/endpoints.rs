@@ -2614,4 +2614,24 @@ fn machine_sidebar_hides_agents_section_like_the_local_sidebar() {
     assert_eq!(state.hits.agent_body, Rect::default());
     assert!(state.hits.endpoint_agents.is_empty());
     assert!(state.hits.workspace_body.height > shown_body);
+
+    state.sidebar_collapsed = true;
+    let frame = state.compose(100, 28).expect("machine rail without agents");
+    let rail = frame_rows(&frame)
+        .iter()
+        .map(|row| row.chars().take(3).collect::<String>())
+        .collect::<Vec<_>>();
+    assert!(
+        rail.iter().all(|row| !row.contains('─')),
+        "hidden machine rail must not draw the agents divider: {rail:?}"
+    );
+    assert!(state.hits.endpoint_agents.is_empty());
+    let toggle = state.hits.sidebar_toggle;
+    assert!(state
+        .hits
+        .machines
+        .iter()
+        .map(|hit| hit.rect)
+        .chain(state.hits.workspaces.iter().map(|hit| hit.rect))
+        .all(|rect| rect.intersection(toggle).is_empty()));
 }

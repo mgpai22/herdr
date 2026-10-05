@@ -32,7 +32,16 @@ pub(in crate::client::shell) fn collapsed_sidebar_sections(
     if content.is_empty() {
         return (Rect::default(), None, Rect::default());
     }
-    if !show_agents || content.height < 7 {
+    if !show_agents {
+        // Keep the bottom row for the expand toggle, as the expanded sidebar does.
+        let height = content.height.saturating_sub(1);
+        return (
+            Rect::new(content.x, content.y, content.width, height),
+            None,
+            Rect::default(),
+        );
+    }
+    if content.height < 7 {
         return (content, None, Rect::default());
     }
     let workspace_height = content.height.div_ceil(2);

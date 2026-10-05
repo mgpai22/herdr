@@ -23,7 +23,10 @@ impl ClientShellState {
                 crate::input::KeybindAction::ToggleSidebarAgents,
             ) => {
                 self.sidebar_agents_visible = !self.sidebar_agents_visible;
-                self.sidebar_agents_visible_manual = true;
+                self.sidebar_agents_override = Some(super::preferences::SidebarAgentsOverride {
+                    visible: self.sidebar_agents_visible,
+                    config_show: self.config.agents.show,
+                });
                 outcome.repaint = true;
                 self.persist_chrome_preferences(outcome);
             }
