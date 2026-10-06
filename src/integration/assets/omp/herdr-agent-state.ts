@@ -6,7 +6,8 @@
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
-import { access, lstat, open, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, open, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import net from "node:net";
 import path from "node:path";
@@ -375,6 +376,12 @@ const SERVICE_TIERS: Record<string, string[]> = {
 };
 // The one status-line key the `status` op uses, so it never touches another extension's status.
 const STATUS_KEY = "herdr-sahur";
+// The status-line key of herdr's notice while a session change it started runs.
+const HOLD_STATUS_KEY = "herdr-session-change";
+// Enter as a terminal sends it: CR or LF, or the kitty keyboard protocol's form (any modifiers,
+// press or release), and xterm's modifyOtherKeys form.
+const ENTER_KEY = /\r|\n|\x1b\[13(?:;\d+(?::\d+)?)?u|\x1b\[27;\d+;13~/g;
+const ESCAPE_KEY = /^\x1b(?:\[27(?:;\d+(?::\d+)?)?u)?$/;
 const SUBAGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const SUBAGENT_STATUSES = new Set(["running", "idle", "parked", "aborted"]);
 // Roster sizes, largest first; the detail uses the first that fits.
@@ -2135,8 +2142,9 @@ export default function (pi) {
   async function sessionFileCwd(file: string): Promise<string | undefined> {
     let handle: any;
     try {
-      if (!(await lstat(file)).isFile()) return undefined;
-      handle = await open(file, "r");
+      // No symlink, and no wait on a FIFO swapped in; the type is checked on the open file.
+      handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      if (!(await handle.stat()).isFile()) return undefined;
       const buffer = Buffer.alloc(64 * 1024);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       // OMP 18.6 writes a padded title slot before the header once a session has a name.
@@ -2150,6 +2158,21 @@ export default function (pi) {
     } finally {
       await handle?.close?.().catch?.(() => {});
     }
+  }
+
+  // Whether the leaf already is where a move to `entryId` would put it: the leaf, past entries
+  // that are not conversation (herdr's own markers, labels, OMP's exit records), is that entry,
+  // or one of those markers records a herdr move to it.
+  function alreadyAt(manager: any, entryId: string): boolean {
+    let id = manager.getLeafId?.();
+    for (let step = 0; id && step < 64; step += 1) {
+      if (id === entryId) return true;
+      const entry = manager.getEntry?.(id);
+      if (entry?.type === "custom" && entry.customType === "herdr-leaf" && entry.data?.entry_id === entryId) return true;
+      if (entry?.type !== "custom" && entry?.type !== "label") return false;
+      id = entry.parentId;
+    }
+    return false;
   }
 
   // `tree`, `fork`, `new_session`, `switch_session`: OMP's own session changes, run through the
@@ -2186,7 +2209,6 @@ export default function (pi) {
       }
     }
     const previous = manager.getSessionFile?.();
-    const activation = activations;
     const editorWasEmpty = !ctx?.ui?.getEditorText?.();
     const sessionData = () => {
       const file = manager.getSessionFile?.();
@@ -2196,9 +2218,10 @@ export default function (pi) {
       };
     };
     // A change that ended without a session event leaves the listener OMP dropped (or herdr's
-    // withdrawal) in place: register again now instead of after the settle wait.
+    // withdrawal) in place: register again now instead of after the settle wait. A change that
+    // ended with one has registered already.
     const restore = async () => {
-      if (activation !== activations) return;
+      if (instructionListener) return;
       clearInterval(withdrawalWatch);
       withdrawalWatch = undefined;
       registerInstructionListener(ctx);
@@ -2210,43 +2233,71 @@ export default function (pi) {
         await delay(20);
       }
     };
-    void (async () => {
+    const summarizing = op === "tree" && args.summarize === true;
+    const run = async (): Promise<{ ok: boolean; error?: string; data?: Record<string, unknown> }> => {
       if (op === "switch_session") {
         const dir = isAbsoluteSessionPath(previous) ? path.dirname(previous) : undefined;
-        if (target === previous) return finish({ ok: false, error: "already_current: OMP runs that session now" });
+        if (target === previous) return { ok: false, error: "already_current: OMP runs that session now" };
         if (dir === undefined || path.dirname(target) !== dir) {
-          return finish({ ok: false, error: "not_same_project: session_path must be in the current session's directory" });
+          return { ok: false, error: "not_same_project: session_path must be in the current session's directory" };
         }
         const cwd = await sessionFileCwd(target);
-        if (cwd === undefined) return finish({ ok: false, error: "no_session_file: session_path is not a readable OMP session file" });
+        if (cwd === undefined) return { ok: false, error: "no_session_file: session_path is not a readable OMP session file" };
         if (cwd !== manager.getCwd?.()) {
-          return finish({ ok: false, error: "not_same_project: that session belongs to another directory" });
+          return { ok: false, error: "not_same_project: that session belongs to another directory" };
         }
         // The file read awaited: the agent may have started a turn meanwhile.
         const late = sessionChangeBlocked(ctx, session);
-        if (late) return finish({ ok: false, error: late });
+        if (late) return { ok: false, error: late };
       }
-      let cancelled: boolean;
+      const hold = { session, summarizing, enterHeld: false, escaped: false, personSubmitted: false };
+      sessionHold = hold;
+      try {
+        ctx?.ui?.setStatus?.(
+          HOLD_STATUS_KEY,
+          summarizing ? "herdr: summarizing the branch; Enter waits, Esc cancels" : "herdr: changing the session; Enter waits",
+        );
+      } catch {}
+      let cancelled = false;
       const data: Record<string, unknown> = {};
       try {
         if (op === "tree") {
-          cancelled = (await cc.navigateTree(entryId, { summarize: args.summarize === true }))?.cancelled === true;
-          if (!cancelled) {
-            const leaf = manager.getLeafId?.();
-            const summarized = leaf ? manager.getEntry?.(leaf)?.type === "branch_summary" : false;
-            if (summarized) data.summary_entry_id = leaf;
-            // OMP restores the leaf from the last entry in the file: only an entry written now keeps
-            // the move across a restart.
+          if (alreadyAt(manager, entryId)) {
+            // The leaf is where a herdr move to this entry put it: moving again would only add
+            // a marker, and a summary of nothing.
             if (args.label !== undefined) manager.appendLabelChange(entryId, args.label.trim());
-            else if (!summarized) pi.appendEntry("herdr-leaf", { entry_id: entryId });
+          } else {
+            cancelled = (await cc.navigateTree(entryId, { summarize: summarizing }))?.cancelled === true;
+            if (!cancelled) {
+              const leaf = manager.getLeafId?.();
+              const summarized = leaf ? manager.getEntry?.(leaf)?.type === "branch_summary" : false;
+              if (summarized) data.summary_entry_id = leaf;
+              // OMP restores the leaf from the last entry in the file: only an entry written now
+              // keeps the move across a restart.
+              if (args.label !== undefined) manager.appendLabelChange(entryId, args.label.trim());
+              else if (!summarized) pi.appendEntry("herdr-leaf", { entry_id: entryId });
+            }
+          }
+          if (!cancelled) {
             data.entry_id = entryId;
             data.leaf_id = manager.getLeafId?.();
-            data.editor_filled = editorWasEmpty && !!ctx?.ui?.getEditorText?.();
+            // OMP puts a user message target into an empty editor; text the person typed during
+            // the change is not that.
+            const entry = manager.getEntry?.(entryId);
+            const text = entry?.type === "message" && entry.message?.role === "user" ? messageText(entry.message.content) : undefined;
+            data.editor_filled = editorWasEmpty && text !== undefined && ctx?.ui?.getEditorText?.()?.trim() === text.trim();
           }
         } else if (op === "fork") {
           cancelled = (await session.fork(entryId, { requireIdle: true })) !== true;
-          // A fork at an entry swaps the session without redrawing it.
-          if (!cancelled && entryId !== undefined) await cc.reload();
+          // A fork at an entry swaps the session without redrawing it. The fork stands even when
+          // the redraw fails.
+          if (!cancelled && entryId !== undefined) {
+            try {
+              await cc.reload();
+            } catch {
+              data.redraw_failed = true;
+            }
+          }
         } else if (op === "new_session") {
           cancelled = (await cc.newSession())?.cancelled === true;
         } else {
@@ -2255,21 +2306,58 @@ export default function (pi) {
       } catch (error) {
         await restore();
         const busy = error?.name === "SessionBusyError";
-        return finish({
+        return {
           ok: false,
           error: busy ? "busy: the agent is working; retry when it is idle" : `failed: ${cap(error?.message ?? error, 200)}`,
-        });
+        };
+      } finally {
+        if (sessionHold === hold) sessionHold = undefined;
+        try {
+          ctx?.ui?.setStatus?.(HOLD_STATUS_KEY, undefined);
+          if (hold.enterHeld) ctx?.ui?.notify?.("herdr held your Enter during a session change; press Enter to send", "info");
+        } catch {}
       }
       if (cancelled) {
         await restore();
-        return finish({ ok: false, error: "cancelled: another extension cancelled the change; the session did not change" });
+        if (hold.personSubmitted) {
+          return { ok: false, error: "busy: a prompt was submitted as the change started; the session did not change" };
+        }
+        if (hold.escaped) return { ok: false, error: "cancelled: the person pressed Esc during the summary; the leaf did not move" };
+        return { ok: false, error: "cancelled: another extension cancelled the change; the session did not change" };
       }
+      await restore();
       await settled();
       Object.assign(data, sessionData());
       if (op !== "tree" && isAbsoluteSessionPath(previous)) data.previous_session_path = previous;
-      finish({ ok: true, data });
-    })();
+      return { ok: true, data };
+    };
+    void run().then(finish);
     return rest;
+  }
+
+  // A session change herdr started and is running now. A person's Enter would submit a prompt
+  // that OMP puts on the session or branch the change is leaving (a summary model call runs
+  // before the move; other extensions' switch handlers run before the swap), so Enter is held
+  // until the change ends and the text stays in the editor. Esc stops a branch summary, as in
+  // OMP's own `/tree`.
+  let sessionHold:
+    | { session: any; summarizing: boolean; enterHeld: boolean; escaped: boolean; personSubmitted: boolean }
+    | undefined;
+
+  function holdKey(data: string) {
+    if (!sessionHold || data.startsWith("\x1b[200~")) return undefined;
+    if (ESCAPE_KEY.test(data)) {
+      if (!sessionHold.summarizing) return undefined;
+      sessionHold.escaped = true;
+      try {
+        sessionHold.session.abortBranchSummary?.();
+      } catch {}
+      return { consume: true };
+    }
+    const kept = data.replace(ENTER_KEY, "");
+    if (kept === data) return undefined;
+    sessionHold.enterHeld = true;
+    return kept ? { data: kept } : { consume: true };
   }
 
   function registerInstructionListener(ctx: {
@@ -2281,6 +2369,8 @@ export default function (pi) {
     // registers a fresh one.
     unsubscribeInstructions?.();
     unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => {
+      const held = holdKey(data);
+      if (held) return held;
       const key = takeKey(data);
       if (key) return key;
       const taken = takeAction(ctx, data) ?? takeInstruction(ctx, data);
@@ -2761,6 +2851,16 @@ export default function (pi) {
       if (sessionRef) {
         await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
       }
+      const hold = sessionHold;
+      if (!hold) return undefined;
+      // A change herdr started: OMP cleared every input listener before this event, so a person
+      // may have submitted a prompt since herdr checked. It would run in the session being left.
+      if (ctx?.isIdle?.() !== true || hold.session.hasAdmittedSubmission === true || ctx?.hasPendingMessages?.() === true) {
+        hold.personSubmitted = true;
+        return { cancel: true };
+      }
+      // Hold Enter for the rest of the change (other extensions' handlers, the swap).
+      unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => holdKey(data));
       return undefined;
     });
   }

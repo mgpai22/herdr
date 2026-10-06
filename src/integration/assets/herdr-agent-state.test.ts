@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterEach, expect, mock, setSystemTime, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { access, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1614,7 +1614,9 @@ async function installOmpForActions(name: string, piExtras: Record<string, unkno
     {
       onTerminalInput(handler: TerminalInputHandler) {
         listener = handler;
-        return () => {};
+        return () => {
+          if (listener === handler) listener = undefined;
+        };
       },
       getEditorText: () => editor,
       setEditorText: (text: string) => (editor = text),
@@ -1678,6 +1680,8 @@ async function installOmpForActions(name: string, piExtras: Record<string, unkno
     resolved,
     askEnded,
     listener: (data: string) => listener?.(data),
+    // OMP's `prepareSessionSwitch`: every extension input listener is dropped.
+    clearInput: () => (listener = undefined),
     aborted: () => aborted,
     editor: () => editor,
     setEditor: (text: string) => (editor = text),
@@ -3394,10 +3398,30 @@ test("Oh My Pi keeps a known missing tombstone when only the subagent's abort ou
 // An OMP root session reached through the agent registry, with a command context that emits the
 // session events OMP emits around each change.
 async function installOmpForSessions(name: string, extras: { mode?: string; foreignManager?: boolean } = {}) {
-  const entries = new Map<string, { id: string; type: string }>(
-    ["u1", "a1", "c1"].map((id) => [id, { id, type: id === "c1" ? "custom" : "message" }]),
-  );
-  const state = { file: "/tmp/omp-instruct.jsonl", id: "omp-instruct", leaf: "a1", transitioning: false, cancel: false, forkBusy: false };
+  const entries = new Map<string, Record<string, any>>([
+    ["root", { id: "root", type: "message", parentId: null, message: { role: "assistant", content: "hello" } }],
+    ["u1", { id: "u1", type: "message", parentId: "root", message: { role: "user", content: [{ type: "text", text: "first question" }] } }],
+    ["a1", { id: "a1", type: "message", parentId: "u1", message: { role: "assistant", content: "answer" } }],
+    ["c1", { id: "c1", type: "custom", customType: "note", parentId: "a1" }],
+  ]);
+  const state = {
+    file: "/tmp/omp-instruct.jsonl",
+    id: "omp-instruct",
+    leaf: "a1",
+    transitioning: false,
+    cancel: false,
+    forkBusy: false,
+    reloadFails: false,
+    admitted: false,
+    // Runs inside a change, after the before-event (the time other extensions' handlers take).
+    duringChange: undefined as (() => unknown) | undefined,
+    // A pending summary: navigateTree waits for it; abortBranchSummary ends it cancelled.
+    summary: undefined as PromiseWithResolvers<boolean> | undefined,
+  };
+  const append = (entry: Record<string, any>) => {
+    entries.set(entry.id, { ...entry, parentId: state.leaf });
+    state.leaf = entry.id;
+  };
   const appended: unknown[] = [];
   const labels: unknown[] = [];
   const calls: unknown[] = [];
@@ -3409,15 +3433,18 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
     getCwd: () => "/proj",
     appendLabelChange: (target: string, label: string | undefined) => {
       labels.push([target, label]);
-      state.leaf = `label${labels.length}`;
+      append({ id: `label${labels.length}`, type: "label", targetId: target, label });
     },
   };
   let omp: Awaited<ReturnType<typeof installOmpForActions>>;
   const emit = (event: string, data: unknown) => omp.harness.handlers.get(event)?.(data, omp.harness.context);
   // OMP's switch: the before-event, then (unless cancelled) the swap and the after-event.
   const swap = async (reason: string, file: string, id: string) => {
-    await emit(reason === "branch" || reason === "fork-entry" ? "session_before_branch" : "session_before_switch", { reason });
-    if (state.cancel) return false;
+    const before = (await emit(reason === "branch" || reason === "fork-entry" ? "session_before_branch" : "session_before_switch", { reason })) as
+      | { cancel?: boolean }
+      | undefined;
+    if (before?.cancel || state.cancel) return false;
+    await state.duringChange?.();
     state.file = file;
     state.id = id;
     await emit(reason === "branch" || reason === "fork-entry" ? "session_branch" : "session_switch", { reason });
@@ -3427,6 +3454,8 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
     navigateTree: async (id: string, options: unknown) => {
       calls.push(["navigateTree", id, options]);
       if (state.cancel) return { cancelled: true };
+      await state.duringChange?.();
+      if (state.summary && !(await state.summary.promise)) return { cancelled: true };
       state.leaf = id === "u1" ? "root" : id;
       if (id === "u1" && !omp.editor()) omp.setEditor("first question");
       await emit("session_tree", {});
@@ -3434,14 +3463,20 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
     },
     newSession: async () => {
       calls.push(["newSession"]);
+      omp.clearInput();
       return { cancelled: !(await swap("new", "/tmp/omp-new.jsonl", "omp-new")) };
     },
     switchSession: async (file: string) => {
       calls.push(["switchSession", file]);
+      omp.clearInput();
       return { cancelled: !(await swap("resume", file, "omp-switched")) };
     },
     reload: async () => {
       calls.push(["reload"]);
+      if (state.reloadFails) {
+        await emit("session_before_switch", { reason: "resume" });
+        throw new Error("Session reload cancelled");
+      }
       await swap("resume", state.file, state.id);
     },
   };
@@ -3451,6 +3486,13 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
       return state.transitioning;
     },
     extensionRunner: { createCommandContext: () => cc },
+    get hasAdmittedSubmission() {
+      return state.admitted;
+    },
+    abortBranchSummary: () => {
+      calls.push(["abortBranchSummary"]);
+      state.summary?.resolve(false);
+    },
     fork: async (entryId: string | undefined, options: unknown) => {
       calls.push(["fork", entryId, options]);
       if (state.forkBusy) throw Object.assign(new Error("busy"), { name: "SessionBusyError" });
@@ -3462,7 +3504,7 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
     getSessionName: () => "Parser fix",
     appendEntry: (type: string, data: unknown) => {
       appended.push([type, data]);
-      state.leaf = `custom${appended.length}`;
+      append({ id: `custom${appended.length}`, type: "custom", customType: type, data });
     },
     setSessionName: (title: string) => calls.push(["setSessionName", title]),
   });
@@ -3486,15 +3528,30 @@ test("Oh My Pi moves the tree leaf through the command context and keeps the mov
     session_path: "/tmp/omp-instruct.jsonl",
     session_id: "omp-instruct",
   });
+  // A second move to the same entry finds the leaf there: no move, no marker, no empty summary.
+  const again = await omp.act({ op: "tree", args: { entry_id: "u1", summarize: true } });
+  expect(again.ack.data).toMatchObject({ entry_id: "u1", leaf_id: "custom1" });
+  expect(calls).toHaveLength(1);
+  expect(appended).toHaveLength(1);
   // An empty editor gets the user message, as OMP's /tree does; a label keeps the move instead.
   omp.setEditor("");
   const labelled = await omp.act({ op: "tree", args: { entry_id: "u1", summarize: true, label: "retry here" } });
-  expect(labelled.ack.data).toMatchObject({ leaf_id: "label1", editor_filled: true });
+  expect(labelled.ack.data).toMatchObject({ leaf_id: "label1", editor_filled: false });
   expect(labels).toEqual([["u1", "retry here"]]);
-  expect(appended).toHaveLength(1);
+  const filled = await omp.act({ op: "tree", args: { entry_id: "a1" } });
+  expect(filled.ack.ok).toBe(true);
+  const back = await omp.act({ op: "tree", args: { entry_id: "u1", summarize: true } });
+  expect(back.ack.data).toMatchObject({ editor_filled: true });
+  expect(omp.editor()).toBe("first question");
+  expect(appended).toHaveLength(3);
   expect(calls.at(-1)).toEqual(["navigateTree", "u1", { summarize: true }]);
-  await waitFor(() => omp.details().at(-1)?.leaf_id === "label1");
-  expect(omp.details().at(-1)).toMatchObject({ session_name: "Parser fix", leaf_id: "label1" });
+  await waitFor(() => omp.details().at(-1)?.leaf_id === "custom3");
+  expect(omp.details().at(-1)).toMatchObject({ session_name: "Parser fix", leaf_id: "custom3" });
+  // Text the person types during a move is not OMP's fill.
+  omp.setEditor("");
+  state.duringChange = () => omp.setEditor("typed by the person");
+  expect((await omp.act({ op: "tree", args: { entry_id: "a1" } })).ack.data).toMatchObject({ editor_filled: false });
+  state.duringChange = undefined;
   expect(state.file).toBe("/tmp/omp-instruct.jsonl");
   expect((await omp.act({ op: "tree", args: { entry_id: "nope" } })).ack.error).toStartWith("no_entry:");
   expect((await omp.act({ op: "tree", args: {} })).ack.error).toStartWith("invalid_args:");
@@ -3629,4 +3686,101 @@ test("Oh My Pi labels entries and renames the session", async () => {
   expect((await omp.act({ op: "label", args: { entry_id: "zz", text: "x" } })).ack.error).toStartWith("no_entry:");
   expect((await omp.act({ op: "rename", args: { title: "Parser fix" } })).ack.data).toEqual({ name: "Parser fix" });
   expect(calls).toEqual([["setSessionName", "Parser fix"]]);
+});
+
+test("Oh My Pi holds Enter during a herdr branch summary and lets Esc cancel it", async () => {
+  const statuses: unknown[] = [];
+  const notices: unknown[] = [];
+  const { omp, state, calls, appended } = await installOmpForSessions("omp-session-summary-hold");
+  Object.assign(omp.harness.context.ui as Record<string, unknown>, {
+    setStatus: (key: string, text: unknown) => statuses.push([key, text]),
+    notify: (text: string) => notices.push(text),
+  });
+  state.summary = Promise.withResolvers<boolean>();
+  const id = "f".repeat(32);
+  expect(omp.listener(actionBlock(id, { op: "tree", args: { entry_id: "u1", summarize: true } }))).toEqual({ consume: true });
+  await waitFor(() => calls.length === 1);
+  expect(statuses.at(-1)).toEqual(["herdr-session-change", "herdr: summarizing the branch; Enter waits, Esc cancels"]);
+  // The person's Enter never submits during the summary; the text they type still reaches OMP.
+  expect(omp.listener("\r")).toEqual({ consume: true });
+  expect(omp.listener("\x1b[13u")).toEqual({ consume: true });
+  expect(omp.listener("more\r")).toEqual({ data: "more" });
+  expect(omp.listener("x")).toBeUndefined();
+  // Esc stops OMP's summarizer.
+  expect(omp.listener("\x1b")).toEqual({ consume: true });
+  expect(calls).toContainEqual(["abortBranchSummary"]);
+  const ack = await omp.finalAck(id);
+  expect(ack.error).toStartWith("cancelled: the person pressed Esc");
+  expect(appended).toEqual([]);
+  expect(statuses.at(-1)).toEqual(["herdr-session-change", undefined]);
+  expect(notices).toEqual(["herdr held your Enter during a session change; press Enter to send"]);
+  // Afterwards Enter passes again.
+  expect(omp.listener("\r")).toBeUndefined();
+
+  // A summary that ends acks only once the leaf moved.
+  state.summary = Promise.withResolvers<boolean>();
+  const next = "e".repeat(32);
+  omp.listener(actionBlock(next, { op: "tree", args: { entry_id: "u1", summarize: true } }));
+  await waitFor(() => calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 2);
+  await Bun.sleep(30);
+  expect(omp.acks().some((ack) => ack.action_id === next)).toBe(false);
+  state.summary.resolve(true);
+  expect((await omp.finalAck(next)).data).toMatchObject({ entry_id: "u1", leaf_id: "custom1" });
+});
+
+test("Oh My Pi cancels its own session change when a person submitted as it started, and holds Enter after", async () => {
+  const { omp, state, calls } = await installOmpForSessions("omp-session-submitted");
+  // A prompt admitted between herdr's check and the change: OMP would run it in the old session.
+  state.duringChange = undefined;
+  state.admitted = true;
+  const { ack } = await omp.act({ op: "new_session", args: {} });
+  expect(ack.error).toStartWith("busy: a prompt was submitted");
+  expect(state.file).toBe("/tmp/omp-instruct.jsonl");
+  expect(omp.harness.reports().at(-1)?.params.accepts_instructions).toBe(true);
+  // Without one, Enter during the rest of the change (another extension's slow handler) is held.
+  state.admitted = false;
+  let during: unknown;
+  state.duringChange = () => {
+    during = omp.listener("\r");
+  };
+  const second = await omp.act({ op: "new_session", args: {} });
+  expect(second.ack.ok).toBe(true);
+  expect(during).toEqual({ consume: true });
+  expect(calls.filter((call) => (call as unknown[])[0] === "newSession")).toHaveLength(2);
+});
+
+test("Oh My Pi keeps an entry fork whose redraw fails, and registers the fork at once", async () => {
+  const { omp, state } = await installOmpForSessions("omp-session-fork-redraw");
+  state.reloadFails = true;
+  const { id, ack } = await omp.act({ op: "fork", args: { entry_id: "a1" } });
+  expect(ack.ok).toBe(true);
+  expect(ack.data).toMatchObject({ session_path: "/tmp/omp-fork.jsonl", redraw_failed: true });
+  const requests = omp.harness.requests as { method?: string; params?: Record<string, unknown> }[];
+  const acked = requests.findIndex((request) => request.params?.action_id === id);
+  const last = requests.slice(0, acked).findLast((request) => request.method === "pane.report_agent_session_v2");
+  expect(last?.params).toMatchObject({ agent_session_path: "/tmp/omp-fork.jsonl", accepts_instructions: true });
+});
+
+test("Oh My Pi reads a switch target without following a symlink or waiting on a FIFO", async () => {
+  const { omp, calls } = await installOmpForSessions("omp-session-switch-special");
+  const real = `/tmp/omp-switch-real-${process.pid}.jsonl`;
+  const link = `/tmp/omp-switch-link-${process.pid}.jsonl`;
+  const fifo = `/tmp/omp-switch-fifo-${process.pid}.jsonl`;
+  await writeFile(real, `${JSON.stringify({ type: "session", id: "s", cwd: "/proj" })}\n`);
+  await rm(link, { force: true });
+  await rm(fifo, { force: true });
+  await symlink(real, link);
+  expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+  try {
+    for (const session_path of [link, fifo]) {
+      const started = Date.now();
+      expect((await omp.act({ op: "switch_session", args: { session_path } })).ack.error).toStartWith("no_session_file:");
+      expect(Date.now() - started).toBeLessThan(900);
+    }
+    expect(calls).toEqual([]);
+  } finally {
+    await rm(real, { force: true });
+    await rm(link, { force: true });
+    await rm(fifo, { force: true });
+  }
 });

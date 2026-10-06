@@ -35,7 +35,8 @@ fn action_ack_timeout(op: crate::api::schema::AgentActionOp) -> Duration {
     }
 }
 /// The longest an instruction may wait in the server queue before it is written. With the ack
-/// wait this stays under the 15 s that callers allow for an answer.
+/// wait this stays under the 15 s that callers allow for an answer (125 s for the session
+/// changes, whose ack wait is `SESSION_ACTION_ACK_TIMEOUT`).
 const INSTRUCTION_QUEUE_LIMIT: Duration = Duration::from_secs(5);
 /// The integration discards a block that reaches it later than this after it was written. The
 /// rest of the ack timeout leaves time for the take to be acked.
@@ -203,6 +204,9 @@ pub(crate) struct PendingActionAck {
     pub(super) withdraws_listener: bool,
     /// The answer keys of the first ack were written; a second set is refused.
     pub(super) keys_written: bool,
+    /// The session file a pending `switch_session` asked for: no other pane may switch to it
+    /// until this one has its result.
+    pub(super) switch_target: Option<String>,
 }
 
 pub(crate) enum ActionResult {
@@ -569,30 +573,44 @@ impl App {
             ListenerWrite::Action,
             |agent| params.validate(agent),
         )?;
-        if params.op == crate::api::schema::AgentActionOp::SwitchSession {
-            if let Some(path) = params
-                .args
-                .get("session_path")
-                .and_then(|path| path.as_str())
+        let switch_target = (params.op == crate::api::schema::AgentActionOp::SwitchSession)
+            .then(|| {
+                params
+                    .args
+                    .get("session_path")
+                    .and_then(|path| path.as_str())
+            })
+            .flatten();
+        if let Some(path) = switch_target {
+            if self
+                .pending_action_acks
+                .values()
+                .any(|pending| pending.switch_target.as_deref() == Some(path))
             {
-                let runs_it = self.collect_agent_infos().into_iter().find(|other| {
-                    other.terminal_id != agent.terminal_id
-                        && other
-                            .agent_session
-                            .as_ref()
-                            .is_some_and(|session| session.value == path)
-                });
-                if let Some(other) = runs_it {
-                    return Err(encode_error(
-                        id,
-                        "agent_action_refused",
-                        format!(
-                            "session_in_use: agent {} in pane {} runs that session; nothing was sent",
-                            other.name.as_deref().unwrap_or("(unnamed)"),
-                            other.pane_id
-                        ),
-                    ));
-                }
+                return Err(encode_error(
+                    id,
+                    "agent_action_refused",
+                    "session_in_use: another pane is switching to that session now; nothing was sent"
+                        .to_string(),
+                ));
+            }
+            let runs_it = self.collect_agent_infos().into_iter().find(|other| {
+                other.terminal_id != agent.terminal_id
+                    && other
+                        .agent_session
+                        .as_ref()
+                        .is_some_and(|session| session.value == path)
+            });
+            if let Some(other) = runs_it {
+                return Err(encode_error(
+                    id,
+                    "agent_action_refused",
+                    format!(
+                        "session_in_use: agent {} in pane {} runs that session; nothing was sent",
+                        other.name.as_deref().unwrap_or("(unnamed)"),
+                        other.pane_id
+                    ),
+                ));
             }
         }
         let action_id = new_instruction_id(&id, terminal_id.as_str());
@@ -626,6 +644,7 @@ impl App {
                 deadline,
                 withdraws_listener: true,
                 keys_written: false,
+                switch_target: switch_target.map(str::to_string),
             },
         );
         let op = params.op;
@@ -3341,6 +3360,28 @@ mod tests {
             ),
         );
         assert_eq!(sent_action(&mut rx).1["op"], "switch_session");
+        // While that switch waits for its result, no other pane may switch to the same file. The
+        // pending switch is handed to the other pane, so this agent can write again.
+        for pending in app.pending_action_acks.values_mut() {
+            pending.terminal_id = other_terminal.clone();
+        }
+        let claimed = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": "/elsewhere/free.jsonl" }),
+            ),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+        let claimed: crate::api::schema::ErrorResponse = serde_json::from_str(&claimed).unwrap();
+        assert!(
+            claimed.error.message.starts_with("session_in_use:"),
+            "{}",
+            claimed.error.message
+        );
+        assert!(rx.try_recv().is_err(), "nothing was written");
     }
 
     #[cfg(target_os = "linux")]
