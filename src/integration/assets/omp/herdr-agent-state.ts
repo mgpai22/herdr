@@ -7,7 +7,7 @@
 
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, open, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import net from "node:net";
 import path from "node:path";
@@ -364,6 +364,9 @@ const droppedWatchMs = 10_000;
 const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 40_000);
 // Interval knobs are at least 10 ms: 0 would spin for the life of the pane.
 const switchPollMs = Math.max(parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000), 10);
+// How long after OMP starts a session the integration looks for a prompt that OMP's exit left in
+// the session's spool. OMP restores its own draft at the end of its start-up; this runs after it.
+const spoolRestoreMs = parseDurationEnv("HERDR_OMP_SPOOL_RESTORE_MS", 1500);
 // How often the integration looks for a moved session file (`/move`, `/wt`).
 const moveWatchMs = Math.max(parseDurationEnv("HERDR_OMP_MOVE_WATCH_MS", 3000), 10);
 // How long OMP may take to report that a dialog closed after a person's key.
@@ -2284,6 +2287,17 @@ export default function (pi) {
       const hold: SessionHold = { session, summarizing, held: false, retryIgnored: false, personSubmitted: false };
       // The terminal UI, so the key hold can see which component has focus.
       captureTui(ctx);
+      if (!tuiRef && !focusNoticeShown) {
+        // The key hold needs OMP's focus; without it the editor's submit keys are held whatever has
+        // focus. Say so once, because a change of OMP's widget API would otherwise go unseen.
+        focusNoticeShown = true;
+        try {
+          ctx?.ui?.notify?.(
+            "herdr cannot read OMP's focus; during its session changes it holds Enter on . and c and the retry keys whatever has focus",
+            "warning",
+          );
+        } catch {}
+      }
       sessionHold = hold;
       try {
         ctx?.ui?.setStatus?.(
@@ -2411,15 +2425,18 @@ export default function (pi) {
     } catch {}
   }
 
-  // Whether OMP's core editor has keyboard focus: the component the input controller gave its
-  // retry and dequeue handlers. False when focus is unknown, so a key meant for a dialog, a
-  // selector or an overlay is never taken.
-  function editorFocused(): boolean {
+  let focusNoticeShown = false;
+
+  // Which component has keyboard focus: OMP's core editor (the component the input controller gave
+  // its retry and dequeue handlers), anything else (a dialog, a selector, an overlay), or unknown
+  // when the terminal UI could not be read.
+  function focusState(): "editor" | "other" | "unknown" {
+    if (!tuiRef) return "unknown";
     try {
-      const focused = tuiRef?.getFocused?.();
-      return typeof focused?.onRetry === "function" && typeof focused?.onDequeue === "function";
+      const focused = tuiRef.getFocused?.();
+      return typeof focused?.onRetry === "function" && typeof focused?.onDequeue === "function" ? "editor" : "other";
     } catch {
-      return false;
+      return "unknown";
     }
   }
 
@@ -2432,6 +2449,9 @@ export default function (pi) {
     if (ESCAPE_KEY.test(data)) {
       const signal = hold.signal;
       if (!hold.summarizing || !signal || signal.aborted) return undefined;
+      // Esc belongs to whatever has focus: a dialog keeps its own, and an unreadable focus is not
+      // taken for the editor's.
+      if (focusState() !== "editor") return undefined;
       try {
         hold.session.abortBranchSummary?.();
       } catch {}
@@ -2441,7 +2461,9 @@ export default function (pi) {
     const retry = RETRY_KEY.test(data);
     const paste = PASTE_THEN_ENTER.exec(data);
     if (!retry && !paste && !BARE_ENTER.test(data)) return undefined;
-    if (!editorFocused()) return undefined;
+    // The submit path fails closed: with the focus unreadable the keys are held (a held Enter is
+    // never lost: the text stays in the editor).
+    if (focusState() === "other") return undefined;
     if (retry) {
       hold.retryIgnored = true;
       return { consume: true };
@@ -2458,40 +2480,259 @@ export default function (pi) {
     return paste ? { data: data.slice(0, data.lastIndexOf("\x1b[201~") + "\x1b[201~".length) } : { consume: true };
   }
 
-  // Held submissions with images, sent once, in order, with their own image data, to the session
-  // OMP runs when the change ended. The editor cannot take images back without losing where they
-  // came from (OMP tells the model each image's source file).
-  let heldReplays: { text: string; images: unknown[] }[] = [];
+  // Prompts with images submitted during a change, oldest first. OMP cleared the editor and cannot
+  // take images back, so herdr keeps them: in memory, and in a spool file beside the session in
+  // case OMP exits before the change ends. Their words are also back in the editor, so OMP's own
+  // draft save keeps those. A normal end sends them once, as one message, and removes the spool.
+  type HeldPrompt = { text: string; images: any[] };
+  let heldReplays: HeldPrompt[] = [];
+  const SPOOL_NAME = "herdr-held-prompt.json";
+  const IMAGE_EXTENSIONS: Record<string, string> = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+  };
+  // OMP's `[Image #N, WxH]` markers, which number a prompt's own images.
+  const IMAGE_MARKER = /\[(?:Image|Video) #[1-9]\d*(?:,[^\]\n]*)?\](?: attachment:\/\/\d+)?/g;
+  // Files herdr wrote for held images that have no file of their own (a pasted clipboard image).
+  const heldImageFiles = new WeakMap<object, string>();
+  let heldSpool: { file: string } | undefined;
+  let spoolQueue: Promise<void> = Promise.resolve();
+  let spoolWarned = false;
+  let spoolRestoreTimer: ReturnType<typeof setTimeout> | undefined;
+  let spoolCheckedFor: string | undefined;
+
+  // The words of a held prompt, without the markers of images that are not in the editor.
+  function wordsOf(text: string): string {
+    return text.replace(IMAGE_MARKER, "").replace(/[ \t]{2,}/g, " ").trim();
+  }
+
+  // The markers of the images of a prompt that follows `offset` earlier images.
+  function shiftMarkers(text: string, offset: number, count: number): string {
+    if (offset === 0) return text;
+    return text.replace(/\[(Image|Video) #([1-9]\d*)((?:,[^\]\n]*)?)\]/g, (marker, kind, number, tail) =>
+      Number(number) > count ? marker : `[${kind} #${Number(number) + offset}${tail}]`,
+    );
+  }
+
+  function artifactsDir(ctx: any): string | undefined {
+    try {
+      const dir = ctx?.sessionManager?.getArtifactsDir?.();
+      return typeof dir === "string" && path.isAbsolute(dir) ? dir : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // The person's own file behind an image, when OMP tagged one (the symbol property
+  // `image.attachmentSource`): an absolute path to an image.
+  function imageSourcePath(image: any): string | undefined {
+    for (const symbol of Object.getOwnPropertySymbols(image ?? {})) {
+      if (symbol.description !== "image.attachmentSource") continue;
+      const source = image[symbol];
+      if (source?.kind === "image" && typeof source.path === "string" && path.isAbsolute(source.path)) return source.path;
+    }
+    return undefined;
+  }
+
+  async function isFile(file: string): Promise<boolean> {
+    return stat(file).then((info) => info.isFile(), () => false);
+  }
+
+  // A private copy of an image that has no file of its own, in the session's artifact directory.
+  async function saveHeldImage(dir: string, image: any): Promise<string | undefined> {
+    const extension = IMAGE_EXTENSIONS[image?.mimeType];
+    if (!extension || typeof image.data !== "string" || image.data.startsWith("blob:")) return undefined;
+    const file = path.join(dir, `herdr-held-${crypto.randomUUID()}.${extension}`);
+    await writeFile(file, Buffer.from(image.data, "base64"), { flag: "wx", mode: 0o600 });
+    heldImageFiles.set(image, file);
+    return file;
+  }
+
+  // Writes every held prompt to one spool file in the session's artifact directory (mode 0600, the
+  // images by path). Writes run one at a time; the file is replaced whole, so OMP's exit leaves
+  // the last complete one. A spool in another directory (the session changed) is removed.
+  function writeSpool(ctx: any): Promise<void> {
+    spoolQueue = spoolQueue.then(async () => {
+      const dir = artifactsDir(ctx);
+      if (heldReplays.length === 0) return;
+      try {
+        if (!dir) throw new Error("no artifact directory");
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        const prompts: { text: string; images: string[] }[] = [];
+        for (const { text, images } of heldReplays) {
+          const held: string[] = [];
+          for (const image of images) {
+            let file = imageSourcePath(image);
+            if (file !== undefined && !(await isFile(file))) file = undefined;
+            file ??= heldImageFiles.get(image) ?? (await saveHeldImage(dir, image));
+            if (file) held.push(file);
+          }
+          prompts.push({ text, images: held });
+        }
+        const file = path.join(dir, SPOOL_NAME);
+        const temporary = `${file}.${process.pid}.tmp`;
+        await writeFile(temporary, JSON.stringify({ v: 1, prompts }), { mode: 0o600 });
+        await rename(temporary, file);
+        const previous = heldSpool?.file;
+        heldSpool = { file };
+        if (previous !== undefined && previous !== file) await unlink(previous).catch(() => {});
+      } catch {
+        if (!spoolWarned) {
+          spoolWarned = true;
+          try {
+            ctx?.ui?.notify?.(
+              "herdr could not save your prompt's images; if OMP exits before the session change ends, they are lost",
+              "warning",
+            );
+          } catch {}
+        }
+      }
+    });
+    return spoolQueue;
+  }
+
+  // The change ended and the prompts were handled: the spool and the copies herdr made go.
+  function dropSpool(prompts: HeldPrompt[]): Promise<void> {
+    spoolQueue = spoolQueue.then(async () => {
+      const spool = heldSpool;
+      heldSpool = undefined;
+      if (spool) await unlink(spool.file).catch(() => {});
+      for (const { images } of prompts) {
+        for (const image of images) {
+          const copy = heldImageFiles.get(image);
+          if (copy) await unlink(copy).catch(() => {});
+        }
+      }
+    });
+    return spoolQueue;
+  }
+
+  // Takes held words out of the editor where hold put them, once, wherever they still are.
+  function removeWords(ctx: any, words: string[]) {
+    try {
+      const before = ctx?.ui?.getEditorText?.();
+      if (typeof before !== "string") return;
+      let text = before;
+      for (const word of words) {
+        const at = word ? text.indexOf(word) : -1;
+        if (at >= 0) text = (text.slice(0, at) + text.slice(at + word.length)).replace(/^\n/, "");
+      }
+      if (text !== before) ctx.ui.setEditorText?.(text);
+    } catch {}
+  }
+
   function replayHeld(ctx: any) {
-    const replays = heldReplays;
+    const prompts = heldReplays;
     heldReplays = [];
-    for (const { text, images } of replays) {
-      try {
-        const content = [...(text ? [{ type: "text", text }] : []), ...images];
-        pi.sendUserMessage(content, ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
-      } catch {}
+    if (prompts.length === 0) return;
+    // One message, in the order typed: two sends would race (the first waits for OMP to prepare its
+    // images, the second then queues ahead of it). Later prompts' image markers follow the earlier
+    // prompts' images.
+    const images: any[] = [];
+    const texts: string[] = [];
+    for (const prompt of prompts) {
+      texts.push(shiftMarkers(prompt.text, images.length, prompt.images.length));
+      images.push(...prompt.images);
     }
-    if (replays.length > 0) {
-      try {
-        ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
-      } catch {}
+    const text = texts.filter(Boolean).join("\n\n");
+    try {
+      pi.sendUserMessage([...(text ? [{ type: "text", text }] : []), ...images], ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
+    } catch {
+      // Nothing was sent: the words are still in the editor, and the spool puts the images back.
+      void spoolQueue.then(() => restoreSpool(ctx, true));
+      return;
     }
+    removeWords(ctx, prompts.map((prompt) => wordsOf(prompt.text)));
+    void dropSpool(prompts);
+    try {
+      ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
+    } catch {}
+  }
+
+  // Puts a spooled prompt back in the editor, without sending anything: its words (unless the
+  // editor already has them, as when OMP restored its draft) and its images as chips, which OMP
+  // makes of image paths. Then the spool is removed; image copies stay, because the chips use them.
+  async function restoreSpool(ctx: any, force = false): Promise<void> {
+    const dir = artifactsDir(ctx);
+    if (!dir) return;
+    const file = path.join(dir, SPOOL_NAME);
+    if (!force && (sessionHold || heldSpool?.file === file)) return;
+    let prompts: { text: string; images: string[] }[];
+    try {
+      const spool = JSON.parse(await readFile(file, "utf8"));
+      if (!Array.isArray(spool?.prompts)) return;
+      prompts = spool.prompts.flatMap((prompt: any) =>
+        typeof prompt?.text === "string" && Array.isArray(prompt.images)
+          ? [{
+              text: prompt.text,
+              images: prompt.images.filter((image: unknown) => typeof image === "string" && path.isAbsolute(image)),
+            }]
+          : [],
+      );
+    } catch {
+      return;
+    }
+    if (!force && (sessionHold || heldSpool?.file === file)) return;
+    const ui = ctx?.ui;
+    let lost = 0;
+    try {
+      const current = ui?.getEditorText?.();
+      const missing = prompts.map((prompt) => wordsOf(prompt.text)).filter((words) => words && !(current ?? "").includes(words));
+      if (missing.length > 0 && typeof current === "string") ui.setEditorText?.([...missing, current].filter(Boolean).join("\n"));
+      for (const { images } of prompts) {
+        for (const image of images) {
+          if (await isFile(image)) ui?.pasteToEditor?.(/\s/.test(image) ? `"${image}"` : image);
+          else lost += 1;
+        }
+      }
+      ui?.notify?.(
+        `herdr put the prompt you sent during a session change back in the editor after OMP restarted; nothing was sent. Press Enter to send it${lost > 0 ? ` (${lost} image file${lost === 1 ? " is" : "s are"} gone)` : ""}`,
+        "info",
+      );
+    } catch {}
+    if (heldSpool?.file === file) heldSpool = undefined;
+    await unlink(file).catch(() => {});
+  }
+
+  // Looks once per session directory, after OMP's own start-up draft restore.
+  function scheduleSpoolRestore(ctx: any) {
+    const dir = artifactsDir(ctx);
+    if (!dir || dir === spoolCheckedFor) return;
+    spoolCheckedFor = dir;
+    clearTimeout(spoolRestoreTimer);
+    spoolRestoreTimer = setTimeout(() => {
+      if (rootSession) void restoreSpool(ctx);
+    }, spoolRestoreMs);
+    spoolRestoreTimer.unref?.();
   }
 
   // A prompt the person submits while herdr's session change runs. The editor cleared it before
   // this event, and nothing runs now. A text prompt goes back into the editor as typed (a slash
   // command stays a command), and the person sends it into the session they now see. A prompt
-  // with images is sent once after the change.
-  pi.on("input", (event: any, ctx: any) => {
+  // with images is held (see above); the words of every held prompt go back into the editor at once
+  // too, so OMP's draft keeps them if OMP exits during the change.
+  pi.on("input", async (event: any, ctx: any) => {
     const hold = sessionHold;
     if (!hold || event?.source !== "interactive") return undefined;
-    const text = typeof event.text === "string" ? event.text : "";
+    let text = typeof event.text === "string" ? event.text : "";
     const images = Array.isArray(event.images) ? event.images : [];
+    const draft = ctx?.ui?.getEditorText?.() ?? "";
     if (images.length > 0) {
+      // The editor still showed the words of earlier held prompts, so a person who goes on typing
+      // sends them again: they are already held, and are not part of this prompt.
+      for (const earlier of heldReplays) {
+        const words = wordsOf(earlier.text);
+        const at = words ? text.indexOf(words) : -1;
+        if (at >= 0) text = (text.slice(0, at) + text.slice(at + words.length)).replace(/^[ \n]+/, "");
+      }
       heldReplays.push({ text, images });
+      const shown = heldReplays.map((prompt) => wordsOf(prompt.text)).filter(Boolean).join("\n");
+      if (shown) ctx?.ui?.setEditorText?.(draft ? `${shown}\n${draft}` : shown);
+      await writeSpool(ctx);
     } else if (text) {
       hold.held = true;
-      const draft = ctx?.ui?.getEditorText?.() ?? "";
       ctx?.ui?.setEditorText?.(draft ? `${text}\n${draft}` : text);
     }
     return { handled: true };
@@ -2668,6 +2909,10 @@ export default function (pi) {
       } catch {}
     }
     registerInstructionListener(ctx);
+    // A held prompt's spool follows the session into its new directory; a spool that an earlier OMP
+    // left is offered back to the editor.
+    if (heldReplays.length > 0 && heldSpool && path.dirname(heldSpool.file) !== artifactsDir(ctx)) void writeSpool(ctx);
+    scheduleSpoolRestore(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
     return true;
@@ -3030,6 +3275,8 @@ export default function (pi) {
     activations += 1;
     clearInterval(moveWatch);
     moveWatch = undefined;
+    clearTimeout(spoolRestoreTimer);
+    spoolRestoreTimer = undefined;
     unsubscribeRedirects?.();
     unsubscribeRedirects = undefined;
     redirectManager = undefined;

@@ -19,7 +19,8 @@
 - `herdr events subscribe --json '<params>'` prints an `events.subscribe` stream as JSON lines and exits 1 on an error line or when the stream ends. It also works with `--machine`, through the saved machine's SSH bridge.
 
 ### Fixed
-- An OMP agent whose session OMP moved to a new file, because another `omp` process held the file, kept the old file as its session in Herdr, and every instruction to it was dropped. The integration now registers the new file at once. `agent.start` refuses a `--resume` of a session a live OMP pane runs (`agent_session_in_use`).
+- An OMP agent whose session OMP moved to a new file, because another `omp` process held the file, kept the old file as its session in Herdr, and every instruction to it was dropped. The integration now registers the new file at once. `agent.start` refuses a `--resume` of a session a live OMP pane runs, and a `--continue` (or `-c`) whose newest session beside a live pane's is run by a live pane (`agent_session_in_use`).
+- A prompt with images that a person sent while an OMP session change started by Herdr ran is no longer lost when OMP exits first: its words are back in the editor at once, its images wait in a private file beside the session, and the next start puts it back in the editor without sending it. Several such prompts are sent as one message in the order typed, Esc stops a `tree` summary only while OMP's editor has focus, and the Enter and retry-key hold applies even when OMP's focus cannot be read (with a warning).
 - Herdr accepts the OMP session report after a branch, a fork at an entry or a `/btw` promotion (`session_start_source` `branch`). It was refused, which left the agent's listener withdrawn and its session on the old file until the next turn.
 - Descriptors received in a live handoff are close-on-exec, so processes started later can no longer keep the server lock after the server exits.
 

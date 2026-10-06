@@ -225,6 +225,29 @@ pub fn omp_resume_args(args: &[String]) -> Vec<&str> {
     values
 }
 
+/// Whether an OMP command line continues the newest session (`--continue`, `-c`).
+pub fn omp_continues_newest(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--continue" | "-c"))
+}
+
+/// The session file `omp --continue` opens among the sessions beside `session_path`: the
+/// `.jsonl` file in that directory with the newest modification time (the name breaks a tie).
+/// OMP also prefers the terminal's own last session when it has one, which Herdr cannot see.
+pub fn newest_session_beside(session_path: &str) -> Option<std::path::PathBuf> {
+    let dir = Path::new(session_path).parent()?;
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
+            Some((meta.modified().ok()?, entry.path()))
+        })
+        .max()
+        .map(|(_, path)| path)
+}
+
 /// Whether `omp --resume <value>`, run in `cwd`, can open the session file `session_path`: the
 /// same file for a path value (one with a separator or ending in `.jsonl`); otherwise OMP's
 /// prefix rule, case-insensitive, on the file's name and on the session id at its end.
@@ -1118,5 +1141,38 @@ mod tests {
             &AgentSessionRef::path(&agy_session).unwrap()
         )
         .is_none());
+    }
+
+    #[test]
+    fn omp_continue_flags_are_found_and_the_newest_session_is_the_latest_file() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(omp_continues_newest(&args(&["--continue"])));
+        assert!(omp_continues_newest(&args(&["--model", "x", "-c"])));
+        assert!(!omp_continues_newest(&args(&["--resume", "abc"])));
+        assert!(!omp_continues_newest(&args(&["--continue-later"])));
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-continue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = dir.join("2026-01-01T00-00-00-000Z_aaa.jsonl");
+        let newer = dir.join("2026-01-02T00-00-00-000Z_bbb.jsonl");
+        std::fs::write(&older, "{}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::create_dir(dir.join("2026-01-03T00-00-00-000Z_ccc.jsonl")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&newer, "{}\n").unwrap();
+        let found = newest_session_beside(older.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, Some(newer));
+        assert_eq!(
+            newest_session_beside("/nonexistent-dir-for-herdr/x.jsonl"),
+            None
+        );
     }
 }

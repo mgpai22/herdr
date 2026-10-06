@@ -3438,6 +3438,105 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn agent_start_refuses_to_continue_a_session_a_live_omp_pane_runs() {
+        let (mut app, _instruct, _rx) = guarded_fixture(AgentState::Idle);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-continue-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("2026-01-01T00-00-00-000Z_live.jsonl");
+        std::fs::write(&live, "{}\n").unwrap();
+        // The live pane runs the newest file of its directory.
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let terminal_id = fixture_terminal_id(&app);
+        assert!(app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(
+                    crate::agent_resume::AgentSessionRef::path(live.display().to_string()).unwrap()
+                ),
+                Some(2),
+                Some("startup".into()),
+                Some(("default".into(), owner)),
+            )
+            .is_some());
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let target_terminal = app.state.workspaces[1]
+            .terminal_id(target_pane)
+            .cloned()
+            .unwrap();
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, args: &[&str]| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: args.iter().map(|arg| arg.to_string()).collect(),
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        // Another directory: the live pane's sessions are not this pane's to continue (the
+        // fixture has no terminal runtime, so the start stops at the next check).
+        let elsewhere = start(&mut app, &["--continue"]);
+        assert_eq!(
+            elsewhere["error"]["code"], "agent_pane_unavailable",
+            "{elsewhere}"
+        );
+        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
+        for args in [
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--model", "m", "--continue"],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{args:?}: {response}"
+            );
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("`--continue`"),
+                "{response}"
+            );
+        }
+        // A newer file that no live pane runs is what `--continue` opens.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.join("2026-01-02T00-00-00-000Z_dead.jsonl"), "{}\n").unwrap();
+        let free = start(&mut app, &["--continue"]);
+        assert_eq!(free["error"]["code"], "agent_pane_unavailable", "{free}");
+        // Without the flag nothing changes.
+        let plain = start(&mut app, &["--model", "m"]);
+        assert_eq!(plain["error"]["code"], "agent_pane_unavailable", "{plain}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn closing_a_pane_ends_its_pending_switch_and_its_claim() {
         use crate::api::schema::AgentActionOp;
         let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
