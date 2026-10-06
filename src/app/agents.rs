@@ -232,24 +232,16 @@ impl App {
                             && other.agent_session.is_some()
                     })
                     .collect();
-                // OMP looks a prefix up among the sessions of its own project first, so a prefix
-                // can only mean a live pane's file when that pane works in this directory (a path
-                // or a full session id names one file wherever it is).
-                let applies = |value: &str, other_cwd: Option<&str>| {
-                    !crate::agent_resume::omp_resume_value_is_prefix(value)
-                        || other_cwd.is_some_and(|other_cwd| Path::new(other_cwd) == cwd)
-                };
+                // A prefix, a path or a session id counts for a live pane in any directory: OMP looks
+                // a prefix up in its own project first and then in every other project, so it can
+                // open that pane's file from anywhere. A false refusal names the pane and the file;
+                // the caller can pass a longer id or a path.
                 for other in &live {
                     let Some(session) = other.agent_session.as_ref() else {
                         continue;
                     };
                     if let Some(value) = values.iter().find(|value| {
-                        applies(value, other.cwd.as_deref())
-                            && crate::agent_resume::omp_resume_value_matches(
-                                value,
-                                &cwd,
-                                &session.value,
-                            )
+                        crate::agent_resume::omp_resume_value_matches(value, &cwd, &session.value)
                     }) {
                         return Err(AgentStartError::SessionInUse {
                             arg: format!("--resume {value}"),
@@ -261,14 +253,8 @@ impl App {
                 // Another pane's `switch_session` that waits for its result is about to run that
                 // file: a second OMP on it would save to another file, as for a live pane.
                 for (claimant, target) in self.pending_switch_claims() {
-                    let claimant_cwd = self
-                        .state
-                        .terminals
-                        .get(&claimant)
-                        .map(|terminal| terminal.cwd.clone());
                     let Some(value) = values.iter().find(|value| {
-                        applies(value, claimant_cwd.as_deref().and_then(Path::to_str))
-                            && crate::agent_resume::omp_resume_value_matches(value, &cwd, &target)
+                        crate::agent_resume::omp_resume_value_matches(value, &cwd, &target)
                     }) else {
                         continue;
                     };

@@ -3440,26 +3440,8 @@ mod tests {
             serde_json::from_str(&response).unwrap()
         };
         let path = fixture_session_path();
-        let target_terminal = app.state.workspaces[1]
-            .terminal_id(target_pane)
-            .cloned()
-            .unwrap();
-        // A prefix names a file of this pane's own project first: from another directory it is not
-        // the live pane's file, while a path or a full session id is wherever it is.
-        let refused = start(&mut app, &["--resume", path.as_str()]);
-        assert_eq!(
-            refused["error"]["code"], "agent_session_in_use",
-            "{refused}"
-        );
-        for args in [vec!["--resume=OMP-NAT"], vec!["-r", "omp-nat"]] {
-            let response = start(&mut app, &args);
-            assert_eq!(
-                response["error"]["code"], "agent_pane_unavailable",
-                "{args:?}: {response}"
-            );
-        }
-        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
-        // The live pane runs `omp-native.jsonl`: every form OMP resolves to that file is refused.
+        // From another directory (the new pane's): OMP also searches other projects for a prefix,
+        // so a prefix, a path and an id all open the live pane's file from here.
         for args in [
             vec!["--resume", path.as_str()],
             vec!["--resume=OMP-NAT"],
@@ -3509,11 +3491,7 @@ mod tests {
             .push(Workspace::test_new("start-target"));
         app.state.ensure_test_terminals();
         let target_pane = app.state.workspaces[1].tabs[0].root_pane;
-        let target_terminal = app.state.workspaces[1]
-            .terminal_id(target_pane)
-            .cloned()
-            .unwrap();
-        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
+        // The new pane's directory is not the claimant's: a prefix counts from any directory.
         let pane_id = app.public_pane_id(1, target_pane).unwrap();
         let start = |app: &mut App, arg: &str| -> serde_json::Value {
             let response = app.handle_api_request(crate::api::schema::Request {
