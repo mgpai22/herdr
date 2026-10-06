@@ -3790,8 +3790,10 @@ test("Oh My Pi holds a prompt sent during a herdr branch summary, holds keys onl
   omp.listener(actionBlock(next, { op: "tree", args: { entry_id: "u1", summarize: true } }));
   await waitFor(() => calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 2);
   expect(omp.listener("\x1br")).toEqual({ consume: true });
-  const image = { type: "image", data: "aGk=", mimeType: "image/png" };
-  expect(await submit("see [Image #1, 1x1] this", [image])).toEqual({ handled: true });
+  const sourceTag = Symbol("image.attachmentSource");
+  const image = { type: "image", data: "aGk=", mimeType: "image/png", [sourceTag]: { path: "local://pasted-image-1", kind: "image" } };
+  const fileImage = { type: "image", data: "aGk=", mimeType: "image/png", [sourceTag]: { path: "/proj/original.png", kind: "image" } };
+  expect(await submit("see [Image #1, 1x1] and [Image #2, 1x1]", [image, fileImage])).toEqual({ handled: true });
   expect(omp.editor()).toBe("");
   await Bun.sleep(30);
   expect(omp.acks().some((ack) => ack.action_id === next)).toBe(false);
@@ -3799,7 +3801,9 @@ test("Oh My Pi holds a prompt sent during a herdr branch summary, holds keys onl
   state.summary.resolve(true);
   expect((await omp.finalAck(next)).data).toMatchObject({ entry_id: "u1", leaf_id: "custom1" });
   await waitFor(() => omp.harness.sent.length === 1);
-  expect(omp.harness.sent[0]).toEqual([[{ type: "text", text: "see [Image #1, 1x1] this" }, image], undefined]);
+  expect(omp.harness.sent[0]).toEqual([[{ type: "text", text: "see [Image #1, 1x1] and [Image #2, 1x1]" }, image, fileImage], undefined]);
+  expect((omp.harness.sent[0] as unknown[][])[0]?.[1]).toBe(image);
+  expect((omp.harness.sent[0] as unknown[][])[0]?.[2]).toBe(fileImage);
   expect(notices).toEqual([
     "herdr ignored the retry key during a session change; press it again",
     "herdr sent your prompt with images after the session change",
