@@ -3931,6 +3931,9 @@ test("Oh My Pi keeps a held image prompt when OMP exits during the change, and p
     await waitFor(() => run.calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 1);
     const fromFile = { type: "image", data: "aGk=", mimeType: "image/png", [tag]: { path: photo, kind: "image" } };
     const fromClipboard = { type: "image", data: "Y2xpcA==", mimeType: "image/webp", [tag]: { path: "local://pasted-image-1.webp", kind: "image" } };
+    // OMP keeps a pasted clipboard image in the session's own `local` directory.
+    await mkdir(join(run.artifacts(), "local"), { recursive: true });
+    await writeFile(join(run.artifacts(), "local", "pasted-image-1.webp"), "clip");
     await run.omp.harness.handlers.get("input")?.(
       // OMP writes each chip as its marker plus one space; the person typed "describe ", " and ", " please".
       { type: "input", text: "describe [Image #1, 1x1]  and [Image #2, 1x1]  please", images: [fromFile, fromClipboard], source: "interactive" },
@@ -3945,8 +3948,10 @@ test("Oh My Pi keeps a held image prompt when OMP exits during the change, and p
     expect(Date.now() - spool.savedAt).toBeLessThan(60_000);
     expect(spool.prompts[0].images[0]).toBe(photo);
     const copy: string = spool.prompts[0].images[1];
-    expect(copy.startsWith(run.artifacts()) && copy.endsWith(".webp")).toBe(true);
+    // The image OMP already kept is the file the spool names: herdr makes no second copy of it.
+    expect(copy).toBe(join(run.artifacts(), "local", "pasted-image-1.webp"));
     expect(await readFile(copy, "utf8")).toBe("clip");
+    expect((await readdir(run.artifacts())).filter((name) => name.startsWith("herdr-held-") && name.endsWith(".webp"))).toEqual([]);
 
     // OMP exits here; the change never ends. The same session starts again.
     const restarted = await installOmpForSessions(`omp-session-spool-restart-${label.length}`, { artifactsRoot: run.artifactsRoot });
@@ -4308,6 +4313,72 @@ test("Oh My Pi writes its own spool beside another running OMP's, and neither ta
   expect(await readFile(theirs, "utf8")).toBe(theirContent);
   expect(omp.harness.sent).toHaveLength(1);
   expect(omp.editor()).toBe("");
+});
+
+test("Oh My Pi leaves a spool alone outside OMP's terminal UI, and restores it when a terminal UI starts", async () => {
+  const image = await sourceImage("rpc-mode");
+  const dead = Bun.spawnSync(["true"]).pid;
+  const saved = JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "RPCWORDS [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] });
+  process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
+  // In RPC mode `ui` is a stand-in: reads give "" and writes are lines for a host.
+  const session = await installOmpForSessions("omp-session-spool-rpc", { mode: "rpc" });
+  await mkdir(session.artifacts()!, { recursive: true });
+  const spool = join(session.artifacts()!, "herdr-held-prompt.json");
+  await writeFile(spool, saved);
+  const calls: string[] = [];
+  Object.assign(session.omp.harness.context.ui as Record<string, unknown>, {
+    getEditorText: () => "",
+    setEditorText: () => calls.push("setEditorText"),
+    pasteToEditor: () => calls.push("pasteToEditor"),
+    notify: () => calls.push("notify"),
+  });
+  await session.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, session.omp.harness.context);
+  // A real wait, longer than the 20 ms restore delay: the integration times it on the real clock.
+  await Bun.sleep(150);
+  expect(calls).toEqual([]);
+  expect(await readFile(spool, "utf8")).toBe(saved);
+  // The same session in a terminal UI later: the prompt is still there and comes back.
+  const tui = await restartWithSpoolFiles("omp-session-spool-rpc-then-tui", { "herdr-held-prompt.json": saved });
+  await waitFor(() => tui.notices.length === 1);
+  expect(tui.omp.editor()).toBe("RPCWORDS 🖼 #1 ");
+  expect(existsSync(tui.spool)).toBe(false);
+});
+
+test("Oh My Pi restores several spool files oldest first, whatever their names", async () => {
+  const [first, second, third] = await Promise.all([sourceImage("order-a"), sourceImage("order-b"), sourceImage("order-c")]);
+  const dead = Bun.spawnSync(["true"]).pid;
+  const file = (text: string, image: string, ago: number) =>
+    JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - ago, prompts: [{ text, images: [image], savedAt: Date.now() - ago }] });
+  // By name the pid files sort before the main file, and pid 10 before pid 9; by time it is C, B, A.
+  const run = await restartWithSpoolFiles("omp-session-spool-order", {
+    "herdr-held-prompt.json": file("A [Image #1, 1x1]", first, 1000),
+    "herdr-held-prompt.10.json": file("B [Image #1, 1x1]", second, 30_000),
+    "herdr-held-prompt.9.json": file("C [Image #1, 1x1]", third, 60_000),
+  });
+  await waitFor(() => run.notices.length === 1);
+  expect(run.pastes).toEqual(["C ", third, "\n", "B ", second, "\n", "A ", first]);
+  expect(run.omp.editor()).toBe("C 🖼 #1 \nB 🖼 #2 \nA 🖼 #3 ");
+  expect(await readdir(run.artifacts()!)).toEqual([]);
+});
+
+test("Oh My Pi looks for a spool again when a session starts again in the same directory", async () => {
+  const image = await sourceImage("reentry");
+  const dead = Bun.spawnSync(["true"]).pid;
+  process.env.HERDR_OMP_SPOOL_RESTORE_MS = "150";
+  const session = await installOmpForSessions("omp-session-spool-reentry");
+  await mkdir(session.artifacts()!, { recursive: true });
+  const spool = join(session.artifacts()!, "herdr-held-prompt.json");
+  await writeFile(spool, JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "AGAIN [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] }));
+  const pastes: string[] = [];
+  const notices: string[] = [];
+  emulatePaste(session.omp, pastes, notices);
+  const run = (name: string) => session.omp.harness.handlers.get(name)?.({ reason: "startup" }, session.omp.harness.context);
+  await run("session_start");
+  // OMP shuts down inside the wait and the extension starts again (a reload).
+  await run("session_shutdown");
+  await run("session_start");
+  await waitFor(() => notices.length === 1);
+  expect(session.omp.editor()).toBe("AGAIN 🖼 #1 ");
 });
 
 test("Oh My Pi passes an Esc outside the summarizer and reports a cancel as the extension's", async () => {

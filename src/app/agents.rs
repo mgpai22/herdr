@@ -232,12 +232,24 @@ impl App {
                             && other.agent_session.is_some()
                     })
                     .collect();
+                // OMP looks a prefix up among the sessions of its own project first, so a prefix
+                // can only mean a live pane's file when that pane works in this directory (a path
+                // or a full session id names one file wherever it is).
+                let applies = |value: &str, other_cwd: Option<&str>| {
+                    !crate::agent_resume::omp_resume_value_is_prefix(value)
+                        || other_cwd.is_some_and(|other_cwd| Path::new(other_cwd) == cwd)
+                };
                 for other in &live {
                     let Some(session) = other.agent_session.as_ref() else {
                         continue;
                     };
                     if let Some(value) = values.iter().find(|value| {
-                        crate::agent_resume::omp_resume_value_matches(value, &cwd, &session.value)
+                        applies(value, other.cwd.as_deref())
+                            && crate::agent_resume::omp_resume_value_matches(
+                                value,
+                                &cwd,
+                                &session.value,
+                            )
                     }) {
                         return Err(AgentStartError::SessionInUse {
                             arg: format!("--resume {value}"),
@@ -245,6 +257,30 @@ impl App {
                             session: session.value.clone(),
                         });
                     }
+                }
+                // Another pane's `switch_session` that waits for its result is about to run that
+                // file: a second OMP on it would save to another file, as for a live pane.
+                for (claimant, target) in self.pending_switch_claims() {
+                    let claimant_cwd = self
+                        .state
+                        .terminals
+                        .get(&claimant)
+                        .map(|terminal| terminal.cwd.clone());
+                    let Some(value) = values.iter().find(|value| {
+                        applies(value, claimant_cwd.as_deref().and_then(Path::to_str))
+                            && crate::agent_resume::omp_resume_value_matches(value, &cwd, &target)
+                    }) else {
+                        continue;
+                    };
+                    let pane_id = live
+                        .iter()
+                        .find(|other| other.terminal_id == claimant.as_str())
+                        .map_or_else(|| "another pane".to_string(), |other| other.pane_id.clone());
+                    return Err(AgentStartError::SessionInUse {
+                        arg: format!("--resume {value}"),
+                        pane_id,
+                        session: target,
+                    });
                 }
                 // `--continue` opens the newest session of this cwd and profile. A live pane with
                 // the same cwd and profile shows where those sessions are; the newest file there is

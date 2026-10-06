@@ -290,6 +290,16 @@ pub fn newest_session_beside(session_path: &str) -> Option<std::path::PathBuf> {
         .map(|(_, path)| path)
 }
 
+/// Whether a `--resume` value is a prefix of a session's file name or id, which OMP looks up in
+/// its own project first. A path (it has a separator or ends in `.jsonl`) and a full session id
+/// name one file wherever it is.
+pub fn omp_resume_value_is_prefix(value: &str) -> bool {
+    !(value.contains('/')
+        || value.contains('\\')
+        || value.ends_with(".jsonl")
+        || is_session_uuid(value))
+}
+
 /// Whether `omp --resume <value>`, run in `cwd`, can open the session file `session_path`: the
 /// same file for a path value (one with a separator or ending in `.jsonl`); otherwise OMP's
 /// prefix rule, case-insensitive, on the file's name and on the session id at its end.

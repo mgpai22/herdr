@@ -1896,7 +1896,7 @@ export default function (pi) {
         .join(""),
     );
     // While an `ask` dialog is open, OMP sends every key but Esc to a person's unfinished draft.
-    if (head.kind === "ask" && !cancel) {
+    if (head.kind === "ask" && !cancel && editorIsReal(ctx)) {
       const draft = ctx?.ui?.getEditorText?.() ?? "";
       if (draft && PASTE_MARKER.test(draft)) {
         return refuse("draft_open: the person's draft holds a collapsed paste; it must be sent or cleared first");
@@ -2522,6 +2522,13 @@ export default function (pi) {
   let spoolRestoreTimer: ReturnType<typeof setTimeout> | undefined;
   let spoolCheckedFor: string | undefined;
 
+  // OMP's editor is real only in its terminal UI. In RPC (and print) mode `ui` is a stand-in: reads
+  // return "" and writes are lines for a host, so nothing herdr puts there reaches a person and
+  // nothing it reads there is the person's. Every path that reads or writes the editor asks.
+  function editorIsReal(ctx: any): boolean {
+    return ctx?.mode === "tui" && ctx?.hasUI === true;
+  }
+
   // The text of a held prompt as the person typed it. OMP wrote each chip as its `[Image #N, WxH]`
   // marker plus the one space it puts after a chip; cutting exactly those leaves every other
   // space, tab and newline as typed.
@@ -2555,11 +2562,19 @@ export default function (pi) {
 
   // The person's own file behind an image, when OMP tagged one (the symbol property
   // `image.attachmentSource`): an absolute path to an image.
-  function imageSourcePath(image: any): string | undefined {
+  // A `local://` source (OMP keeps a pasted clipboard image in the session's own `local` directory
+  // beside its artifacts) is that file, so herdr makes no copy of it.
+  function imageSourcePath(image: any, artifacts?: string): string | undefined {
     for (const symbol of Object.getOwnPropertySymbols(image ?? {})) {
       if (symbol.description !== "image.attachmentSource") continue;
       const source = image[symbol];
-      if (source?.kind === "image" && typeof source.path === "string" && path.isAbsolute(source.path)) return source.path;
+      if (source?.kind !== "image" || typeof source.path !== "string") continue;
+      if (path.isAbsolute(source.path)) return source.path;
+      if (artifacts && source.path.startsWith("local://")) {
+        const root = path.resolve(artifacts, "local");
+        const file = path.resolve(root, source.path.slice("local://".length));
+        if (file.startsWith(root + path.sep)) return file;
+      }
     }
     return undefined;
   }
@@ -2713,7 +2728,7 @@ export default function (pi) {
         for (const { text, images, savedAt } of heldReplays) {
           const held: string[] = [];
           for (const image of images) {
-            let source = imageSourcePath(image);
+            let source = imageSourcePath(image, dir);
             if (source !== undefined && !(await isFile(source))) source = undefined;
             source ??= heldImageFiles.get(image) ?? (await saveHeldImage(dir, image));
             if (source) held.push(source);
@@ -2763,6 +2778,7 @@ export default function (pi) {
 
   // Takes held words out of the editor where hold put them, once, wherever they still are.
   function removeWords(ctx: any, words: string[]) {
+    if (!editorIsReal(ctx)) return;
     try {
       const before = ctx?.ui?.getEditorText?.();
       if (typeof before !== "string") return;
@@ -2794,7 +2810,11 @@ export default function (pi) {
     } catch {
       // Nothing was sent: the words are still in the editor, and the spool puts the images back.
       const own = heldSpool?.file;
-      void spoolQueue.then(() => (own !== undefined && path.dirname(own) === artifactsDir(ctx) ? restoreSpool(ctx, own) : undefined)).catch(() => {});
+      spoolQueue = spoolQueue
+        .then(async () => {
+          if (own !== undefined && path.dirname(own) === artifactsDir(ctx)) await restoreSpool(ctx, own);
+        })
+        .catch(() => {});
       return;
     }
     removeWords(ctx, prompts.map((prompt) => wordsOf(prompt.text)));
@@ -2892,37 +2912,71 @@ export default function (pi) {
     return { lost, slow };
   }
 
-  // Puts the prompts of one spool file back in the editor, without sending anything, then removes
-  // the file (image copies stay: the chips use them). `own` is this process's spool, restored
-  // whatever its state. Another file is left when it is this process's change that is writing it,
-  // or when another process that still runs wrote it a moment ago: that process's change is not
-  // over. A file that cannot be restored in full stays. Returns how long to wait before looking
-  // again, when it should.
-  async function restoreOne(ctx: any, file: string, own: boolean): Promise<number | undefined> {
-    if (!own && heldSpool?.file === file) return undefined;
+  // Reads one spool file for a restore. `own` is this process's spool, restored whatever its state.
+  // Another file is left when it is this process's change that is writing it, or when another
+  // process that still runs wrote it a moment ago: that process's change is not over (`wait` is
+  // when to look again). A file that cannot be read is set aside or left.
+  async function readForRestore(
+    ctx: any,
+    file: string,
+    own: boolean,
+  ): Promise<{ item?: { file: string; prompts: SpoolPrompt[] }; wait?: number }> {
+    if (!own && heldSpool?.file === file) return {};
     const found = await readSpool(file);
-    if (found.state === "none" || found.state === "unreadable") return undefined;
+    if (found.state === "none" || found.state === "unreadable") return {};
     if (found.state === "corrupt") {
       await setSpoolAside(ctx, file);
-      return undefined;
+      return {};
     }
-    if (!own && ownedByOtherLiveProcess(found)) return spoolPollMs;
-    const { prompts } = found;
+    if (!own && ownedByOtherLiveProcess(found)) return { wait: spoolPollMs };
+    return { item: { file, prompts: found.prompts } };
+  }
+
+  // Puts the prompts of the spool files beside the session (or just `only`, this process's own)
+  // back in the editor in one go, oldest first whichever file they came from, without sending
+  // anything, then removes the files (image copies stay: the chips use them). Only in the terminal
+  // UI, where the editor is real: elsewhere the files are left as they are. Runs in `spoolQueue`,
+  // so it never overlaps a write. A restore that cannot finish keeps every file. Returns how long
+  // to wait before looking again, when it should.
+  async function restoreSpool(ctx: any, only?: string): Promise<number | undefined> {
+    if (!editorIsReal(ctx)) return undefined;
+    const dir = artifactsDir(ctx);
+    if (!dir) return undefined;
+    if (only === undefined && sessionHold) return spoolRestoreMs;
+    await removeDeadTemporaries(dir);
+    const names = only !== undefined ? [path.basename(only)] : (await readdir(dir).catch(() => [] as string[])).filter((name) => SPOOL_FILE.test(name));
+    let again: number | undefined;
+    const items: { file: string; prompts: SpoolPrompt[] }[] = [];
+    for (const name of names) {
+      const { item, wait } = await readForRestore(ctx, path.join(dir, name), only !== undefined);
+      if (item) items.push(item);
+      if (wait !== undefined) again = Math.min(again ?? wait, wait);
+    }
+    if (items.length === 0) return again;
+    // By time, not by name: a pid sorts as text, and the main file has none.
+    const oldestOf = (item: { prompts: SpoolPrompt[] }) => Math.min(Infinity, ...item.prompts.map((prompt) => prompt.savedAt));
+    items.sort((a, b) => oldestOf(a) - oldestOf(b));
+    const prompts = items.flatMap((item) => item.prompts);
     const ui = ctx?.ui;
-    if (prompts.some((prompt) => wordsOf(prompt.text) || prompt.images.length > 0)) {
-      let result: { lost: number; slow: number };
+    let result = { lost: 0, slow: 0 };
+    const worth = prompts.some((prompt) => wordsOf(prompt.text) || prompt.images.length > 0);
+    if (worth) {
       try {
         result = await putBack(ui, prompts);
       } catch {
-        // Part of the prompt may be in the editor: keep the saved copy, and say where it is.
+        // Part of the prompt may be in the editor: keep the saved copies, and say where they are.
         try {
-          ui?.notify?.(`herdr could not put your saved prompt back in the editor; the saved copy is ${file}`, "warning");
+          ui?.notify?.(`herdr could not put your saved prompt back in the editor; the saved copy is ${items.map((item) => item.file).join(", ")}`, "warning");
         } catch {}
-        return undefined;
+        return again;
       }
-      // The saved copy goes before the notice, so the notice never shows while it is still there.
+    }
+    // The saved copies go before the notice, so the notice never shows while they are still there.
+    for (const { file } of items) {
       if (heldSpool?.file === file) heldSpool = undefined;
       await unlink(file).catch(() => {});
+    }
+    if (worth) {
       const { lost, slow } = result;
       const oldest = Math.min(...prompts.map((prompt) => prompt.savedAt));
       const extras =
@@ -2934,25 +2988,6 @@ export default function (pi) {
           "info",
         );
       } catch {}
-      return undefined;
-    }
-    if (heldSpool?.file === file) heldSpool = undefined;
-    await unlink(file).catch(() => {});
-    return undefined;
-  }
-
-  // Restores every spool beside the session (or just `only`, this process's own). Runs in
-  // `spoolQueue`, so it never overlaps a write. Returns how long to wait before looking again.
-  async function restoreSpool(ctx: any, only?: string): Promise<number | undefined> {
-    const dir = artifactsDir(ctx);
-    if (!dir) return undefined;
-    if (only === undefined && sessionHold) return spoolRestoreMs;
-    await removeDeadTemporaries(dir);
-    const names = only !== undefined ? [path.basename(only)] : (await readdir(dir).catch(() => [] as string[])).filter((name) => SPOOL_FILE.test(name)).sort();
-    let again: number | undefined;
-    for (const name of names) {
-      const wait = await restoreOne(ctx, path.join(dir, name), only !== undefined);
-      if (wait !== undefined) again = Math.min(again ?? wait, wait);
     }
     return again;
   }
@@ -2995,7 +3030,7 @@ export default function (pi) {
   // too, so OMP's draft keeps them if OMP exits during the change.
   pi.on("input", async (event: any, ctx: any) => {
     const hold = sessionHold;
-    if (!hold || event?.source !== "interactive") return undefined;
+    if (!hold || event?.source !== "interactive" || !editorIsReal(ctx)) return undefined;
     let text = typeof event.text === "string" ? event.text : "";
     const images = Array.isArray(event.images) ? event.images : [];
     const draft = ctx?.ui?.getEditorText?.() ?? "";
@@ -3051,6 +3086,7 @@ export default function (pi) {
 
   // Removes herdr blocks for this runtime from the editor text; returns whether it found any.
   function scrubLeakedBlocks(ctx: any): boolean {
+    if (!editorIsReal(ctx)) return false;
     const ui = ctx?.ui;
     const text = ui?.getEditorText?.();
     if (typeof text !== "string" || !text.includes("herdr-")) return false;
@@ -3557,6 +3593,8 @@ export default function (pi) {
     moveWatch = undefined;
     clearTimeout(spoolRestoreTimer);
     spoolRestoreTimer = undefined;
+    // A session that starts again in the same directory (a reload) looks for a spool again.
+    spoolCheckedFor = undefined;
     unsubscribeRedirects?.();
     unsubscribeRedirects = undefined;
     redirectManager = undefined;

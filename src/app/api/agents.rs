@@ -688,6 +688,20 @@ impl App {
         Ok(())
     }
 
+    /// The session files that `switch_session` actions still waiting for their result are about
+    /// to open, with the terminal that asked.
+    pub(crate) fn pending_switch_claims(&self) -> Vec<(crate::terminal::TerminalId, String)> {
+        self.pending_action_acks
+            .values()
+            .filter_map(|pending| {
+                pending
+                    .switch_target
+                    .clone()
+                    .map(|target| (pending.terminal_id.clone(), target))
+            })
+            .collect()
+    }
+
     /// Every check a guarded write to a pane's OMP listener needs, in one app-loop step.
     fn check_listener_write(
         &mut self,
@@ -3426,6 +3440,25 @@ mod tests {
             serde_json::from_str(&response).unwrap()
         };
         let path = fixture_session_path();
+        let target_terminal = app.state.workspaces[1]
+            .terminal_id(target_pane)
+            .cloned()
+            .unwrap();
+        // A prefix names a file of this pane's own project first: from another directory it is not
+        // the live pane's file, while a path or a full session id is wherever it is.
+        let refused = start(&mut app, &["--resume", path.as_str()]);
+        assert_eq!(
+            refused["error"]["code"], "agent_session_in_use",
+            "{refused}"
+        );
+        for args in [vec!["--resume=OMP-NAT"], vec!["-r", "omp-nat"]] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_pane_unavailable",
+                "{args:?}: {response}"
+            );
+        }
+        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
         // The live pane runs `omp-native.jsonl`: every form OMP resolves to that file is refused.
         for args in [
             vec!["--resume", path.as_str()],
@@ -3448,6 +3481,66 @@ mod tests {
                 "{args:?}: {response}"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_start_refuses_to_resume_a_session_another_pane_is_switching_to() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .action_listener = true;
+        let claimed = "/elsewhere/2026-02-02T00-00-00-000Z_claimed.jsonl";
+        let _response = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": claimed }),
+            ),
+        );
+        sent_action(&mut rx);
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let target_terminal = app.state.workspaces[1]
+            .terminal_id(target_pane)
+            .cloned()
+            .unwrap();
+        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, arg: &str| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: vec!["--resume".into(), arg.into()],
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        // The file the switch is about to open is as taken as one a pane runs now.
+        for arg in [claimed, "2026-02-02T00-00", "claimed"] {
+            let response = start(&mut app, arg);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{arg}: {response}"
+            );
+        }
+        let free = start(&mut app, "/elsewhere/free.jsonl");
+        assert_eq!(free["error"]["code"], "agent_pane_unavailable", "{free}");
     }
 
     #[cfg(target_os = "linux")]
