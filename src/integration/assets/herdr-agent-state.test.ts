@@ -116,6 +116,9 @@ function captureConnectionEndpoint() {
   return () => connectedEndpoint;
 }
 
+// A test may answer some requests itself (an error, say); every other request is answered ok.
+let recordingReply: ((request: any) => unknown) | undefined;
+
 async function startRecordingServer(name: string): Promise<unknown[]> {
   const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
   socketPath = recordingSocketPath;
@@ -133,7 +136,7 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
       }
       const request = JSON.parse(input.slice(0, newline));
       requests.push(request);
-      socket.end(JSON.stringify({ id: request.id, result: { type: "ok" } }) + "\n");
+      socket.end(JSON.stringify(recordingReply?.(request) ?? { id: request.id, result: { type: "ok" } }) + "\n");
     });
   });
   server = recordingServer;
@@ -3387,3 +3390,242 @@ test("Oh My Pi keeps a known missing tombstone when only the subagent's abort ou
     stopped();
   }
 }, 20_000);
+
+// An OMP root session reached through the agent registry, with a command context that emits the
+// session events OMP emits around each change.
+async function installOmpForSessions(name: string, extras: { mode?: string; foreignManager?: boolean } = {}) {
+  const entries = new Map<string, { id: string; type: string }>(
+    ["u1", "a1", "c1"].map((id) => [id, { id, type: id === "c1" ? "custom" : "message" }]),
+  );
+  const state = { file: "/tmp/omp-instruct.jsonl", id: "omp-instruct", leaf: "a1", transitioning: false, cancel: false, forkBusy: false };
+  const appended: unknown[] = [];
+  const labels: unknown[] = [];
+  const calls: unknown[] = [];
+  const manager = {
+    getSessionFile: () => state.file,
+    getSessionId: () => state.id,
+    getEntry: (id: string) => entries.get(id),
+    getLeafId: () => state.leaf,
+    getCwd: () => "/proj",
+    appendLabelChange: (target: string, label: string | undefined) => {
+      labels.push([target, label]);
+      state.leaf = `label${labels.length}`;
+    },
+  };
+  let omp: Awaited<ReturnType<typeof installOmpForActions>>;
+  const emit = (event: string, data: unknown) => omp.harness.handlers.get(event)?.(data, omp.harness.context);
+  // OMP's switch: the before-event, then (unless cancelled) the swap and the after-event.
+  const swap = async (reason: string, file: string, id: string) => {
+    await emit(reason === "branch" || reason === "fork-entry" ? "session_before_branch" : "session_before_switch", { reason });
+    if (state.cancel) return false;
+    state.file = file;
+    state.id = id;
+    await emit(reason === "branch" || reason === "fork-entry" ? "session_branch" : "session_switch", { reason });
+    return true;
+  };
+  const cc = {
+    navigateTree: async (id: string, options: unknown) => {
+      calls.push(["navigateTree", id, options]);
+      if (state.cancel) return { cancelled: true };
+      state.leaf = id === "u1" ? "root" : id;
+      if (id === "u1" && !omp.editor()) omp.setEditor("first question");
+      await emit("session_tree", {});
+      return { cancelled: false };
+    },
+    newSession: async () => {
+      calls.push(["newSession"]);
+      return { cancelled: !(await swap("new", "/tmp/omp-new.jsonl", "omp-new")) };
+    },
+    switchSession: async (file: string) => {
+      calls.push(["switchSession", file]);
+      return { cancelled: !(await swap("resume", file, "omp-switched")) };
+    },
+    reload: async () => {
+      calls.push(["reload"]);
+      await swap("resume", state.file, state.id);
+    },
+  };
+  const session = {
+    sessionManager: extras.foreignManager ? { ...manager } : manager,
+    get isSessionTransitioning() {
+      return state.transitioning;
+    },
+    extensionRunner: { createCommandContext: () => cc },
+    fork: async (entryId: string | undefined, options: unknown) => {
+      calls.push(["fork", entryId, options]);
+      if (state.forkBusy) throw Object.assign(new Error("busy"), { name: "SessionBusyError" });
+      return swap(entryId === undefined ? "fork" : "fork-entry", "/tmp/omp-fork.jsonl", "omp-fork");
+    },
+  };
+  omp = await installOmpForActions(name, {
+    pi: { AgentRegistry: { global: () => ({ get: (id: string) => (id === "main" ? { session } : undefined), list: () => [] }) }, MAIN_AGENT_ID: "main" },
+    getSessionName: () => "Parser fix",
+    appendEntry: (type: string, data: unknown) => {
+      appended.push([type, data]);
+      state.leaf = `custom${appended.length}`;
+    },
+    setSessionName: (title: string) => calls.push(["setSessionName", title]),
+  });
+  Object.assign(omp.harness.context, { sessionManager: manager, mode: extras.mode ?? "tui" });
+  return { omp, state, calls, appended, labels };
+}
+
+test("Oh My Pi moves the tree leaf through the command context and keeps the move on disk", async () => {
+  const { omp, state, calls, appended, labels } = await installOmpForSessions("omp-session-tree");
+  omp.setEditor("my draft");
+  const moved = await omp.act({ op: "tree", args: { entry_id: "u1" } });
+  expect(moved.ack.ok).toBe(true);
+  expect(calls).toEqual([["navigateTree", "u1", { summarize: false }]]);
+  // The draft stays; the move is saved as an entry under the new leaf.
+  expect(omp.editor()).toBe("my draft");
+  expect(appended).toEqual([["herdr-leaf", { entry_id: "u1" }]]);
+  expect(moved.ack.data).toEqual({
+    entry_id: "u1",
+    leaf_id: "custom1",
+    editor_filled: false,
+    session_path: "/tmp/omp-instruct.jsonl",
+    session_id: "omp-instruct",
+  });
+  // An empty editor gets the user message, as OMP's /tree does; a label keeps the move instead.
+  omp.setEditor("");
+  const labelled = await omp.act({ op: "tree", args: { entry_id: "u1", summarize: true, label: "retry here" } });
+  expect(labelled.ack.data).toMatchObject({ leaf_id: "label1", editor_filled: true });
+  expect(labels).toEqual([["u1", "retry here"]]);
+  expect(appended).toHaveLength(1);
+  expect(calls.at(-1)).toEqual(["navigateTree", "u1", { summarize: true }]);
+  await waitFor(() => omp.details().at(-1)?.leaf_id === "label1");
+  expect(omp.details().at(-1)).toMatchObject({ session_name: "Parser fix", leaf_id: "label1" });
+  expect(state.file).toBe("/tmp/omp-instruct.jsonl");
+  expect((await omp.act({ op: "tree", args: { entry_id: "nope" } })).ack.error).toStartWith("no_entry:");
+  expect((await omp.act({ op: "tree", args: {} })).ack.error).toStartWith("invalid_args:");
+});
+
+test("Oh My Pi refuses session changes while busy, transitioning, in a dialog or outside its TUI", async () => {
+  const { omp, state, calls } = await installOmpForSessions("omp-session-guards");
+  omp.harness.setIdle(false);
+  expect((await omp.act({ op: "new_session", args: {} })).ack.error).toStartWith("busy:");
+  omp.harness.setIdle(true);
+  state.transitioning = true;
+  expect((await omp.act({ op: "fork", args: {} })).ack.error).toStartWith("transitioning:");
+  state.transitioning = false;
+  await omp.approval("call1", "rm -rf build");
+  expect((await omp.act({ op: "tree", args: { entry_id: "a1" } })).ack.error).toStartWith("dialog_open:");
+  await omp.resolved("call1", false);
+  expect(calls).toEqual([]);
+
+  const rpc = await installOmpForSessions("omp-session-rpc", { mode: "rpc" });
+  expect((await rpc.omp.act({ op: "new_session", args: {} })).ack.error).toStartWith("unsupported_mode:");
+  // A registry session that is not this binding's (a task subagent's) is never driven.
+  const foreign = await installOmpForSessions("omp-session-foreign", { foreignManager: true });
+  expect((await foreign.omp.act({ op: "switch_session", args: { session_path: "/tmp/x.jsonl" } })).ack.error).toStartWith(
+    "unsupported_mode:",
+  );
+  expect([...rpc.calls, ...foreign.calls]).toEqual([]);
+});
+
+test("Oh My Pi acks a new session after herdr registered it, with its path", async () => {
+  const { omp, calls } = await installOmpForSessions("omp-session-new");
+  const { id, ack } = await omp.act({ op: "new_session", args: {} });
+  expect(calls).toEqual([["newSession"]]);
+  expect(ack.data).toEqual({
+    session_path: "/tmp/omp-new.jsonl",
+    session_id: "omp-new",
+    previous_session_path: "/tmp/omp-instruct.jsonl",
+  });
+  const requests = omp.harness.requests as { method?: string; params?: Record<string, unknown> }[];
+  const registered = requests.findIndex(
+    (request) => request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl",
+  );
+  const acked = requests.findIndex((request) => request.method === "pane.ack_action" && request.params?.action_id === id);
+  expect(registered).toBeGreaterThanOrEqual(0);
+  expect(registered).toBeLessThan(acked);
+});
+
+test("Oh My Pi acks a session change only once herdr accepted the new session", async () => {
+  process.env.HERDR_OMP_SESSION_RETRY_MS = "50";
+  let refused = 0;
+  recordingReply = (request) => {
+    if (request.method !== "pane.report_agent_session_v2" || request.params?.agent_session_path !== "/tmp/omp-new.jsonl") return undefined;
+    // Both attempts of the first report (it retries once at once).
+    if (refused++ > 1) return undefined;
+    return { id: request.id, error: { code: "agent_not_ready", message: "busy" } };
+  };
+  try {
+    const { omp } = await installOmpForSessions("omp-session-registered");
+    const { id, ack } = await omp.act({ op: "new_session", args: {} });
+    expect(ack.data).toMatchObject({ session_path: "/tmp/omp-new.jsonl" });
+    const requests = omp.harness.requests as { method?: string; params?: Record<string, unknown> }[];
+    const reports = requests
+      .map((request, index) => ({ request, index }))
+      .filter(({ request }) => request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl");
+    // The first report was refused; the result follows the later retry herdr accepted.
+    expect(reports).toHaveLength(3);
+    expect(reports[2].index).toBeLessThan(requests.findIndex((request) => request.params?.action_id === id));
+  } finally {
+    recordingReply = undefined;
+    delete process.env.HERDR_OMP_SESSION_RETRY_MS;
+  }
+});
+
+test("Oh My Pi registers its listener again at once after a cancelled session change", async () => {
+  const { omp, state } = await installOmpForSessions("omp-session-cancel");
+  state.cancel = true;
+  const before = omp.harness.reports().length;
+  const { id, ack } = await omp.act({ op: "new_session", args: {} });
+  expect(ack.error).toStartWith("cancelled:");
+  const reports = omp.harness.reports().slice(before);
+  // The withdrawal from the before-event, then a registration, before the result.
+  expect(reports.map((report) => report.params.accepts_instructions)).toEqual([false, true]);
+  const requests = omp.harness.requests as { method?: string; params?: Record<string, unknown> }[];
+  const lastReport = requests.findLastIndex((request) => request.method === "pane.report_agent_session_v2");
+  expect(lastReport).toBeLessThan(requests.findIndex((request) => request.params?.action_id === id));
+  // The listener takes blocks again.
+  expect((await omp.act({ op: "rename", args: { title: "after" } })).ack.ok).toBe(true);
+});
+
+test("Oh My Pi switches only to a session file of the same project", async () => {
+  const { omp, calls } = await installOmpForSessions("omp-session-switch");
+  const target = `/tmp/omp-switch-${process.pid}.jsonl`;
+  const elsewhere = `/tmp/omp-switch-other-${process.pid}.jsonl`;
+  await writeFile(target, `${JSON.stringify({ type: "session", id: "s", cwd: "/proj" })}\n`);
+  await writeFile(elsewhere, `${JSON.stringify({ type: "session", id: "s", cwd: "/other" })}\n`);
+  try {
+    const refused = async (session_path: string) => (await omp.act({ op: "switch_session", args: { session_path } })).ack.error;
+    expect(await refused("/var/tmp/x.jsonl")).toStartWith("not_same_project:");
+    expect(await refused(elsewhere)).toStartWith("not_same_project:");
+    expect(await refused(`/tmp/omp-missing-${process.pid}.jsonl`)).toStartWith("no_session_file:");
+    expect(await refused("/tmp/omp-instruct.jsonl")).toStartWith("already_current:");
+    expect(await refused("relative.jsonl")).toStartWith("invalid_args:");
+    expect(calls).toEqual([]);
+    const { ack } = await omp.act({ op: "switch_session", args: { session_path: target } });
+    expect(calls).toEqual([["switchSession", target]]);
+    expect(ack.data).toEqual({ session_path: target, session_id: "omp-switched", previous_session_path: "/tmp/omp-instruct.jsonl" });
+  } finally {
+    await rm(target, { force: true });
+    await rm(elsewhere, { force: true });
+  }
+});
+
+test("Oh My Pi forks with OMP's idle rule and redraws an entry fork", async () => {
+  const { omp, state, calls } = await installOmpForSessions("omp-session-fork");
+  const { ack } = await omp.act({ op: "fork", args: { entry_id: "a1" } });
+  expect(calls).toEqual([["fork", "a1", { requireIdle: true }], ["reload"]]);
+  expect(ack.data).toMatchObject({ session_path: "/tmp/omp-fork.jsonl", previous_session_path: "/tmp/omp-instruct.jsonl" });
+  expect((await omp.act({ op: "fork", args: { entry_id: "c1" } })).ack.error).toStartWith("no_entry:");
+  state.forkBusy = true;
+  expect((await omp.act({ op: "fork", args: {} })).ack.error).toStartWith("busy:");
+});
+
+test("Oh My Pi labels entries and renames the session", async () => {
+  const { omp, labels, calls } = await installOmpForSessions("omp-session-label");
+  expect((await omp.act({ op: "label", args: { entry_id: "a1", text: "good answer" } })).ack.data).toEqual({
+    entry_id: "a1",
+    label: "good answer",
+  });
+  expect((await omp.act({ op: "label", args: { entry_id: "a1", clear: true } })).ack.data).toEqual({ entry_id: "a1", label: null });
+  expect(labels).toEqual([["a1", "good answer"], ["a1", undefined]]);
+  expect((await omp.act({ op: "label", args: { entry_id: "a1" } })).ack.error).toStartWith("invalid_args:");
+  expect((await omp.act({ op: "label", args: { entry_id: "zz", text: "x" } })).ack.error).toStartWith("no_entry:");
+  expect((await omp.act({ op: "rename", args: { title: "Parser fix" } })).ack.data).toEqual({ name: "Parser fix" });
+  expect(calls).toEqual([["setSessionName", "Parser fix"]]);
+});

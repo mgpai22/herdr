@@ -1491,7 +1491,7 @@ impl TerminalState {
                 | (
                     "herdr:omp",
                     "omp",
-                    Some("startup" | "new" | "resume" | "fork")
+                    Some("startup" | "new" | "resume" | "fork" | "branch")
                 )
                 | (
                     "herdr:qwen",

@@ -1298,6 +1298,36 @@
               "const": "subagent_cancel",
               "description": "`args.subagent_id` and `args.expected_run` (the `run` of the subagent's row the caller\nread): cancel that run of a running subagent of the session.",
               "type": "string"
+            },
+            {
+              "const": "tree",
+              "description": "`args.entry_id`, `args.summarize` (optional) and `args.label` (optional): move the session's\nleaf to that entry, as OMP's `/tree` does, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "fork",
+              "description": "`args.entry_id` (optional): copy the session, or its path up to that entry, into a new file\nand run it, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "new_session",
+              "description": "Start a new session, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "switch_session",
+              "description": "`args.session_path`: resume another session file of the same project, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "label",
+              "description": "`args.entry_id` and `args.text`, or `args.clear: true`: set or clear an entry's label.",
+              "type": "string"
+            },
+            {
+              "const": "rename",
+              "description": "`args.title`: name the session.",
+              "type": "string"
             }
           ]
         },
@@ -2680,6 +2710,13 @@
                 "null"
               ]
             },
+            "leaf_id": {
+              "description": "The entry the session's leaf is on now. A tree move shows here before it reaches the\nsession file.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "model": {
               "description": "The session model, `provider/id`.",
               "type": [
@@ -2697,6 +2734,13 @@
                 }
               ],
               "description": "The session's service tier overrides, per provider family."
+            },
+            "session_name": {
+              "description": "The session's name (OMP's session title).",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "status_text": {
               "description": "The status-line text the `status` op set.",
@@ -7571,6 +7615,36 @@
               "const": "subagent_cancel",
               "description": "`args.subagent_id` and `args.expected_run` (the `run` of the subagent's row the caller\nread): cancel that run of a running subagent of the session.",
               "type": "string"
+            },
+            {
+              "const": "tree",
+              "description": "`args.entry_id`, `args.summarize` (optional) and `args.label` (optional): move the session's\nleaf to that entry, as OMP's `/tree` does, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "fork",
+              "description": "`args.entry_id` (optional): copy the session, or its path up to that entry, into a new file\nand run it, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "new_session",
+              "description": "Start a new session, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "switch_session",
+              "description": "`args.session_path`: resume another session file of the same project, while idle.",
+              "type": "string"
+            },
+            {
+              "const": "label",
+              "description": "`args.entry_id` and `args.text`, or `args.clear: true`: set or clear an entry's label.",
+              "type": "string"
+            },
+            {
+              "const": "rename",
+              "description": "`args.title`: name the session.",
+              "type": "string"
             }
           ]
         },
@@ -9059,6 +9133,13 @@
                 "null"
               ]
             },
+            "leaf_id": {
+              "description": "The entry the session's leaf is on now. A tree move shows here before it reaches the\nsession file.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "model": {
               "description": "The session model, `provider/id`.",
               "type": [
@@ -9076,6 +9157,13 @@
                 }
               ],
               "description": "The session's service tier overrides, per provider family."
+            },
+            "session_name": {
+              "description": "The session's name (OMP's session title).",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "status_text": {
               "description": "The status-line text the `status` op set.",

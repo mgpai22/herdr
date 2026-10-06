@@ -2,11 +2,12 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=15
+// HERDR_INTEGRATION_VERSION=16
 // @ts-nocheck
 
 import { createHash } from "node:crypto";
-import { access, writeFile } from "node:fs/promises";
+import { access, lstat, open, writeFile } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import net from "node:net";
 import path from "node:path";
 
@@ -1369,6 +1370,12 @@ export default function (pi) {
     const tiers = serviceTiers();
     if (Object.keys(tiers).length > 0) detail.service_tiers = tiers;
     if (statusText !== undefined) detail.status_text = statusText;
+    try {
+      const name = pi.getSessionName?.();
+      if (typeof name === "string" && name) detail.session_name = cap(name, 200);
+      const leaf = ctx?.sessionManager?.getLeafId?.();
+      if (typeof leaf === "string" && leaf) detail.leaf_id = cap(leaf, 64);
+    } catch {}
     const fits = () => Buffer.byteLength(JSON.stringify(detail), "utf8") <= detailBudgetBytes;
     const head = dialogs[0];
     if (head) {
@@ -1742,6 +1749,15 @@ export default function (pi) {
         return answerDialog(ctx, actionId, args, finish, refuse, rest);
       case "command":
         return runCommand(args, finish, refuse, rest);
+      case "rename":
+        return renameSession(args.title, finish, refuse, rest);
+      case "label":
+        return labelEntry(ctx, args, finish, refuse, rest);
+      case "tree":
+      case "fork":
+      case "new_session":
+      case "switch_session":
+        return changeSession(ctx, request.op, args, finish, refuse, rest);
       case "set_service_tier": {
         const { family, tier } = args;
         if (typeof family !== "string" || !Object.hasOwn(SERVICE_TIERS, family)) {
@@ -2047,20 +2063,210 @@ export default function (pi) {
     return rest;
   }
 
-  // `name` is the only session command that 18.4.4 lets an extension run without driving the
-  // editor (session changes need a command handler, and an editor submit can reach a picker).
+  // `command name` is kept for callers from before the `rename` op.
   function runCommand(args: any, finish: any, refuse: any, rest: any) {
     const name = args.name;
     const sub = args.args && typeof args.args === "object" ? args.args : {};
     if (name !== "name") return refuse(`unsupported_op: command ${cap(name, 40)}`);
-    const title = sub.title;
+    return renameSession(sub.title, finish, refuse, rest);
+  }
+
+  // As `/rename <title>`: a user title, which stops OMP's automatic titles.
+  function renameSession(title: unknown, finish: any, refuse: any, rest: any) {
     if (!isOneLine(title, 200)) {
-      return refuse("invalid_args: name needs a one-line title of at most 200 characters");
+      return refuse("invalid_args: rename needs a one-line title of at most 200 characters");
     }
     Promise.resolve(pi.setSessionName(title.trim())).then(
       () => finish({ ok: true, data: { name: title.trim() } }),
       (error) => finish({ ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` }),
     );
+    return rest;
+  }
+
+  // The root session and its command context (what a `/command` handler gets), reached through
+  // OMP's agent registry. Only when they belong to this binding (a task subagent has its own
+  // session manager) and OMP runs its TUI: elsewhere the command context's session methods do
+  // nothing and report success.
+  function rootCommandSession(ctx: any): { session: any; cc: any } | undefined {
+    if (ctx?.mode !== "tui" || ctx?.hasUI !== true) return undefined;
+    try {
+      const session = pi.pi?.AgentRegistry?.global?.()?.get?.(pi.pi?.MAIN_AGENT_ID)?.session;
+      if (!session || !ctx.sessionManager || session.sessionManager !== ctx.sessionManager) return undefined;
+      const cc = session.extensionRunner?.createCommandContext?.();
+      return cc ? { session, cc } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Why a session change may not run now: herdr never aborts a turn or acts past an open dialog.
+  function sessionChangeBlocked(ctx: any, session: any): string | undefined {
+    const dialog = dialogs[0];
+    if (dialog) return `dialog_open: ${dialog.kind} ${dialog.id} is open; it must be answered first`;
+    if (session.isSessionTransitioning === true) return "transitioning: OMP is changing its session now; retry when it ends";
+    if (ctx?.isIdle?.() !== true || agentActive || compacting || answering || ctx?.hasPendingMessages?.() === true) {
+      return "busy: the agent is working; retry when it is idle";
+    }
+    return undefined;
+  }
+
+  function labelEntry(ctx: any, args: any, finish: any, refuse: any, rest: any) {
+    const id = args.entry_id;
+    if (typeof id !== "string" || !id || id.length > 128) return refuse("invalid_args: label needs entry_id");
+    const clear = args.clear === true;
+    if (clear === (args.text !== undefined) || (!clear && !isOneLine(args.text, 200))) {
+      return refuse("invalid_args: label needs text (one line, 1-200 characters) or clear: true");
+    }
+    const access = rootCommandSession(ctx);
+    if (!access) return refuse("unsupported_mode: OMP runs no TUI session herdr can reach");
+    const manager = access.session.sessionManager;
+    if (!manager.getEntry?.(id)) return refuse(`no_entry: ${cap(id, 128)} is not an entry of this session`);
+    const label = clear ? undefined : args.text.trim();
+    try {
+      manager.appendLabelChange(id, label);
+    } catch (error) {
+      return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+    }
+    finish({ ok: true, data: { entry_id: id, label: label ?? null } });
+    return rest;
+  }
+
+  // The `cwd` in a session file's header line, or undefined when it is not a session file.
+  async function sessionFileCwd(file: string): Promise<string | undefined> {
+    let handle: any;
+    try {
+      if (!(await lstat(file)).isFile()) return undefined;
+      handle = await open(file, "r");
+      const buffer = Buffer.alloc(64 * 1024);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      const text = buffer.toString("utf8", 0, bytesRead);
+      const newline = text.indexOf("\n");
+      const header = JSON.parse(newline < 0 ? text : text.slice(0, newline));
+      return header?.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      await handle?.close?.().catch?.(() => {});
+    }
+  }
+
+  // `tree`, `fork`, `new_session`, `switch_session`: OMP's own session changes, run through the
+  // command context (never the editor) while the agent is idle. The result follows herdr's
+  // registration of the session OMP runs afterwards, so the caller's next write can name it.
+  function changeSession(ctx: any, op: string, args: any, finish: any, refuse: any, rest: any) {
+    const entryId = args.entry_id;
+    if (entryId !== undefined && (typeof entryId !== "string" || !entryId || entryId.length > 128)) {
+      return refuse("invalid_args: entry_id must be an entry id");
+    }
+    if (op === "tree") {
+      if (entryId === undefined) return refuse("invalid_args: tree needs entry_id");
+      if (args.summarize !== undefined && typeof args.summarize !== "boolean") {
+        return refuse("invalid_args: summarize must be true or false");
+      }
+      if (args.label !== undefined && !isOneLine(args.label, 200)) {
+        return refuse("invalid_args: label must be one line of 1-200 characters");
+      }
+    }
+    const target = args.session_path;
+    if (op === "switch_session" && (!isAbsoluteSessionPath(target) || !target.endsWith(".jsonl") || target.length > 4096)) {
+      return refuse("invalid_args: switch_session needs an absolute session_path ending in .jsonl");
+    }
+    const access = rootCommandSession(ctx);
+    if (!access) return refuse("unsupported_mode: OMP runs no TUI session herdr can reach");
+    const { session, cc } = access;
+    const manager = session.sessionManager;
+    const blocked = sessionChangeBlocked(ctx, session);
+    if (blocked) return refuse(blocked);
+    if (entryId !== undefined) {
+      const entry = manager.getEntry?.(entryId);
+      if (!entry || (op === "fork" && entry.type !== "message")) {
+        return refuse(`no_entry: ${cap(entryId, 128)} is not ${op === "fork" ? "a message" : "an entry"} of this session`);
+      }
+    }
+    const previous = manager.getSessionFile?.();
+    const activation = activations;
+    const editorWasEmpty = !ctx?.ui?.getEditorText?.();
+    const sessionData = () => {
+      const file = manager.getSessionFile?.();
+      return {
+        ...(isAbsoluteSessionPath(file) ? { session_path: file } : {}),
+        session_id: manager.getSessionId?.(),
+      };
+    };
+    // A change that ended without a session event leaves the listener OMP dropped (or herdr's
+    // withdrawal) in place: register again now instead of after the settle wait.
+    const restore = async () => {
+      if (activation !== activations) return;
+      clearInterval(withdrawalWatch);
+      withdrawalWatch = undefined;
+      registerInstructionListener(ctx);
+      await reportSession();
+    };
+    const settled = async () => {
+      const until = Date.now() + 10_000;
+      while (registeredSessionKey !== currentSessionKey() && Date.now() < until) {
+        await delay(20);
+      }
+    };
+    void (async () => {
+      if (op === "switch_session") {
+        const dir = isAbsoluteSessionPath(previous) ? path.dirname(previous) : undefined;
+        if (target === previous) return finish({ ok: false, error: "already_current: OMP runs that session now" });
+        if (dir === undefined || path.dirname(target) !== dir) {
+          return finish({ ok: false, error: "not_same_project: session_path must be in the current session's directory" });
+        }
+        const cwd = await sessionFileCwd(target);
+        if (cwd === undefined) return finish({ ok: false, error: "no_session_file: session_path is not a readable OMP session file" });
+        if (cwd !== manager.getCwd?.()) {
+          return finish({ ok: false, error: "not_same_project: that session belongs to another directory" });
+        }
+        // The file read awaited: the agent may have started a turn meanwhile.
+        const late = sessionChangeBlocked(ctx, session);
+        if (late) return finish({ ok: false, error: late });
+      }
+      let cancelled: boolean;
+      const data: Record<string, unknown> = {};
+      try {
+        if (op === "tree") {
+          cancelled = (await cc.navigateTree(entryId, { summarize: args.summarize === true }))?.cancelled === true;
+          if (!cancelled) {
+            const leaf = manager.getLeafId?.();
+            const summarized = leaf ? manager.getEntry?.(leaf)?.type === "branch_summary" : false;
+            if (summarized) data.summary_entry_id = leaf;
+            // OMP restores the leaf from the last entry in the file: only an entry written now keeps
+            // the move across a restart.
+            if (args.label !== undefined) manager.appendLabelChange(entryId, args.label.trim());
+            else if (!summarized) pi.appendEntry("herdr-leaf", { entry_id: entryId });
+            data.entry_id = entryId;
+            data.leaf_id = manager.getLeafId?.();
+            data.editor_filled = editorWasEmpty && !!ctx?.ui?.getEditorText?.();
+          }
+        } else if (op === "fork") {
+          cancelled = (await session.fork(entryId, { requireIdle: true })) !== true;
+          // A fork at an entry swaps the session without redrawing it.
+          if (!cancelled && entryId !== undefined) await cc.reload();
+        } else if (op === "new_session") {
+          cancelled = (await cc.newSession())?.cancelled === true;
+        } else {
+          cancelled = (await cc.switchSession(target))?.cancelled === true;
+        }
+      } catch (error) {
+        await restore();
+        const busy = error?.name === "SessionBusyError";
+        return finish({
+          ok: false,
+          error: busy ? "busy: the agent is working; retry when it is idle" : `failed: ${cap(error?.message ?? error, 200)}`,
+        });
+      }
+      if (cancelled) {
+        await restore();
+        return finish({ ok: false, error: "cancelled: another extension cancelled the change; the session did not change" });
+      }
+      await settled();
+      Object.assign(data, sessionData());
+      if (op !== "tree" && isAbsoluteSessionPath(previous)) data.previous_session_path = previous;
+      finish({ ok: true, data });
+    })();
     return rest;
   }
 
@@ -2538,7 +2744,8 @@ export default function (pi) {
   // handlers that each hit the cap take longer than the wait; a block that then arrives after
   // OMP changed its session is still refused at take time (`liveSessionMoved`). The withdrawal
   // report gets one attempt of at most 1 s, so a herdr that accepts but does not answer delays the
-  // person's switch by that much.
+  // person's switch by that much. A change herdr asked for (`changeSession`) knows how it ended and
+  // registers again at once.
   for (const event of ["session_before_switch", "session_before_branch"]) {
     pi.on(event, async (_event, ctx) => {
       if (!rootSession) return undefined;

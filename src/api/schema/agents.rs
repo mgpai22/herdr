@@ -312,6 +312,30 @@ pub enum AgentActionOp {
     /// `args.subagent_id` and `args.expected_run` (the `run` of the subagent's row the caller
     /// read): cancel that run of a running subagent of the session.
     SubagentCancel,
+    /// `args.entry_id`, `args.summarize` (optional) and `args.label` (optional): move the session's
+    /// leaf to that entry, as OMP's `/tree` does, while idle.
+    Tree,
+    /// `args.entry_id` (optional): copy the session, or its path up to that entry, into a new file
+    /// and run it, while idle.
+    Fork,
+    /// Start a new session, while idle.
+    NewSession,
+    /// `args.session_path`: resume another session file of the same project, while idle.
+    SwitchSession,
+    /// `args.entry_id` and `args.text`, or `args.clear: true`: set or clear an entry's label.
+    Label,
+    /// `args.title`: name the session.
+    Rename,
+}
+
+impl AgentActionOp {
+    /// Whether the op changes the running session or its leaf; these wait longer for their result.
+    pub fn is_session_change(self) -> bool {
+        matches!(
+            self,
+            Self::Tree | Self::Fork | Self::NewSession | Self::SwitchSession
+        )
+    }
 }
 
 /// What became of an `agent.action`, as `AgentInfo.last_action` shows it.
@@ -417,6 +441,13 @@ pub struct OmpDetail {
     /// The session's subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<OmpSubagents>,
+    /// The session's name (OMP's session title).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// The entry the session's leaf is on now. A tree move shows here before it reaches the
+    /// session file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaf_id: Option<String>,
     /// When the integration built the report, unix ms.
     pub updated_ms: u64,
 }
