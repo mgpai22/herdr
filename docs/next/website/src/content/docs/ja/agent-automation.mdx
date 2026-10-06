@@ -68,6 +68,7 @@ herdr agent rename w1:p2 reviewer
 | プロンプトを送信し、必要なら完了を待つ | `agent prompt` |
 | エージェントの対話 UI にキーを送る | `agent send-keys` |
 | エージェントのライフサイクル状態を待つ | `agent wait` |
+| すべてのエージェントの状態変化を 1 本のストリームで監視する | `events subscribe` |
 
 `agent prompt` はテキストを送信し、短い遅延の後にエンコード済み Enter を送信します。ターミナルの現在の bracketed paste モードを尊重します。working 中のエージェントにも送信できます。エージェントがすでに `blocked` の場合は、ターミナル入力を送信せずに `agent_blocked` を返します。ダイアログを確認し、意図した応答には `agent send-keys` を使ってください。`esc`、`up`、`enter`、`ctrl+c` のような操作には `agent send-keys` を使います。`escape` も `esc` のエイリアスとして使えます。意図的に生のターミナルを操作したい場合は、ペイン入力コマンドを使ってください。
 
@@ -121,5 +122,14 @@ herdr agent send-keys reviewer esc
 herdr pane run w1:p3 "just test --watch"
 herdr pane wait-output w1:p3 --regex "passed|failed" --timeout 120000
 ```
+
+`agent list` をポーリングする代わりに、1 本のストリームですべてのエージェントを監視します。`pane_id` のない項目はすべてのペインを対象にします。ストリームは現在の状態を送らないため、最初の行の後に `agent list` を 1 回読みます。コマンドが終了したら購読し直して再取得します。失われたイベントは再送されません。終わったターンは `working` から `done`、表示中のペインでは `idle` への変化として届きます:
+
+```bash
+herdr events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed"}]}' |
+  jq -c --unbuffered 'select(.event == "pane.agent_status_changed") | .data | {pane_id, agent_status}'
+```
+
+イベントのフィールドと復旧方法は [イベント購読](/ja/docs/socket-api/#イベント購読) を参照してください。
 
 コマンドとオプションの完全な一覧は [CLI リファレンス](/ja/docs/cli-reference/) を参照してください。シェル補完でも同じコマンドツリーを対話的に確認できます。

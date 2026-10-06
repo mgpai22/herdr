@@ -68,6 +68,7 @@ herdr agent rename w1:p2 reviewer
 | Submit a prompt, optionally waiting for it | `agent prompt` |
 | Send keys to an agent's interactive UI | `agent send-keys` |
 | Wait for agent lifecycle state | `agent wait` |
+| Watch status changes of every agent on one stream | `events subscribe` |
 
 `agent prompt` submits text plus encoded Enter and honors the terminal's live bracketed-paste mode. It can prompt an agent that is already working. If the agent is already `blocked`, it returns `agent_blocked` without sending terminal input; inspect the dialog and use `agent send-keys` for a deliberate response. Use `agent send-keys` for interactions such as `esc`, `up`, `enter`, or `ctrl+c`; `escape` is accepted as an alias for `esc`. Use the pane input commands when you deliberately want raw terminal control.
 
@@ -123,5 +124,14 @@ Run an ordinary process and wait for its output without treating it as an agent:
 herdr pane run w1:p3 "just test --watch"
 herdr pane wait-output w1:p3 --regex "passed|failed" --timeout 120000
 ```
+
+Watch every agent on one stream instead of polling `agent list`. An entry without `pane_id` covers every pane. Read `agent list` once after the first line for current state, since the stream sends none. When the command exits, subscribe again and re-read; missed events are not replayed. A turn that ends shows as `working` to `done`, or to `idle` in a viewed pane:
+
+```bash
+herdr events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed"}]}' |
+  jq -c --unbuffered 'select(.event == "pane.agent_status_changed") | .data | {pane_id, agent_status}'
+```
+
+See [event subscriptions](/docs/socket-api/#event-subscriptions) for the event fields and recovery rules.
 
 See the [CLI reference](/docs/cli-reference/) for the complete command and option list. Shell completions expose the same command tree interactively.

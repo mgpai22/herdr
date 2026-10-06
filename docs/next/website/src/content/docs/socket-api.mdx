@@ -818,6 +818,15 @@ Recovery restores current state, not the missing event history. Another
 `events_lost` requires resubscribing and reconciling again. Slow readers may
 need to increase read throughput or reduce event load.
 
+```text
+connection A                            connection B
+events.subscribe
+  <- subscription_started
+                                        session.snapshot -> replace the cache
+  <- event line -> re-read the affected state on B, one read at a time
+  <- EOF or error events_lost -> drop the cache, start again at events.subscribe
+```
+
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.metadata_updated`, `workspace.renamed`, `workspace.moved`, `workspace.reordered`, `workspace.closed`, and `workspace.focused`. `workspace.metadata_updated` reports token changes and TTL expiry without invoking plugin event hooks. Other workspace events describe Herdr UI/runtime lifecycle. `workspace.created` includes optional `workspace.worktree` provenance when the workspace belongs to a worktree group. `workspace.moved` includes the moved `workspace_id`, requested `insert_index`, and updated ordered `workspaces` list. `workspace.reordered` includes the atomically moved `workspace_ids`, optional `before_workspace_id`, and authoritative ordered `workspaces` list. `workspace.closed` includes a final `workspace` snapshot when Herdr can still identify it before removal.
 Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,
 `tab.renamed`, and `tab.moved`. `tab.moved` includes the moved `tab_id`,

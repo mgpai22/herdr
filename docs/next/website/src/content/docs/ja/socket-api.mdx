@@ -648,6 +648,15 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 
 スナップショットとイベントに共通のシーケンス境界はありません。順序が保証されるのは各購読項目内のみで、項目間やスナップショットとの前後関係は保証されません。バッファしたイベントの内容をスナップショットへ無条件に再適用しないでください。復旧できるのは現在の状態であり、失われたイベント履歴ではありません。再び `events_lost` を受け取った場合は、再購読して状態を照合し直します。読み取りが遅いクライアントでは、読み取り速度を上げるかイベントの負荷を減らす必要があります。
 
+```text
+接続 A                                  接続 B
+events.subscribe
+  <- subscription_started
+                                        session.snapshot -> キャッシュを置き換える
+  <- イベント行 -> B で該当する状態を再取得する（1 回ずつ）
+  <- EOF または error events_lost -> キャッシュを捨て、events.subscribe からやり直す
+```
+
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。
 ペインのイベント購読には `pane.created`、`pane.updated`、`pane.closed`、`pane.focused`、`pane.moved`、`pane.exited`、`pane.agent_detected`、`pane.output_matched`、`pane.agent_status_changed`、`pane.scroll_changed` があります。`pane.focused` は、このサーバーに接続した任意のクライアントでの手動ペイン選択も報告します。他のクライアントの表示は移動させず、ペイロードにクライアントの識別情報は含みません。選択済みのペインを再度選んでも発行しません。ターミナルタイトルの変更は `pane.updated` を発行することがありますが、生のタイトルでスピナーだけが変化し、`terminal_title_stripped` が変わらない場合は発行しません。`pane.scroll_changed` は 1 つの `pane_id` を対象とし、Herdr がスクロールスナップショットの変化を検出するたびに `pane_id`、`workspace_id`、現在の `scroll` 情報を発行します。
