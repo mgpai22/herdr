@@ -225,10 +225,52 @@ pub fn omp_resume_args(args: &[String]) -> Vec<&str> {
     values
 }
 
-/// Whether an OMP command line continues the newest session (`--continue`, `-c`).
-pub fn omp_continues_newest(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--continue" | "-c"))
+/// What `--continue` / `-c` asks of OMP, read as OMP's own parser and `normalizeContinueSessionArgs`
+/// read it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OmpContinue<'a> {
+    /// No continue, or one that does not open the newest session of the cwd's session directory:
+    /// another flag decides the session (`--resume`, `-r`, `--session`, `--fork`, `--no-session`)
+    /// or the directory (`--session-dir`), or the flag is only text after `--`.
+    Other,
+    /// A plain `--continue`: the newest session of the cwd's session directory.
+    Newest,
+    /// `--continue <session id>`: OMP takes that as `--resume <id>`.
+    Session(&'a str),
+}
+
+pub fn omp_continue(args: &[String]) -> OmpContinue<'_> {
+    let mut continue_at = None;
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            break;
+        }
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        match flag {
+            "--continue" | "-c" if continue_at.is_none() => continue_at = Some(i),
+            "--resume" | "-r" | "--session" | "--fork" | "--no-session" | "--session-dir" => {
+                return OmpContinue::Other;
+            }
+            _ => {}
+        }
+    }
+    let Some(at) = continue_at else {
+        return OmpContinue::Other;
+    };
+    match args.get(at + 1).map(|next| next.trim()) {
+        Some(next) if is_session_uuid(next) => OmpContinue::Session(next),
+        _ => OmpContinue::Newest,
+    }
+}
+
+/// OMP's `SESSION_ID_ARG_RE`: a session id as a UUID.
+fn is_session_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// The session file `omp --continue` opens among the sessions beside `session_path`: the
@@ -1146,10 +1188,32 @@ mod tests {
     #[test]
     fn omp_continue_flags_are_found_and_the_newest_session_is_the_latest_file() {
         let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-        assert!(omp_continues_newest(&args(&["--continue"])));
-        assert!(omp_continues_newest(&args(&["--model", "x", "-c"])));
-        assert!(!omp_continues_newest(&args(&["--resume", "abc"])));
-        assert!(!omp_continues_newest(&args(&["--continue-later"])));
+        let id = "0A1B2C3D-4e5f-6789-abcd-ef0123456789";
+        assert_eq!(omp_continue(&args(&["--continue"])), OmpContinue::Newest);
+        assert_eq!(
+            omp_continue(&args(&["--model", "x", "-c"])),
+            OmpContinue::Newest
+        );
+        assert_eq!(
+            omp_continue(&args(&["-c", "fix the bug"])),
+            OmpContinue::Newest
+        );
+        let with_id = args(&["--continue", id]);
+        assert_eq!(omp_continue(&with_id), OmpContinue::Session(id));
+        // Another flag decides the session or the directory, or the flag is text after `--`.
+        for other in [
+            vec!["--resume", "abc"],
+            vec!["--continue", "--resume", "abc"],
+            vec!["--session-dir", "/elsewhere", "--continue"],
+            vec!["--continue", "--session-dir=/elsewhere"],
+            vec!["--continue", "--fork", "abc"],
+            vec!["--continue", "--no-session"],
+            vec!["--continue-later"],
+            vec!["--", "--continue"],
+            vec![],
+        ] {
+            assert_eq!(omp_continue(&args(&other)), OmpContinue::Other, "{other:?}");
+        }
 
         let dir = std::env::temp_dir().join(format!(
             "herdr-continue-{}-{}",

@@ -3449,7 +3449,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let live = dir.join("2026-01-01T00-00-00-000Z_live.jsonl");
+        let live = dir.join("2026-01-01T00-00-00-000Z_0a1b2c3d-4e5f-6789-abcd-ef0123456789.jsonl");
         std::fs::write(&live, "{}\n").unwrap();
         // The live pane runs the newest file of its directory.
         let owner = crate::platform::observe_process(std::process::id())
@@ -3522,6 +3522,32 @@ mod tests {
                     .unwrap()
                     .contains("`--continue`"),
                 "{response}"
+            );
+        }
+        // `--continue <session id>` is a resume of that id: refused for the live pane's id, free
+        // for another. `--session-dir` moves the lookup away from the live pane's directory.
+        let live_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        let refused = start(&mut app, &["--continue", live_id]);
+        assert_eq!(
+            refused["error"]["code"], "agent_session_in_use",
+            "{refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("--resume {live_id}")),
+            "{refused}"
+        );
+        for args in [
+            vec!["--continue", "ffffffff-4e5f-6789-abcd-ef0123456789"],
+            vec!["--session-dir", "/elsewhere", "--continue"],
+            vec!["--continue", "--session-dir=/elsewhere"],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_pane_unavailable",
+                "{args:?}: {response}"
             );
         }
         // A newer file that no live pane runs is what `--continue` opens.

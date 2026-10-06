@@ -127,7 +127,7 @@ OMP 切换会话时（`/new`、`/resume`、fork、branch），集成会撤回监
 
 集成 v16 还报告 `session_name`（OMP 的会话标题）和 `leaf_id`（会话 leaf 所在的条目，在 tree 移动写入会话文件之前即可显示）。branch、在条目处 fork 以及 `/btw` 提升会作为 `session_start_source` `branch` 报告，Herdr 现在接受它，因此 `agent_session` 立即跟随新文件。
 
-当另一个 `omp` 进程持有会话文件而 OMP 把会话移到新文件时（OMP 的会话租约），集成 v16 立即注册新文件，因此 `agent_session` 跟随它，指令仍能到达该智能体。kind 为 `omp` 的 `agent.start` 在 `--resume`、`-r` 或 `--session` 指向某个运行中 OMP 窗格的会话文件（该文件的路径，或 OMP 会与其名称或会话 ID 匹配的前缀）时，以 `agent_session_in_use` 拒绝。当与某个运行中 OMP 窗格工作目录和配置文件相同的会话旁最新的会话文件正被运行中的 OMP 窗格使用时，`--continue` 和 `-c` 也会被拒绝。集成无法读取 OMP 焦点时，无论焦点在哪里都会保留这两个键，并显示一次警告。
+当另一个 `omp` 进程持有会话文件而 OMP 把会话移到新文件时（OMP 的会话租约），集成 v16 立即注册新文件，因此 `agent_session` 跟随它，指令仍能到达该智能体。kind 为 `omp` 的 `agent.start` 在 `--resume`、`-r` 或 `--session` 指向某个运行中 OMP 窗格的会话文件（该文件的路径，或 OMP 会与其名称或会话 ID 匹配的前缀）时，以 `agent_session_in_use` 拒绝。当与某个运行中 OMP 窗格工作目录和配置文件相同的会话旁最新的会话文件正被运行中的 OMP 窗格使用时，单独的 `--continue` 和 `-c` 也会被拒绝（`--continue <会话 ID>` 被 OMP 当作 `--resume`，因此对该会话同样拒绝；与 `--session-dir`、`--resume` 或 `--fork` 同用时不拒绝）。集成无法读取 OMP 焦点时，无论焦点在哪里都会保留这两个键，并显示一次警告。
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 

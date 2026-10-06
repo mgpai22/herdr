@@ -7,7 +7,7 @@
 
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import net from "node:net";
 import path from "node:path";
@@ -2484,9 +2484,19 @@ export default function (pi) {
   // take images back, so herdr keeps them: in memory, and in a spool file beside the session in
   // case OMP exits before the change ends. Their words are also back in the editor, so OMP's own
   // draft save keeps those. A normal end sends them once, as one message, and removes the spool.
-  type HeldPrompt = { text: string; images: any[] };
+  //
+  // The spool is never replaced blindly: a spool that is already in the session's directory (an
+  // earlier OMP exited during a change and nobody reopened the session) keeps its prompts. They go
+  // first in the file, and after the send they are put back in the editor, never sent.
+  type HeldPrompt = { text: string; images: any[]; savedAt: number };
+  type SpoolPrompt = { text: string; images: string[]; savedAt: number };
   let heldReplays: HeldPrompt[] = [];
   const SPOOL_NAME = "herdr-held-prompt.json";
+  const SPOOL_TEMPORARY = /^herdr-held-prompt\.json\.(\d+)\.\d+\.tmp$/;
+  // A spool whose writer still runs and wrote it this recently belongs to that process's change.
+  const spoolLiveMs = 10 * 60_000;
+  // How long a pasted image path may take to become a chip in OMP's editor.
+  const chipWaitMs = 3000;
   const IMAGE_EXTENSIONS: Record<string, string> = {
     "image/png": "png",
     "image/jpeg": "jpg",
@@ -2495,11 +2505,15 @@ export default function (pi) {
   };
   // OMP's `[Image #N, WxH]` markers, which number a prompt's own images.
   const IMAGE_MARKER = /\[(?:Image|Video) #[1-9]\d*(?:,[^\]\n]*)?\](?: attachment:\/\/\d+)?/g;
+  // What a chip or a collapsed paste looks like in the editor's text (an icon, then `#N`).
+  const EDITOR_CHIP = /[\p{So}\p{Sk}]\s?#\d+|\[Paste #\d+/u;
   // Files herdr wrote for held images that have no file of their own (a pasted clipboard image).
   const heldImageFiles = new WeakMap<object, string>();
-  let heldSpool: { file: string } | undefined;
+  // The spool this process wrote, and the prompts that were already in that very file.
+  let heldSpool: { file: string; inherited: SpoolPrompt[] } | undefined;
   let spoolQueue: Promise<void> = Promise.resolve();
   let spoolWarned = false;
+  let spoolWrites = 0;
   let spoolRestoreTimer: ReturnType<typeof setTimeout> | undefined;
   let spoolCheckedFor: string | undefined;
 
@@ -2540,6 +2554,24 @@ export default function (pi) {
     return stat(file).then((info) => info.isFile(), () => false);
   }
 
+  function processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error: any) {
+      return error?.code === "EPERM";
+    }
+  }
+
+  function ageText(ms: number): string {
+    const seconds = Math.max(0, Math.round(ms / 1000));
+    if (seconds < 90) return `${seconds} s`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 90) return `${minutes} min`;
+    const hours = Math.round(minutes / 60);
+    return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`;
+  }
+
   // A private copy of an image that has no file of its own, in the session's artifact directory.
   async function saveHeldImage(dir: string, image: any): Promise<string | undefined> {
     const extension = IMAGE_EXTENSIONS[image?.mimeType];
@@ -2550,9 +2582,84 @@ export default function (pi) {
     return file;
   }
 
+  // Replaces `file` whole: a 0600 temporary file in the same directory, flushed to disk, then
+  // renamed over it, so an exit leaves the old content or the new one. The temporary file goes on
+  // every error path.
+  async function writeAtomic(file: string, content: string): Promise<void> {
+    spoolWrites += 1;
+    const temporary = `${file}.${process.pid}.${spoolWrites}.tmp`;
+    try {
+      const handle = await open(temporary, "w", 0o600);
+      try {
+        await handle.writeFile(content);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(temporary, file);
+    } catch (error) {
+      await unlink(temporary).catch(() => {});
+      throw error;
+    }
+  }
+
+  type SpoolRead =
+    | { state: "none" | "unreadable" | "corrupt" }
+    | { state: "ok"; prompts: SpoolPrompt[]; pid: number | undefined; savedAt: number };
+
+  // What a spool file holds. A file that is not a spool this code can read in full is `corrupt`, so
+  // nothing in it is dropped without a word; one that cannot be read at all is `unreadable`.
+  async function readSpool(file: string): Promise<SpoolRead> {
+    let raw: string;
+    let mtime: number;
+    try {
+      raw = await readFile(file, "utf8");
+      mtime = (await stat(file)).mtimeMs;
+    } catch (error: any) {
+      return { state: error?.code === "ENOENT" ? "none" : "unreadable" };
+    }
+    let spool: any;
+    try {
+      spool = JSON.parse(raw);
+    } catch {
+      return { state: "corrupt" };
+    }
+    if (!Array.isArray(spool?.prompts)) return { state: "corrupt" };
+    const savedAt = typeof spool.savedAt === "number" ? spool.savedAt : mtime;
+    const prompts: SpoolPrompt[] = [];
+    for (const prompt of spool.prompts) {
+      if (typeof prompt?.text !== "string" || !Array.isArray(prompt.images)) return { state: "corrupt" };
+      if (prompt.images.some((image: unknown) => typeof image !== "string")) return { state: "corrupt" };
+      prompts.push({ text: prompt.text, images: prompt.images, savedAt: typeof prompt.savedAt === "number" ? prompt.savedAt : savedAt });
+    }
+    return { state: "ok", prompts, pid: typeof spool.pid === "number" ? spool.pid : undefined, savedAt };
+  }
+
+  async function writeSpoolFile(file: string, prompts: SpoolPrompt[]): Promise<void> {
+    await writeAtomic(file, JSON.stringify({ v: 2, pid: process.pid, savedAt: Date.now(), prompts }));
+  }
+
+  function warnOnce(ctx: any, text: string) {
+    if (spoolWarned) return;
+    spoolWarned = true;
+    try {
+      ctx?.ui?.notify?.(text, "warning");
+    } catch {}
+  }
+
+  // Sets a spool that cannot be read in full aside, where the person can find it.
+  async function setSpoolAside(ctx: any, file: string): Promise<void> {
+    const aside = path.join(path.dirname(file), `herdr-held-prompt.corrupt-${Date.now()}.json`);
+    try {
+      await rename(file, aside);
+      ctx?.ui?.notify?.(`herdr could not read a held prompt saved beside this session and set the file aside as ${aside}`, "warning");
+    } catch {}
+  }
+
   // Writes every held prompt to one spool file in the session's artifact directory (mode 0600, the
-  // images by path). Writes run one at a time; the file is replaced whole, so OMP's exit leaves
-  // the last complete one. A spool in another directory (the session changed) is removed.
+  // images by path). Writes run one at a time and replace the file whole. A spool already there
+  // (not this process's) keeps its prompts, in front. When the session changed, the spool of the
+  // session left is rewritten with only the prompts that were already in it, or removed.
   function writeSpool(ctx: any): Promise<void> {
     spoolQueue = spoolQueue.then(async () => {
       const dir = artifactsDir(ctx);
@@ -2560,50 +2667,63 @@ export default function (pi) {
       try {
         if (!dir) throw new Error("no artifact directory");
         await mkdir(dir, { recursive: true, mode: 0o700 });
-        const prompts: { text: string; images: string[] }[] = [];
-        for (const { text, images } of heldReplays) {
+        const file = path.join(dir, SPOOL_NAME);
+        const previous = heldSpool;
+        let inherited = previous?.file === file ? previous.inherited : [];
+        if (previous?.file !== file) {
+          const found = await readSpool(file);
+          if (found.state === "corrupt") await setSpoolAside(ctx, file);
+          // Never write over what cannot be read.
+          else if (found.state === "unreadable") throw new Error("spool unreadable");
+          else if (found.state === "ok") inherited = found.prompts;
+        }
+        const prompts: SpoolPrompt[] = [];
+        for (const { text, images, savedAt } of heldReplays) {
           const held: string[] = [];
           for (const image of images) {
-            let file = imageSourcePath(image);
-            if (file !== undefined && !(await isFile(file))) file = undefined;
-            file ??= heldImageFiles.get(image) ?? (await saveHeldImage(dir, image));
-            if (file) held.push(file);
+            let source = imageSourcePath(image);
+            if (source !== undefined && !(await isFile(source))) source = undefined;
+            source ??= heldImageFiles.get(image) ?? (await saveHeldImage(dir, image));
+            if (source) held.push(source);
           }
-          prompts.push({ text, images: held });
+          prompts.push({ text, images: held, savedAt });
         }
-        const file = path.join(dir, SPOOL_NAME);
-        const temporary = `${file}.${process.pid}.tmp`;
-        await writeFile(temporary, JSON.stringify({ v: 1, prompts }), { mode: 0o600 });
-        await rename(temporary, file);
-        const previous = heldSpool?.file;
-        heldSpool = { file };
-        if (previous !== undefined && previous !== file) await unlink(previous).catch(() => {});
+        await writeSpoolFile(file, [...inherited, ...prompts]);
+        heldSpool = { file, inherited };
+        if (previous && previous.file !== file) await leaveSpoolBehind(previous);
       } catch {
-        if (!spoolWarned) {
-          spoolWarned = true;
-          try {
-            ctx?.ui?.notify?.(
-              "herdr could not save your prompt's images; if OMP exits before the session change ends, they are lost",
-              "warning",
-            );
-          } catch {}
-        }
+        warnOnce(ctx, "herdr could not save your prompt's images; if OMP exits before the session change ends, they are lost");
       }
     });
     return spoolQueue;
   }
 
-  // The change ended and the prompts were handled: the spool and the copies herdr made go.
-  function dropSpool(prompts: HeldPrompt[]): Promise<void> {
+  // The prompts that were in a spool before this process added its own stay in that file, for the
+  // next start of that session; with none, the file goes.
+  async function leaveSpoolBehind(spool: { file: string; inherited: SpoolPrompt[] }): Promise<void> {
+    if (spool.inherited.length === 0) {
+      await unlink(spool.file).catch(() => {});
+      return;
+    }
+    await writeSpoolFile(spool.file, spool.inherited).catch(() => {});
+  }
+
+  // The change ended and the prompts were handled: the copies herdr made go, and so does the spool
+  // unless it held earlier prompts, which are put back in the editor (never sent) at once.
+  function dropSpool(ctx: any, prompts: HeldPrompt[]): Promise<void> {
     spoolQueue = spoolQueue.then(async () => {
       const spool = heldSpool;
       heldSpool = undefined;
-      if (spool) await unlink(spool.file).catch(() => {});
       for (const { images } of prompts) {
         for (const image of images) {
           const copy = heldImageFiles.get(image);
           if (copy) await unlink(copy).catch(() => {});
         }
+      }
+      if (!spool) return;
+      await leaveSpoolBehind(spool);
+      if (spool.inherited.length > 0 && path.dirname(spool.file) === artifactsDir(ctx)) {
+        await restoreSpool(ctx, true);
       }
     });
     return spoolQueue;
@@ -2645,65 +2765,142 @@ export default function (pi) {
       return;
     }
     removeWords(ctx, prompts.map((prompt) => wordsOf(prompt.text)));
-    void dropSpool(prompts);
+    void dropSpool(ctx, prompts);
     try {
       ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
     } catch {}
   }
 
-  // Puts a spooled prompt back in the editor, without sending anything: its words (unless the
-  // editor already has them, as when OMP restored its draft) and its images as chips, which OMP
-  // makes of image paths. Then the spool is removed; image copies stay, because the chips use them.
-  async function restoreSpool(ctx: any, force = false): Promise<void> {
-    const dir = artifactsDir(ctx);
-    if (!dir) return;
-    const file = path.join(dir, SPOOL_NAME);
-    if (!force && (sessionHold || heldSpool?.file === file)) return;
-    let prompts: { text: string; images: string[] }[];
-    try {
-      const spool = JSON.parse(await readFile(file, "utf8"));
-      if (!Array.isArray(spool?.prompts)) return;
-      prompts = spool.prompts.flatMap((prompt: any) =>
-        typeof prompt?.text === "string" && Array.isArray(prompt.images)
-          ? [{
-              text: prompt.text,
-              images: prompt.images.filter((image: unknown) => typeof image === "string" && path.isAbsolute(image)),
-            }]
-          : [],
-      );
-    } catch {
-      return;
+  // Waits for OMP's editor to show the chip of a pasted image path: the paste makes the chip once
+  // OMP has read the file, which can come after a later paste of text.
+  async function waitForEditorChange(ui: any, before: string): Promise<boolean> {
+    const until = Date.now() + chipWaitMs;
+    while (Date.now() < until) {
+      if (ui?.getEditorText?.() !== before) return true;
+      await delay(10);
     }
-    if (!force && (sessionHold || heldSpool?.file === file)) return;
-    const ui = ctx?.ui;
-    let lost = 0;
-    try {
-      const current = ui?.getEditorText?.();
-      const missing = prompts.map((prompt) => wordsOf(prompt.text)).filter((words) => words && !(current ?? "").includes(words));
-      if (missing.length > 0 && typeof current === "string") ui.setEditorText?.([...missing, current].filter(Boolean).join("\n"));
-      for (const { images } of prompts) {
-        for (const image of images) {
-          if (await isFile(image)) ui?.pasteToEditor?.(/\s/.test(image) ? `"${image}"` : image);
-          else lost += 1;
-        }
-      }
-      ui?.notify?.(
-        `herdr put the prompt you sent during a session change back in the editor after OMP restarted; nothing was sent. Press Enter to send it${lost > 0 ? ` (${lost} image file${lost === 1 ? " is" : "s are"} gone)` : ""}`,
-        "info",
-      );
-    } catch {}
-    if (heldSpool?.file === file) heldSpool = undefined;
-    await unlink(file).catch(() => {});
+    return false;
   }
 
-  // Looks once per session directory, after OMP's own start-up draft restore.
-  function scheduleSpoolRestore(ctx: any) {
+  // Puts spooled prompts into the editor as the person typed them: words and image chips in their
+  // original order, then the draft that was there (minus the words OMP's own draft restore already
+  // brought back). Text and image paths go in as pastes, one at a time, because OMP turns an image
+  // path into a chip only as a paste and sets the chip into the text once the file is read. Returns
+  // how many images could not be put back.
+  async function putBack(ui: any, prompts: SpoolPrompt[]): Promise<number> {
+    let lost = 0;
+    const current = ui?.getEditorText?.();
+    // With chips already in the editor `setEditorText` would drop them: add at the cursor then.
+    const rebuild = typeof current === "string" && !EDITOR_CHIP.test(current);
+    let remaining = "";
+    if (rebuild) {
+      remaining = current;
+      for (const prompt of prompts) {
+        const words = wordsOf(prompt.text);
+        const at = words ? remaining.indexOf(words) : -1;
+        if (at >= 0) remaining = remaining.slice(0, at) + remaining.slice(at + words.length);
+      }
+      remaining = remaining.trim();
+      ui.setEditorText?.("");
+    }
+    let wrote = false;
+    const pasteWords = (piece: string) => {
+      const text = piece.replace(/[ \t]{2,}/g, " ");
+      if (!text) return;
+      ui?.pasteToEditor?.(text);
+      wrote = true;
+    };
+    for (const prompt of prompts) {
+      if (wrote) pasteWords("\n");
+      const pieces = prompt.text.split(IMAGE_MARKER);
+      let next = 0;
+      const putImage = async () => {
+        const image = prompt.images[next++];
+        if (image === undefined) return;
+        if (!path.isAbsolute(image) || !(await isFile(image))) {
+          lost += 1;
+          return;
+        }
+        const before = ui?.getEditorText?.() ?? "";
+        ui?.pasteToEditor?.(/\s/.test(image) ? `"${image}"` : image);
+        if (await waitForEditorChange(ui, before)) wrote = true;
+        else lost += 1;
+      };
+      for (let i = 0; i < pieces.length; i += 1) {
+        pasteWords(pieces[i]);
+        if (i < pieces.length - 1) await putImage();
+      }
+      // Images with no marker in the text (a marker the person deleted) go after the words.
+      while (next < prompt.images.length) await putImage();
+    }
+    if (remaining) {
+      if (wrote) pasteWords("\n");
+      pasteWords(remaining);
+    }
+    return lost;
+  }
+
+  // Puts the prompts of the spool beside the session back in the editor, without sending anything,
+  // then removes the spool (image copies stay: the chips use them). `force` is for this process's
+  // own spool. Without it a spool is left when it is this process's change that is writing it, when
+  // a change runs now (asks again later), or when another process that still runs wrote it a moment
+  // ago: that process's change is not over. Returns whether to ask again.
+  async function restoreSpool(ctx: any, force = false): Promise<boolean> {
     const dir = artifactsDir(ctx);
-    if (!dir || dir === spoolCheckedFor) return;
+    if (!dir) return false;
+    const file = path.join(dir, SPOOL_NAME);
+    if (!force && sessionHold) return true;
+    if (!force && heldSpool?.file === file) return false;
+    await removeDeadTemporaries(dir);
+    const found = await readSpool(file);
+    if (found.state === "none" || found.state === "unreadable") return false;
+    if (!force && (sessionHold || heldSpool?.file === file)) return !heldSpool;
+    if (found.state === "corrupt") {
+      await setSpoolAside(ctx, file);
+      return false;
+    }
+    const { prompts } = found;
+    if (!force && found.pid !== undefined && found.pid !== process.pid && processAlive(found.pid) && Date.now() - found.savedAt < spoolLiveMs) {
+      return false;
+    }
+    const ui = ctx?.ui;
+    if (prompts.some((prompt) => wordsOf(prompt.text) || prompt.images.length > 0)) {
+      try {
+        const lost = await putBack(ui, prompts);
+        const oldest = Math.min(...prompts.map((prompt) => prompt.savedAt));
+        ui?.notify?.(
+          `herdr put the prompt you sent during a session change back in the editor after OMP restarted; nothing was sent. Press Enter to send it (saved ${ageText(Date.now() - oldest)} ago)${lost > 0 ? `; ${lost} image${lost === 1 ? " is" : "s are"} gone` : ""}`,
+          "info",
+        );
+      } catch {}
+    }
+    if (heldSpool?.file === file) heldSpool = undefined;
+    await unlink(file).catch(() => {});
+    return false;
+  }
+
+  // Temporary files of spool writes whose process is gone.
+  async function removeDeadTemporaries(dir: string): Promise<void> {
+    try {
+      for (const name of await readdir(dir)) {
+        const pid = SPOOL_TEMPORARY.exec(name)?.[1];
+        if (pid !== undefined && Number(pid) !== process.pid && !processAlive(Number(pid))) {
+          await unlink(path.join(dir, name)).catch(() => {});
+        }
+      }
+    } catch {}
+  }
+
+  // Looks once per session directory, after OMP's own start-up draft restore; while a change runs
+  // it looks again after each wait.
+  function scheduleSpoolRestore(ctx: any, first = true) {
+    const dir = artifactsDir(ctx);
+    if (!dir || (first && dir === spoolCheckedFor)) return;
     spoolCheckedFor = dir;
     clearTimeout(spoolRestoreTimer);
-    spoolRestoreTimer = setTimeout(() => {
-      if (rootSession) void restoreSpool(ctx);
+    spoolRestoreTimer = setTimeout(async () => {
+      if (!rootSession || artifactsDir(ctx) !== dir) return;
+      if (await restoreSpool(ctx)) scheduleSpoolRestore(ctx, false);
     }, spoolRestoreMs);
     spoolRestoreTimer.unref?.();
   }
@@ -2727,7 +2924,7 @@ export default function (pi) {
         const at = words ? text.indexOf(words) : -1;
         if (at >= 0) text = (text.slice(0, at) + text.slice(at + words.length)).replace(/^[ \n]+/, "");
       }
-      heldReplays.push({ text, images });
+      heldReplays.push({ text, images, savedAt: Date.now() });
       const shown = heldReplays.map((prompt) => wordsOf(prompt.text)).filter(Boolean).join("\n");
       if (shown) ctx?.ui?.setEditorText?.(draft ? `${shown}\n${draft}` : shown);
       await writeSpool(ctx);

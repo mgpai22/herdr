@@ -212,8 +212,16 @@ impl App {
         }
         if kind == crate::detect::Agent::Omp {
             let cwd = terminal.cwd.clone();
-            let values = crate::agent_resume::omp_resume_args(&params.args);
-            let continues = crate::agent_resume::omp_continues_newest(&params.args);
+            let mut values = crate::agent_resume::omp_resume_args(&params.args);
+            // `--continue <session id>` is `--resume <session id>` for OMP.
+            let continues = match crate::agent_resume::omp_continue(&params.args) {
+                crate::agent_resume::OmpContinue::Newest => true,
+                crate::agent_resume::OmpContinue::Session(id) => {
+                    values.push(id);
+                    false
+                }
+                crate::agent_resume::OmpContinue::Other => false,
+            };
             if !values.is_empty() || continues {
                 let live: Vec<_> = self
                     .collect_agent_infos()
