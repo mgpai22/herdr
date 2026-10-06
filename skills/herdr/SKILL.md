@@ -170,6 +170,25 @@ herdr agent read reviewer --source recent-unwrapped --lines 120
 
 If a wait fails or returns `blocked`, inspect `agent get` and `agent read` before deciding what input to send. A timeout or stalled response does not prove the prompt was never delivered; do not blindly submit it again. Use the pane surface only when raw terminal control is intentional.
 
+## Watch many agents at once
+
+To react when any agent finishes a turn or blocks, hold one event stream instead of polling `herdr agent list` or running one `agent wait` per agent:
+
+```bash
+herdr events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed"}]}'
+```
+
+The first line is the `subscription_started` response. Each later line is one event, for example `{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p2","workspace_id":"w1","agent_status":"idle","agent":"codex",...}}`. An entry without `pane_id` watches every pane on the server; add `"agent_status":"blocked"` to receive only that status. The command runs until the stream ends, so start it as a background process and read its lines.
+
+Use this order:
+
+1. Start `events subscribe` and wait for the `subscription_started` line.
+2. Read current state with `herdr agent list`. The stream sends no initial state.
+3. React to each event line.
+4. When the command exits with status 1 (server stopped, an `events_lost` error line, or the reader fell 5 seconds behind), go back to step 1. The server does not replay missed events.
+
+A turn that ends shows as `working` to `done`, or `working` to `idle` in a pane someone is viewing. A person viewing a `done` pane is not an event, so trust `agent list` for current status. Lines also repeat when only the title or labels change; compare `agent_status` with the last line for that pane. Servers that predate the any-pane stream reject an entry without `pane_id`; use `agent wait` there. For a saved machine, put `--machine <label-or-id>` before `events`.
+
 ## Run an ordinary command in another pane
 
 Create a sibling pane with the same geometry rule, preserve the caller's working directory, and keep user focus unchanged:

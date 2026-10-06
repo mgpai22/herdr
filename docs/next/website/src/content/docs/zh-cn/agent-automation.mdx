@@ -68,6 +68,7 @@ herdr agent rename w1:p2 reviewer
 | 提交提示,并可选择等待 | `agent prompt` |
 | 向智能体交互界面发送按键 | `agent send-keys` |
 | 等待智能体生命周期状态 | `agent wait` |
+| 在一条流上监视所有智能体的状态变化 | `events subscribe` |
 
 `agent prompt` 会先发送文本,短暂延迟后再发送编码后的 Enter,并遵循终端当前的 bracketed paste 模式。即使智能体正在 working 也可以提交。如果智能体已经是 `blocked`,它不会发送任何终端输入,而是返回 `agent_blocked`;请先检查对话框,再用 `agent send-keys` 明确作出响应。使用 `agent send-keys` 进行 `esc`、`up`、`enter`、`ctrl+c` 等交互;`escape` 也是 `esc` 的别名。只有在明确需要原始终端控制时才使用窗格输入命令。
 
@@ -121,5 +122,14 @@ herdr agent send-keys reviewer esc
 herdr pane run w1:p3 "just test --watch"
 herdr pane wait-output w1:p3 --regex "passed|failed" --timeout 120000
 ```
+
+用一条流监视所有智能体，不要轮询 `agent list`。不带 `pane_id` 的条目覆盖所有窗格。流不发送当前状态，因此在第一行之后读取一次 `agent list`。命令退出后重新订阅并重新读取；丢失的事件不会重发。结束的回合表现为 `working` 变为 `done`,在被查看的窗格中变为 `idle`:
+
+```bash
+herdr events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed"}]}' |
+  jq -c --unbuffered 'select(.event == "pane.agent_status_changed") | .data | {pane_id, agent_status}'
+```
+
+事件字段和恢复方法见 [事件订阅](/zh-cn/docs/socket-api/#事件订阅)。
 
 完整命令和选项列表见 [CLI 参考](/zh-cn/docs/cli-reference/)。Shell 补全也能以交互方式显示同一命令树。
