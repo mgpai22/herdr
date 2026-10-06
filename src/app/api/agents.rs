@@ -893,7 +893,7 @@ impl App {
     /// gone (OMP dropped it on a session change or an exec restart), so the agent stops accepting
     /// instructions until the integration reports its listener again; at most one block can then
     /// reach the editor. Either way the outcome becomes `unconfirmed`.
-    pub(super) fn expire_instruction_acks(&mut self) {
+    pub(crate) fn expire_instruction_acks(&mut self) {
         let now = Instant::now();
         let terminals = &mut self.state.terminals;
         let recent = &mut self.recent_instructions;
@@ -905,10 +905,11 @@ impl App {
                 settle_unconfirmed(terminals, recent, instruction_id, pending, now);
                 false
             });
-        // An action block nobody acked may mean the listener is gone, as for an instruction.
+        // An action block nobody acked may mean the listener is gone, as for an instruction. An
+        // action to a closed pane gets no result: it ends at once, and with it a switch claim.
         let last_actions = &mut self.last_actions;
         self.pending_action_acks.retain(|action_id, pending| {
-            if pending.deadline > now {
+            if pending.deadline > now && terminals.contains_key(&pending.terminal_id) {
                 return true;
             }
             record_action_outcome(
@@ -3382,6 +3383,40 @@ mod tests {
             claimed.error.message
         );
         assert!(rx.try_recv().is_err(), "nothing was written");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closing_a_pane_ends_its_pending_switch_and_its_claim() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .action_listener = true;
+        let target = "/elsewhere/claimed.jsonl";
+        let response = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": target }),
+            ),
+        );
+        sent_action(&mut rx);
+        // The pane closes while the switch waits for its result.
+        app.state.workspaces[0].tabs[0].panes.clear();
+        app.state.remove_unattached_terminal_ids([terminal_id]);
+        app.shutdown_detached_terminal_runtimes();
+        // The caller hears at once, long before the session ack deadline.
+        let ended = response.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(ended.contains("action_unconfirmed"), "{ended}");
+        assert!(app
+            .pending_action_acks
+            .values()
+            .all(|pending| pending.switch_target.as_deref() != Some(target)));
     }
 
     #[cfg(target_os = "linux")]

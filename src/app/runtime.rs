@@ -35,9 +35,14 @@ impl App {
 
     pub(crate) fn shutdown_detached_terminal_runtimes(&mut self) {
         let terminal_ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
+        if terminal_ids.is_empty() {
+            return;
+        }
         for terminal_id in terminal_ids {
             self.shutdown_terminal_runtime(terminal_id);
         }
+        // Ends the actions still waiting on the closed panes.
+        self.expire_instruction_acks();
     }
 
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {

@@ -3417,6 +3417,7 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
     duringChange: undefined as (() => unknown) | undefined,
     // A pending summary: navigateTree waits for it; abortBranchSummary ends it cancelled.
     summary: undefined as PromiseWithResolvers<boolean> | undefined,
+    summaryAbort: undefined as AbortController | undefined,
   };
   const append = (entry: Record<string, any>) => {
     entries.set(entry.id, { ...entry, parentId: state.leaf });
@@ -3453,9 +3454,19 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
   const cc = {
     navigateTree: async (id: string, options: unknown) => {
       calls.push(["navigateTree", id, options]);
-      if (state.cancel) return { cancelled: true };
       await state.duringChange?.();
-      if (state.summary && !(await state.summary.promise)) return { cancelled: true };
+      if (state.cancel) return { cancelled: true };
+      if (state.summary) {
+        // OMP creates the summary's abort controller, hands its signal to session_before_tree, and
+        // drops it once the summary ends.
+        const controller = new AbortController();
+        state.summaryAbort = controller;
+        controller.signal.addEventListener("abort", () => state.summary?.resolve(false));
+        await emit("session_before_tree", { signal: controller.signal });
+        const done = await state.summary.promise;
+        state.summaryAbort = undefined;
+        if (!done) return { cancelled: true };
+      }
       state.leaf = id === "u1" ? "root" : id;
       if (id === "u1" && !omp.editor()) omp.setEditor("first question");
       await emit("session_tree", {});
@@ -3491,7 +3502,7 @@ async function installOmpForSessions(name: string, extras: { mode?: string; fore
     },
     abortBranchSummary: () => {
       calls.push(["abortBranchSummary"]);
-      state.summary?.resolve(false);
+      state.summaryAbort?.abort();
     },
     fork: async (entryId: string | undefined, options: unknown) => {
       calls.push(["fork", entryId, options]);
@@ -3553,6 +3564,13 @@ test("Oh My Pi moves the tree leaf through the command context and keeps the mov
   expect((await omp.act({ op: "tree", args: { entry_id: "a1" } })).ack.data).toMatchObject({ editor_filled: false });
   state.duringChange = undefined;
   expect(state.file).toBe("/tmp/omp-instruct.jsonl");
+  // A leaf on a user message (an aborted turn's prompt) is not where a move to it goes: OMP moves
+  // to its parent and fills the editor.
+  state.leaf = "u1";
+  omp.setEditor("");
+  const onPrompt = await omp.act({ op: "tree", args: { entry_id: "u1" } });
+  expect(calls.at(-1)).toEqual(["navigateTree", "u1", { summarize: false }]);
+  expect(onPrompt.ack.data).toMatchObject({ editor_filled: true });
   expect((await omp.act({ op: "tree", args: { entry_id: "nope" } })).ack.error).toStartWith("no_entry:");
   expect((await omp.act({ op: "tree", args: {} })).ack.error).toStartWith("invalid_args:");
 });
@@ -3688,7 +3706,7 @@ test("Oh My Pi labels entries and renames the session", async () => {
   expect(calls).toEqual([["setSessionName", "Parser fix"]]);
 });
 
-test("Oh My Pi holds Enter during a herdr branch summary and lets Esc cancel it", async () => {
+test("Oh My Pi holds a prompt sent during a herdr branch summary, never the keys, and lets Esc cancel it", async () => {
   const statuses: unknown[] = [];
   const notices: unknown[] = [];
   const { omp, state, calls, appended } = await installOmpForSessions("omp-session-summary-hold");
@@ -3696,16 +3714,26 @@ test("Oh My Pi holds Enter during a herdr branch summary and lets Esc cancel it"
     setStatus: (key: string, text: unknown) => statuses.push([key, text]),
     notify: (text: string) => notices.push(text),
   });
+  const submit = (text: string, images?: unknown[]) =>
+    omp.harness.handlers.get("input")?.({ type: "input", text, images, source: "interactive" }, omp.harness.context);
   state.summary = Promise.withResolvers<boolean>();
   const id = "f".repeat(32);
   expect(omp.listener(actionBlock(id, { op: "tree", args: { entry_id: "u1", summarize: true } }))).toEqual({ consume: true });
   await waitFor(() => calls.length === 1);
-  expect(statuses.at(-1)).toEqual(["herdr-session-change", "herdr: summarizing the branch; Enter waits, Esc cancels"]);
-  // The person's Enter never submits during the summary; the text they type still reaches OMP.
+  expect(statuses.at(-1)).toEqual(["herdr-session-change", "herdr: summarizing the branch; a prompt you send waits, Esc cancels"]);
+  // Keys reach whatever has focus: another extension's dialog takes Enter, and a paste with its
+  // Enter in one read goes to OMP as one input.
+  expect(omp.listener("\r")).toBeUndefined();
+  expect(omp.listener("\x1b[200~PANERUN-X\x1b[201~\r")).toBeUndefined();
+  expect(omp.listener("\x1b[13;2u")).toBeUndefined();
+  // OMP's submit of that paste: held, and back in the editor.
+  expect(await submit("PANERUN-X")).toEqual({ handled: true });
+  expect(omp.editor()).toBe("PANERUN-X");
+  expect(omp.harness.sent).toEqual([]);
+  // A continue shortcut submits before the input event: its bare Enter is held.
+  omp.setEditor(".");
   expect(omp.listener("\r")).toEqual({ consume: true });
-  expect(omp.listener("\x1b[13u")).toEqual({ consume: true });
-  expect(omp.listener("more\r")).toEqual({ data: "more" });
-  expect(omp.listener("x")).toBeUndefined();
+  omp.setEditor("PANERUN-X");
   // Esc stops OMP's summarizer.
   expect(omp.listener("\x1b")).toEqual({ consume: true });
   expect(calls).toContainEqual(["abortBranchSummary"]);
@@ -3713,22 +3741,42 @@ test("Oh My Pi holds Enter during a herdr branch summary and lets Esc cancel it"
   expect(ack.error).toStartWith("cancelled: the person pressed Esc");
   expect(appended).toEqual([]);
   expect(statuses.at(-1)).toEqual(["herdr-session-change", undefined]);
-  expect(notices).toEqual(["herdr held your Enter during a session change; press Enter to send"]);
-  // Afterwards Enter passes again.
-  expect(omp.listener("\r")).toBeUndefined();
+  expect(notices).toEqual(["herdr kept your prompt in the editor during a session change; press Enter to send it"]);
+  // Afterwards submissions and Esc pass again.
+  expect(await submit("later")).toBeUndefined();
+  expect(omp.listener("\x1b")).toBeUndefined();
 
-  // A summary that ends acks only once the leaf moved.
+  // A summary that ends acks only once the leaf moved. A prompt with an image cannot go back to
+  // the editor: it is sent once, after the change.
   state.summary = Promise.withResolvers<boolean>();
   const next = "e".repeat(32);
   omp.listener(actionBlock(next, { op: "tree", args: { entry_id: "u1", summarize: true } }));
   await waitFor(() => calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 2);
+  const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+  expect(await submit("see this", [image])).toEqual({ handled: true });
   await Bun.sleep(30);
   expect(omp.acks().some((ack) => ack.action_id === next)).toBe(false);
+  expect(omp.harness.sent).toEqual([]);
   state.summary.resolve(true);
   expect((await omp.finalAck(next)).data).toMatchObject({ entry_id: "u1", leaf_id: "custom1" });
+  await waitFor(() => omp.harness.sent.length === 1);
+  expect(omp.harness.sent[0]).toEqual([[{ type: "text", text: "see this" }, image], undefined]);
 });
 
-test("Oh My Pi cancels its own session change when a person submitted as it started, and holds Enter after", async () => {
+test("Oh My Pi passes an Esc outside the summarizer and reports a cancel as the extension's", async () => {
+  const { omp, state } = await installOmpForSessions("omp-session-summary-esc");
+  // Before OMP's summarizer starts there is nothing to abort: the Esc is the editor's.
+  let early: unknown;
+  state.duringChange = () => {
+    early = omp.listener("\x1b");
+  };
+  state.cancel = true;
+  const { ack } = await omp.act({ op: "tree", args: { entry_id: "u1", summarize: true } });
+  expect(early).toBeUndefined();
+  expect(ack.error).toStartWith("cancelled: another extension cancelled");
+});
+
+test("Oh My Pi cancels its own session change when a person submitted as it started, and holds prompts after", async () => {
   const { omp, state, calls } = await installOmpForSessions("omp-session-submitted");
   // A prompt admitted between herdr's check and the change: OMP would run it in the old session.
   state.duringChange = undefined;
@@ -3737,15 +3785,23 @@ test("Oh My Pi cancels its own session change when a person submitted as it star
   expect(ack.error).toStartWith("busy: a prompt was submitted");
   expect(state.file).toBe("/tmp/omp-instruct.jsonl");
   expect(omp.harness.reports().at(-1)?.params.accepts_instructions).toBe(true);
-  // Without one, Enter during the rest of the change (another extension's slow handler) is held.
+  // Without one, a prompt sent during the rest of the change (another extension's slow handler,
+  // after OMP dropped every input listener) is held; Enter itself still reaches a dialog.
   state.admitted = false;
-  let during: unknown;
-  state.duringChange = () => {
-    during = omp.listener("\r");
+  let key: unknown;
+  let submitted: unknown;
+  state.duringChange = async () => {
+    key = omp.listener("\r");
+    submitted = await omp.harness.handlers.get("input")?.(
+      { type: "input", text: "PANERUN-M1", source: "interactive" },
+      omp.harness.context,
+    );
   };
   const second = await omp.act({ op: "new_session", args: {} });
   expect(second.ack.ok).toBe(true);
-  expect(during).toEqual({ consume: true });
+  expect(key).toBeUndefined();
+  expect(submitted).toEqual({ handled: true });
+  expect(omp.editor()).toBe("PANERUN-M1");
   expect(calls.filter((call) => (call as unknown[])[0] === "newSession")).toHaveLength(2);
 });
 

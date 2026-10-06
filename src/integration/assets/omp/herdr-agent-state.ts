@@ -378,9 +378,8 @@ const SERVICE_TIERS: Record<string, string[]> = {
 const STATUS_KEY = "herdr-sahur";
 // The status-line key of herdr's notice while a session change it started runs.
 const HOLD_STATUS_KEY = "herdr-session-change";
-// Enter as a terminal sends it: CR or LF, or the kitty keyboard protocol's form (any modifiers,
-// press or release), and xterm's modifyOtherKeys form.
-const ENTER_KEY = /\r|\n|\x1b\[13(?:;\d+(?::\d+)?)?u|\x1b\[27;\d+;13~/g;
+// A bare Enter (no modifier): CR, or the kitty keyboard protocol's form.
+const BARE_ENTER = /^(?:\r|\x1b\[13(?:;1)?u)$/;
 const ESCAPE_KEY = /^\x1b(?:\[27(?:;\d+(?::\d+)?)?u)?$/;
 const SUBAGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const SUBAGENT_STATUSES = new Set(["running", "idle", "parked", "aborted"]);
@@ -2166,7 +2165,8 @@ export default function (pi) {
   function alreadyAt(manager: any, entryId: string): boolean {
     let id = manager.getLeafId?.();
     for (let step = 0; id && step < 64; step += 1) {
-      if (id === entryId) return true;
+      // OMP moves a user message target's leaf to its parent, so a leaf on it is not there yet.
+      if (id === entryId) return manager.getEntry?.(id)?.message?.role !== "user";
       const entry = manager.getEntry?.(id);
       if (entry?.type === "custom" && entry.customType === "herdr-leaf" && entry.data?.entry_id === entryId) return true;
       if (entry?.type !== "custom" && entry?.type !== "label") return false;
@@ -2250,12 +2250,14 @@ export default function (pi) {
         const late = sessionChangeBlocked(ctx, session);
         if (late) return { ok: false, error: late };
       }
-      const hold = { session, summarizing, enterHeld: false, escaped: false, personSubmitted: false };
+      const hold: SessionHold = { session, summarizing, held: false, personSubmitted: false };
       sessionHold = hold;
       try {
         ctx?.ui?.setStatus?.(
           HOLD_STATUS_KEY,
-          summarizing ? "herdr: summarizing the branch; Enter waits, Esc cancels" : "herdr: changing the session; Enter waits",
+          summarizing
+            ? "herdr: summarizing the branch; a prompt you send waits, Esc cancels"
+            : "herdr: changing the session; a prompt you send waits",
         );
       } catch {}
       let cancelled = false;
@@ -2314,7 +2316,7 @@ export default function (pi) {
         if (sessionHold === hold) sessionHold = undefined;
         try {
           ctx?.ui?.setStatus?.(HOLD_STATUS_KEY, undefined);
-          if (hold.enterHeld) ctx?.ui?.notify?.("herdr held your Enter during a session change; press Enter to send", "info");
+          if (hold.held) ctx?.ui?.notify?.("herdr kept your prompt in the editor during a session change; press Enter to send it", "info");
         } catch {}
       }
       if (cancelled) {
@@ -2322,7 +2324,7 @@ export default function (pi) {
         if (hold.personSubmitted) {
           return { ok: false, error: "busy: a prompt was submitted as the change started; the session did not change" };
         }
-        if (hold.escaped) return { ok: false, error: "cancelled: the person pressed Esc during the summary; the leaf did not move" };
+        if (hold.signal?.aborted) return { ok: false, error: "cancelled: the person pressed Esc during the summary; the leaf did not move" };
         return { ok: false, error: "cancelled: another extension cancelled the change; the session did not change" };
       }
       await restore();
@@ -2331,34 +2333,91 @@ export default function (pi) {
       if (op !== "tree" && isAbsoluteSessionPath(previous)) data.previous_session_path = previous;
       return { ok: true, data };
     };
-    void run().then(finish);
+    void run().then(async (result) => {
+      await finish(result);
+      replayHeld(ctx);
+    });
     return rest;
   }
 
-  // A session change herdr started and is running now. A person's Enter would submit a prompt
-  // that OMP puts on the session or branch the change is leaving (a summary model call runs
-  // before the move; other extensions' switch handlers run before the swap), so Enter is held
-  // until the change ends and the text stays in the editor. Esc stops a branch summary, as in
-  // OMP's own `/tree`.
-  let sessionHold:
-    | { session: any; summarizing: boolean; enterHeld: boolean; escaped: boolean; personSubmitted: boolean }
-    | undefined;
+  // A session change herdr started and is running now. A prompt the person submits meanwhile
+  // would go to the session or branch the change is leaving (a summary model call runs before
+  // the move; other extensions' switch handlers run before the swap). OMP's `input` event holds
+  // it (see the handler below), so every key still reaches whatever has focus, a dialog included.
+  // Esc stops a branch summary, as in OMP's own `/tree`.
+  type SessionHold = {
+    session: any;
+    summarizing: boolean;
+    // The summary's abort signal, from OMP's `session_before_tree`.
+    signal?: AbortSignal;
+    held: boolean;
+    personSubmitted: boolean;
+  };
+  let sessionHold: SessionHold | undefined;
 
-  function holdKey(data: string) {
-    if (!sessionHold || data.startsWith("\x1b[200~")) return undefined;
+  // The raw keys the `input` event cannot see: Esc during a summary, and Enter on OMP's
+  // continue shortcuts (`.` and `c`), which submit before the `input` event.
+  function holdKey(ctx: any, data: string) {
+    const hold = sessionHold;
+    if (!hold) return undefined;
     if (ESCAPE_KEY.test(data)) {
-      if (!sessionHold.summarizing) return undefined;
-      sessionHold.escaped = true;
+      const signal = hold.signal;
+      if (!hold.summarizing || !signal || signal.aborted) return undefined;
       try {
-        sessionHold.session.abortBranchSummary?.();
+        hold.session.abortBranchSummary?.();
       } catch {}
-      return { consume: true };
+      // Only while OMP's summarizer runs does the abort take; any other Esc is the editor's.
+      return signal.aborted ? { consume: true } : undefined;
     }
-    const kept = data.replace(ENTER_KEY, "");
-    if (kept === data) return undefined;
-    sessionHold.enterHeld = true;
-    return kept ? { data: kept } : { consume: true };
+    if (!BARE_ENTER.test(data)) return undefined;
+    const text = ctx?.ui?.getEditorText?.()?.trim();
+    if (text !== "." && text !== "c") return undefined;
+    hold.held = true;
+    return { consume: true };
   }
+
+  // Held submissions with images (the editor cannot take images back), sent in order to the
+  // session OMP runs once the change ended.
+  let heldReplays: { text: string; images: unknown[] }[] = [];
+  function replayHeld(ctx: any) {
+    const replays = heldReplays;
+    heldReplays = [];
+    for (const { text, images } of replays) {
+      try {
+        const content = [...(text ? [{ type: "text", text }] : []), ...images];
+        pi.sendUserMessage(content, ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
+      } catch {}
+    }
+    if (replays.length > 0) {
+      try {
+        ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
+      } catch {}
+    }
+  }
+
+  // A prompt the person submits while herdr's session change runs. The editor cleared it before
+  // this event; it goes back into the editor, so nothing is lost and the person sends it into
+  // the session they now see. Images cannot go back, so such a prompt is sent after the change.
+  pi.on("input", (event: any, ctx: any) => {
+    const hold = sessionHold;
+    if (!hold || event?.source !== "interactive") return undefined;
+    const text = typeof event.text === "string" ? event.text : "";
+    const images = Array.isArray(event.images) ? event.images : [];
+    if (images.length > 0) {
+      heldReplays.push({ text, images });
+    } else if (text) {
+      hold.held = true;
+      const draft = ctx?.ui?.getEditorText?.() ?? "";
+      ctx?.ui?.setEditorText?.(draft ? `${text}\n${draft}` : text);
+    }
+    return { handled: true };
+  });
+
+  // OMP's summary abort signal for the `tree` herdr runs (Esc aborts through it).
+  pi.on("session_before_tree", (event: any) => {
+    if (sessionHold?.summarizing && event?.signal) sessionHold.signal = event.signal;
+    return undefined;
+  });
 
   function registerInstructionListener(ctx: {
     isIdle?: () => boolean;
@@ -2369,7 +2428,7 @@ export default function (pi) {
     // registers a fresh one.
     unsubscribeInstructions?.();
     unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => {
-      const held = holdKey(data);
+      const held = holdKey(ctx, data);
       if (held) return held;
       const key = takeKey(data);
       if (key) return key;
@@ -2859,8 +2918,9 @@ export default function (pi) {
         hold.personSubmitted = true;
         return { cancel: true };
       }
-      // Hold Enter for the rest of the change (other extensions' handlers, the swap).
-      unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => holdKey(data));
+      // OMP dropped herdr's listener: keep the raw keys the `input` event cannot see (Esc, the
+      // continue shortcuts) for the rest of the change (other extensions' handlers, the swap).
+      unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => holdKey(ctx, data));
       return undefined;
     });
   }
