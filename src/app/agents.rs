@@ -209,6 +209,28 @@ impl App {
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
             return Err(AgentStartError::TargetBusy(params.pane_id));
         }
+        if kind == crate::detect::Agent::Omp {
+            let cwd = terminal.cwd.clone();
+            let values = crate::agent_resume::omp_resume_args(&params.args);
+            if !values.is_empty() {
+                for other in self.collect_agent_infos() {
+                    let Some(session) = other.agent_session.as_ref().filter(|_| {
+                        other.agent.as_deref() == Some("omp") && other.runtime_id.is_some()
+                    }) else {
+                        continue;
+                    };
+                    if let Some(value) = values.iter().find(|value| {
+                        crate::agent_resume::omp_resume_value_matches(value, &cwd, &session.value)
+                    }) {
+                        return Err(AgentStartError::SessionInUse {
+                            value: (*value).to_string(),
+                            pane_id: other.pane_id,
+                            session: session.value.clone(),
+                        });
+                    }
+                }
+            }
+        }
         let runtime = self
             .terminal_runtimes
             .get(&terminal_id)
@@ -310,6 +332,16 @@ impl App {
             AgentStartError::TargetBusy(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_busy".into(),
                 message: format!("agent target pane {target} is not an available shell"),
+            },
+            AgentStartError::SessionInUse {
+                value,
+                pane_id,
+                session,
+            } => crate::api::schema::ErrorBody {
+                code: "agent_session_in_use".into(),
+                message: format!(
+                    "OMP in pane {pane_id} runs {session}, which --resume {value} can open; a second OMP on it would save to another file that Herdr cannot follow until its first write. Resume another session, or close that pane first"
+                ),
             },
             AgentStartError::TargetUnavailable(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_unavailable".into(),
@@ -642,6 +674,12 @@ pub(super) enum AgentStartError {
     InvalidTimeout,
     TargetNotFound(String),
     TargetBusy(String),
+    /// `--resume` names a session file a live OMP pane runs.
+    SessionInUse {
+        value: String,
+        pane_id: String,
+        session: String,
+    },
     TargetUnavailable(String),
     InputFailed(String),
     DuplicateName {

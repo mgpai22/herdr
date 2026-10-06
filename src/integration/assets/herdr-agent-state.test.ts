@@ -3840,3 +3840,28 @@ test("Oh My Pi reads a switch target without following a symlink or waiting on a
     await rm(fifo, { force: true });
   }
 });
+
+test("Oh My Pi follows OMP's move to a new session file when another omp process holds the file", async () => {
+  const omp = await installOmpForActions("omp-session-redirect", { setSessionName: () => {} });
+  const live = { file: "/tmp/omp-instruct.jsonl", id: "omp-instruct" };
+  let notify: (() => void) | undefined;
+  Object.assign(omp.harness.context.sessionManager as Record<string, unknown>, {
+    getSessionFile: () => live.file,
+    getSessionId: () => live.id,
+    onPersistenceNotice: (cb: () => void) => {
+      notify = cb;
+      return () => {};
+    },
+  });
+  await omp.harness.handlers.get("session_switch")?.({ reason: "resume" }, omp.harness.context);
+  await waitFor(() => notify !== undefined && omp.harness.reports().length >= 2);
+  // The first write finds the file held by another omp: OMP saves to a sibling with a new id.
+  live.file = "/tmp/omp-instruct-moved.jsonl";
+  live.id = "omp-moved";
+  notify?.();
+  await waitFor(() => omp.harness.reports().at(-1)?.params.agent_session_path === "/tmp/omp-instruct-moved.jsonl");
+  // A block herdr checked against the old file is for this conversation: it runs.
+  const old = createHash("sha256").update("/tmp/omp-instruct.jsonl").digest("hex").slice(0, 32);
+  const { ack } = await omp.act({ op: "rename", args: { title: "after the move" }, session: old });
+  expect(ack.ok).toBe(true);
+});

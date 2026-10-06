@@ -669,6 +669,28 @@ function followSessionMove(ctx: any): boolean {
   return true;
 }
 
+// OMP moved the session to a sibling file with a new id, with no session event: another omp
+// process holds the file (a second `--resume` of a running session), or the file changed on disk.
+// The conversation goes on in the new file, so herdr registers it, and a block herdr checked
+// against the old file is still for this conversation. Returns whether it followed.
+function followSessionRedirect(ctx: any): boolean {
+  const before = currentAgentSessionPath;
+  if (before === undefined || !liveSessionMoved(ctx)) return false;
+  let file: unknown;
+  try {
+    file = ctx?.sessionManager?.getSessionFile?.();
+  } catch {
+    return false;
+  }
+  if (!isAbsoluteSessionPath(file) || file === before) return false;
+  updateSessionRef(ctx);
+  movedSessionTags = [tagOf(before)];
+  movedSessionStems = before.endsWith(".jsonl") ? [before.slice(0, -".jsonl".length)] : [];
+  reportsLost = true;
+  void reportSession();
+  return true;
+}
+
 function currentSessionKey(): string | undefined {
   if (currentAgentSessionPath) return `path\0${currentAgentSessionPath}`;
   if (currentAgentSessionId) return `id\0${currentAgentSessionId}`;
@@ -1151,6 +1173,10 @@ export default function (pi) {
   let detailRefused = false;
   let moveWatch: ReturnType<typeof setInterval> | undefined;
   let unsubscribeRegistry: (() => void) | undefined;
+  // OMP's notices that the session moved to a new file with a new id (another omp process holds
+  // the file, or the file changed under it), and the session manager they come from.
+  let unsubscribeRedirects: (() => void) | undefined;
+  let redirectManager: unknown;
   // Counts activations and shutdowns, so a pending withdrawal undo sees that a session event came.
   let activations = 0;
   let lastDetailAt = 0;
@@ -2569,6 +2595,20 @@ export default function (pi) {
         if (typeof off === "function") unsubscribeRegistry = off;
       } catch {}
     }
+    // OMP reports a redirect through its session manager only. A session change keeps the
+    // manager, so one subscription per manager. OMP replays earlier notices to a new subscriber:
+    // each is checked against the session OMP runs now.
+    const manager = ctx?.sessionManager;
+    if (manager !== redirectManager && typeof manager?.onPersistenceNotice === "function") {
+      unsubscribeRedirects?.();
+      try {
+        const off = manager.onPersistenceNotice(() => {
+          if (rootSession && instructionListener && detailCtx) followSessionRedirect(detailCtx);
+        });
+        unsubscribeRedirects = typeof off === "function" ? off : undefined;
+        redirectManager = manager;
+      } catch {}
+    }
     registerInstructionListener(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
@@ -2932,6 +2972,9 @@ export default function (pi) {
     activations += 1;
     clearInterval(moveWatch);
     moveWatch = undefined;
+    unsubscribeRedirects?.();
+    unsubscribeRedirects = undefined;
+    redirectManager = undefined;
     unsubscribeRegistry?.();
     unsubscribeRegistry = undefined;
     onSubagentChange = undefined;

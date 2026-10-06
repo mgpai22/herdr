@@ -127,6 +127,8 @@ OMP 切换会话时（`/new`、`/resume`、fork、branch），集成会撤回监
 
 集成 v16 还报告 `session_name`（OMP 的会话标题）和 `leaf_id`（会话 leaf 所在的条目，在 tree 移动写入会话文件之前即可显示）。branch、在条目处 fork 以及 `/btw` 提升会作为 `session_start_source` `branch` 报告，Herdr 现在接受它，因此 `agent_session` 立即跟随新文件。
 
+当另一个 `omp` 进程持有会话文件而 OMP 把会话移到新文件时（OMP 的会话租约），集成 v16 立即注册新文件，因此 `agent_session` 跟随它，指令仍能到达该智能体。kind 为 `omp` 的 `agent.start` 在 `--resume`、`-r` 或 `--session` 指向某个运行中 OMP 窗格的会话文件（该文件的路径，或 OMP 会与其名称或会话 ID 匹配的前缀）时，以 `agent_session_in_use` 拒绝。
+
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 
 `session.snapshot` 为维护本地运行时缓存的客户端返回一次性引导快照。响应包含版本/协议元数据、当前聚焦的工作区/标签页/窗格 id、工作区记录、标签页记录、窗格记录、标签页布局快照和智能体记录。它不是订阅。初始化或恢复缓存时,应先建立订阅,再按下文事件订阅部分的说明读取服务器当前状态并核对、更新缓存。事件表示缓存可能过期,不能无条件重放到快照上。重新连接后或本地缓存可能已过期时,再次调用 `session.snapshot`。工作区记录也包含关联 worktree 的来源信息。完整的仓库 worktree 发现仍使用 `worktree.list`。

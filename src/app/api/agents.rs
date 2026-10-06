@@ -3387,6 +3387,57 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn agent_start_refuses_to_resume_a_session_a_live_omp_pane_runs() {
+        let (mut app, _instruct, _rx) = guarded_fixture(AgentState::Idle);
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, args: &[&str]| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: args.iter().map(|arg| arg.to_string()).collect(),
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        let path = fixture_session_path();
+        // The live pane runs `omp-native.jsonl`: every form OMP resolves to that file is refused.
+        for args in [
+            vec!["--resume", path.as_str()],
+            vec!["--resume=OMP-NAT"],
+            vec!["-r", "omp-nat"],
+            vec!["--session", "omp-native"],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{args:?}: {response}"
+            );
+        }
+        // Another session, and a flag value OMP would not take, pass this check (the fixture has
+        // no terminal runtime, so the start stops at the next one).
+        for args in [vec!["--resume", "zz9"], vec!["-r", "-omp"]] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_pane_unavailable",
+                "{args:?}: {response}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn closing_a_pane_ends_its_pending_switch_and_its_claim() {
         use crate::api::schema::AgentActionOp;
         let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);

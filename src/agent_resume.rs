@@ -194,6 +194,66 @@ pub fn persisted_session_from_launch_args(
     })
 }
 
+/// The session values an OMP command line asks to resume: `--resume`, `-r` and `--session`, as
+/// `--flag value` (a value that does not start with `-`) or `--flag=value`.
+pub fn omp_resume_args(args: &[String]) -> Vec<&str> {
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (arg, None),
+        };
+        if matches!(flag, "--resume" | "-r" | "--session") {
+            match inline {
+                Some(value) if !value.is_empty() => values.push(value),
+                Some(_) => {}
+                None => {
+                    if let Some(next) = args
+                        .get(i + 1)
+                        .filter(|next| !next.is_empty() && !next.starts_with('-'))
+                    {
+                        values.push(next.as_str());
+                        i += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    values
+}
+
+/// Whether `omp --resume <value>`, run in `cwd`, can open the session file `session_path`: the
+/// same file for a path value (one with a separator or ending in `.jsonl`); otherwise OMP's
+/// prefix rule, case-insensitive, on the file's name and on the session id at its end.
+pub fn omp_resume_value_matches(value: &str, cwd: &Path, session_path: &str) -> bool {
+    if value.contains('/') || value.contains('\\') || value.ends_with(".jsonl") {
+        let joined = cwd.join(value);
+        let same = |a: &Path, b: &Path| {
+            a == b
+                || matches!(
+                    (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        };
+        return same(&joined, Path::new(session_path));
+    }
+    let prefix = value.to_lowercase();
+    let Some(stem) = Path::new(session_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_lowercase)
+    else {
+        return false;
+    };
+    stem.starts_with(&prefix)
+        || stem
+            .rsplit_once('_')
+            .is_some_and(|(_, id)| id.starts_with(&prefix))
+}
+
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
     match value.as_deref().map(str::trim) {
         Some(
