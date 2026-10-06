@@ -440,6 +440,7 @@ mod tests {
                 agent_start_profile: false,
                 agent_instruct: false,
                 agent_action: false,
+                events_any_pane: false,
             }),
         }
     }

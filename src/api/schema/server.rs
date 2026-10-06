@@ -45,4 +45,7 @@ pub struct ServerCapabilities {
     /// Supports `agent.action` structured OMP actions acknowledged by the OMP integration.
     #[serde(default)]
     pub agent_action: bool,
+    /// Supports `pane.agent_status_changed` subscriptions without `pane_id`.
+    #[serde(default)]
+    pub events_any_pane: bool,
 }

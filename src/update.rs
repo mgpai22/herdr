@@ -2857,6 +2857,7 @@ mod tests {
                 agent_start_profile: false,
                 agent_instruct: false,
                 agent_action: false,
+                events_any_pane: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2935,6 +2936,7 @@ mod tests {
                     agent_start_profile: false,
                     agent_instruct: false,
                     agent_action: false,
+                    events_any_pane: false,
                 }),
             },
         };
@@ -3197,6 +3199,7 @@ mod tests {
                     agent_start_profile: false,
                     agent_instruct: false,
                     agent_action: false,
+                    events_any_pane: false,
                 }),
             },
         };

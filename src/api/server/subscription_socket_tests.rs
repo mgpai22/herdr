@@ -354,3 +354,59 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     assert_eq!(response["id"], "ordinary");
     assert_eq!(response["result"]["type"], "workspace_list");
 }
+
+fn status_event(pane_id: &str, agent_status: AgentStatus, state_change_seq: u64) -> EventEnvelope {
+    EventEnvelope {
+        event: EventKind::PaneAgentStatusChanged,
+        data: EventData::PaneAgentStatusChanged {
+            pane_id: pane_id.into(),
+            workspace_id: "workspace_1".into(),
+            agent_status,
+            agent: Some("omp".into()),
+            title: None,
+            display_agent: None,
+            state_labels: Default::default(),
+            state_change_seq: Some(state_change_seq),
+        },
+    }
+}
+
+#[test]
+fn agent_status_subscription_without_pane_id_streams_every_pane_without_app_requests() {
+    let mut test = SocketTest::new();
+    let mut all = test.connect();
+    all.subscribe("all", json!([{"type": "pane.agent_status_changed"}]));
+    all.assert_started("all");
+    let mut done = test.connect();
+    done.subscribe(
+        "done",
+        json!([{"type": "pane.agent_status_changed", "agent_status": "done"}]),
+    );
+    done.assert_started("done");
+
+    test.hub.push(renamed_event(0));
+    test.hub
+        .push(status_event("w1:p1", AgentStatus::Working, 4));
+    test.hub.push(status_event("w1:p2", AgentStatus::Done, 5));
+
+    let first = all.response();
+    assert_eq!(first["event"], "pane.agent_status_changed", "{first}");
+    assert_eq!(first["data"]["pane_id"], "w1:p1");
+    assert_eq!(first["data"]["agent_status"], "working");
+    assert_eq!(first["data"]["state_change_seq"], 4);
+    assert!(first["data"].get("type").is_none());
+    let second = all.response();
+    assert_eq!(second["data"]["pane_id"], "w1:p2");
+    assert_eq!(second["data"]["agent_status"], "done");
+    let filtered = done.response();
+    assert_eq!(filtered["data"]["pane_id"], "w1:p2");
+    assert_eq!(filtered["data"]["state_change_seq"], 5);
+
+    // A per-pane subscription asks the app for a pane snapshot on setup and every
+    // poll; one without pane_id never does.
+    std::thread::sleep(CONNECTION_POLL_INTERVAL * 3);
+    assert!(matches!(
+        test.api_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}

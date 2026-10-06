@@ -552,7 +552,13 @@ fn main() -> io::Result<()> {
     finish_cli(cli::maybe_run(&args))?;
 
     if args.get(1).map(String::as_str) == Some("remote-api-bridge") {
-        return remote::run_remote_api_bridge(&args[2..]);
+        // The local `--machine` CLI shows this stderr inside its own error line, so
+        // print it plainly instead of letting `main` print the `Debug` form.
+        if let Err(err) = remote::run_remote_api_bridge(&args[2..]) {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // Subcommands and flags (no TUI, no logging needed)

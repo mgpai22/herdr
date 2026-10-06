@@ -5732,6 +5732,54 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
 }
 
 #[test]
+fn headless_status_events_carry_the_panes_state_change_seq() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("seq");
+    let pane_id = workspace.tabs[0].root_pane;
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    for state in [
+        crate::detect::AgentState::Working,
+        crate::detect::AgentState::Idle,
+    ] {
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::HookStateReported {
+                pane_id,
+                source: "custom:pi".into(),
+                agent_label: "pi".into(),
+                state,
+                message: None,
+                seq: None,
+                session_ref: None,
+            })
+        );
+    }
+    let terminal_id = server.app.state.workspaces[0]
+        .pane_state(pane_id)
+        .expect("pane")
+        .attached_terminal_id
+        .clone();
+    let current = server.app.state.terminals[&terminal_id]
+        .last_agent_state_change_seq
+        .expect("state change seq");
+    let seqs: Vec<Option<u64>> = server
+        .app
+        .event_hub
+        .events_after(0)
+        .into_iter()
+        .filter_map(|(_, event)| match event.data {
+            crate::api::schema::EventData::PaneAgentStatusChanged {
+                state_change_seq, ..
+            } => Some(state_change_seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seqs.len(), 2, "{seqs:?}");
+    assert!(seqs[0] < seqs[1], "{seqs:?}");
+    assert_eq!(seqs[1], Some(current));
+}
+
+#[test]
 fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
     let mut server = test_headless_server();
     let now = Instant::now();

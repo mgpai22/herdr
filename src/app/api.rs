@@ -675,17 +675,21 @@ impl App {
         }
 
         let previous_agent_status = pane_agent_status(update.previous_state, update.previous_seen);
-        let agent_status = self
+        let pane_state = self
             .state
             .workspaces
             .get(update.ws_idx)
-            .and_then(|ws| ws.pane_state(update.pane_id))
+            .and_then(|ws| ws.pane_state(update.pane_id));
+        let agent_status = pane_state
             .map(|pane| pane_agent_status(update.state, pane.seen))
             .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
 
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
         {
+            let state_change_seq = pane_state
+                .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                .map(|terminal| terminal.last_agent_state_change_seq.unwrap_or(0));
             let presentation = update.presentation.clone();
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneAgentStatusChanged,
@@ -697,6 +701,7 @@ impl App {
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     state_labels: presentation.state_labels,
+                    state_change_seq,
                 },
             });
         }

@@ -75,7 +75,7 @@ herdr --machine "Build machine" worktree create --cwd /srv/project --branch revi
 
 有効なプロファイル ID または一意のラベル（大文字・小文字を区別）を指定します。任意の SSH ホスト名は使えません。保存済みのリモートセッションを使うため、`--session` や `--remote` との併用はエラーです。省略時のローカル動作は変わりません。
 
-対応するのは `workspace`、`worktree`、`tab`、`pane`、`notification`、`agent`（`attach` とローカルの `explain --file` 以外）、`api snapshot`、`status server`、API ベースのプラグイン操作（`link`、`unlink`、`enable`、`disable`、`list`、`action`、`log`、`pane`）です。サーバー操作は `stop`、`reload-config`、`agent-manifests`、`reload-agent-manifests` に対応します。ローカルのインストール・設定、プラグインのインストール、セッション管理、対話的な端末接続は転送しません。
+対応するのは `workspace`、`worktree`、`tab`、`pane`、`notification`、`agent`（`attach` とローカルの `explain --file` 以外）、`api snapshot`、`events subscribe`、`status server`、API ベースのプラグイン操作（`link`、`unlink`、`enable`、`disable`、`list`、`action`、`log`、`pane`）です。サーバー操作は `stop`、`reload-config`、`agent-manifests`、`reload-agent-manifests` に対応します。ローカルのインストール・設定、プラグインのインストール、セッション管理、対話的な端末接続は転送しません。
 
 JSON API を非対話 SSH で転送します。API の内容を SSH のシェルコマンドに埋め込むことはありません。開いた TUI は不要で、サーバーのインストール・起動・再起動も自動では行いません。ローカル CLI とリモート Herdr を更新し、実行中サーバーの API プロトコルとの互換性を保ってください。認証、接続、互換性のエラーで Local にフォールバックしたり、要求を自動再送したりすることはありません。
 
@@ -372,6 +372,17 @@ herdr pane wait-output <pane_id> (--match <text> | --regex <pattern>) [--source 
 タイムアウトや `agent_prompt_stalled` は未送信を保証しません。再試行前にエージェントを確認してください。
 
 `pane wait-output` と `agent wait` は、`--timeout` を省略すると無期限に待ちます。`agent prompt --wait` では、活動を観測した後、またはプロンプト開始時に `working` だった場合の安定状態待機は無期限です。non-working 状態から開始して活動を観測できない場合は、5 秒後に `agent_prompt_stalled` を返します。タイムアウトまたはサーバーエラーは JSON として stderr に出力され、終了コード 1 になります。CLI 使用法のエラーは終了コード 2 です。
+
+## イベント
+
+`events.subscribe` のストリームを JSON 行として出力する:
+
+```bash
+herdr events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed"},{"type":"pane.agent_detected"}]}'
+herdr --machine "Build machine" events subscribe --json '{"subscriptions":[{"type":"pane.agent_status_changed","agent_status":"done"}]}'
+```
+
+`--json` には `events.subscribe` のパラメーターを渡します。最初の行は `subscription_started` レスポンスで、以降の各行が 1 つのイベントです。届くたびに出力します。エラー行は stderr に出力し、終了コード 1 で終わります。サーバー停止などでストリームが終わった場合も終了コード 1 です。不正なパラメーターは使用法エラー（終了コード 2）です。`pane_id` を省いた `pane.agent_status_changed` はすべてのペインを監視します。詳しくは [ソケット API](/ja/docs/socket-api/#イベント購読) を参照してください。
 
 ## インテグレーション
 

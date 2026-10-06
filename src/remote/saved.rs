@@ -103,6 +103,11 @@ impl SavedSshApiBridge {
         self.metadata_cache.invalidate();
     }
 
+    /// See `SshStdioBridge::release_files`: for a command whose one stream is open.
+    pub(crate) fn release_files(&self) {
+        self.bridge.release_files();
+    }
+
     pub(crate) fn stale_metadata_failure(error: &io::Error) -> bool {
         error
             .to_string()

@@ -74,6 +74,14 @@ impl ApiClient {
         read_json_line(&mut reader)
     }
 
+    /// Sends one request and returns the connection for a response of many lines,
+    /// such as `events.subscribe`.
+    pub fn open_stream(&self, request: &Request) -> Result<BufReader<LocalStream>, ApiClientError> {
+        let mut stream = self.connect()?;
+        write_request(&mut stream, request)?;
+        Ok(BufReader::new(stream))
+    }
+
     pub fn status(&self) -> Result<crate::api::RuntimeStatus, ApiClientError> {
         self.read_status(None)
     }

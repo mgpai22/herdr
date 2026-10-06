@@ -2640,6 +2640,7 @@ pub(super) struct SshStdioBridge {
     should_stop: Arc<AtomicBool>,
     failure_rx: mpsc::Receiver<io::Error>,
     thread: Option<JoinHandle<()>>,
+    ssh_config_dir: Option<PathBuf>,
 }
 
 impl SshStdioBridge {
@@ -2692,6 +2693,9 @@ impl SshStdioBridge {
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_options = ssh_options.cloned();
+        let ssh_config_dir = ssh_options
+            .and_then(|options| options.config_path.parent())
+            .map(Path::to_path_buf);
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
@@ -2745,6 +2749,7 @@ impl SshStdioBridge {
             should_stop,
             failure_rx,
             thread: Some(thread),
+            ssh_config_dir,
         })
     }
 
@@ -2752,6 +2757,18 @@ impl SshStdioBridge {
         self.failure_rx
             .recv_timeout(BRIDGE_FAILURE_REPORT_TIMEOUT)
             .ok()
+    }
+
+    /// Removes the bridge socket and the temporary SSH config while the bridge keeps
+    /// serving its open connection, so a signal that skips `Drop` leaves no files.
+    /// Only for a caller that opens no further connection: a later one cannot
+    /// reach the socket, and its SSH child would find no config.
+    pub(super) fn release_files(&self) {
+        #[cfg(unix)]
+        let _ = crate::ipc::remove_socket_file_if_owned(&self.local_socket, &self.socket_identity);
+        if let Some(dir) = &self.ssh_config_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }
 

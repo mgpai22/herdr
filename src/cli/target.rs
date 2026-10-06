@@ -165,6 +165,16 @@ pub(super) fn remote_error(error: io::Error) -> io::Error {
     })
 }
 
+/// After a `--machine` command opened its only stream, remove the bridge's files so
+/// that a signal, which skips `Drop`, leaves nothing in the temp dir.
+pub(super) fn release_machine_files() {
+    TARGET.with(|target| {
+        if let Some(bridge) = target.borrow().as_ref().and_then(|t| t.bridge.as_ref()) {
+            bridge.release_files();
+        }
+    });
+}
+
 pub(super) fn restart_guidance() -> String {
     TARGET.with(|target| match target.borrow().as_ref() {
         Some(target) => format!("Update Herdr and restart the server on machine '{}' (session {}). Stopping the server exits its pane processes.", target.profile.label, target.profile.session),
@@ -298,6 +308,7 @@ fn validate_machine_command(args: &[String]) -> Result<(), String> {
         }
         "api" => subcommand == "snapshot",
         "status" => subcommand == "server",
+        "events" => subcommand == "subscribe",
         "plugin" => matches!(
             subcommand,
             "link" | "unlink" | "enable" | "disable" | "list" | "action" | "log" | "logs" | "pane"
@@ -462,6 +473,7 @@ mod tests {
             &["worktree", "create", "--branch", "feature"],
             &["tab", "list"],
             &["api", "snapshot"],
+            &["events", "subscribe", "--json", "{}"],
             &["server", "stop"],
         ] {
             let mut input = args(&["herdr"]);
