@@ -185,7 +185,7 @@ Use this order:
 1. Start `events subscribe` and wait for the `subscription_started` line.
 2. Read current state with `herdr agent list`. The stream sends no initial state.
 3. React to each event line.
-4. When the command exits with status 1 (server stopped, an `events_lost` error line, or the reader fell 5 seconds behind), go back to step 1. The server does not replay missed events.
+4. When the command exits with status 1 (server stopped, an `events_lost` error line on stderr, or a reader so slow that the server could not write to it for 5 seconds), go back to step 1. The server does not replay missed events.
 
 A turn that ends shows as `working` to `done`, or `working` to `idle` in a pane someone is viewing. A person viewing a `done` pane is not an event, so trust `agent list` for current status. Lines also repeat when only the title or labels change; compare `agent_status` with the last line for that pane. Servers that predate the any-pane stream reject an entry without `pane_id`; use `agent wait` there. For a saved machine, put `--machine <label-or-id>` before `events`.
 
