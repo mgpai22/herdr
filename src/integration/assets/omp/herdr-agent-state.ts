@@ -2131,7 +2131,7 @@ export default function (pi) {
     return rest;
   }
 
-  // The `cwd` in a session file's header line, or undefined when it is not a session file.
+  // The `cwd` in a session file's header, or undefined when it is not a session file.
   async function sessionFileCwd(file: string): Promise<string | undefined> {
     let handle: any;
     try {
@@ -2139,10 +2139,12 @@ export default function (pi) {
       handle = await open(file, "r");
       const buffer = Buffer.alloc(64 * 1024);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      const text = buffer.toString("utf8", 0, bytesRead);
-      const newline = text.indexOf("\n");
-      const header = JSON.parse(newline < 0 ? text : text.slice(0, newline));
-      return header?.type === "session" && typeof header.cwd === "string" ? header.cwd : undefined;
+      // OMP 18.6 writes a padded title slot before the header once a session has a name.
+      for (const line of buffer.toString("utf8", 0, bytesRead).split("\n", 3)) {
+        const entry = JSON.parse(line);
+        if (entry?.type === "session") return typeof entry.cwd === "string" ? entry.cwd : undefined;
+      }
+      return undefined;
     } catch {
       return undefined;
     } finally {

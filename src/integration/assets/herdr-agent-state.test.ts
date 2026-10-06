@@ -3587,7 +3587,8 @@ test("Oh My Pi switches only to a session file of the same project", async () =>
   const { omp, calls } = await installOmpForSessions("omp-session-switch");
   const target = `/tmp/omp-switch-${process.pid}.jsonl`;
   const elsewhere = `/tmp/omp-switch-other-${process.pid}.jsonl`;
-  await writeFile(target, `${JSON.stringify({ type: "session", id: "s", cwd: "/proj" })}\n`);
+  // A named session starts with OMP's title slot, then the header.
+  await writeFile(target, `${JSON.stringify({ type: "title", v: 1, title: "named" })}\n${JSON.stringify({ type: "session", id: "s", cwd: "/proj" })}\n`);
   await writeFile(elsewhere, `${JSON.stringify({ type: "session", id: "s", cwd: "/other" })}\n`);
   try {
     const refused = async (session_path: string) => (await omp.act({ op: "switch_session", args: { session_path } })).ack.error;
