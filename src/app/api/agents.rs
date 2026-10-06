@@ -191,6 +191,16 @@ pub(super) fn record_action_outcome(
     );
 }
 
+/// Whether the process that owned a pending action no longer runs: it is not there, or its pid
+/// now belongs to another process. A platform that cannot observe processes never says so.
+fn owner_process_gone(owner: &crate::platform::OwnerProcessIncarnation) -> bool {
+    match crate::platform::observe_process(owner.pid) {
+        Ok(None) => true,
+        Ok(Some(live)) => live != *owner,
+        Err(_) => false,
+    }
+}
+
 /// An `agent.action` block written to the PTY whose result has not come back.
 pub(crate) struct PendingActionAck {
     pub(super) op: crate::api::schema::AgentActionOp,
@@ -906,10 +916,14 @@ impl App {
                 false
             });
         // An action block nobody acked may mean the listener is gone, as for an instruction. An
-        // action to a closed pane gets no result: it ends at once, and with it a switch claim.
+        // action to a closed pane, or to an OMP that exited or was killed while the change ran
+        // (the pane stays a shell), gets no result: it ends at once, and with it a switch claim.
         let last_actions = &mut self.last_actions;
         self.pending_action_acks.retain(|action_id, pending| {
-            if pending.deadline > now && terminals.contains_key(&pending.terminal_id) {
+            if pending.deadline > now
+                && terminals.contains_key(&pending.terminal_id)
+                && !owner_process_gone(&pending.owner)
+            {
                 return true;
             }
             record_action_outcome(
@@ -3559,6 +3573,53 @@ mod tests {
         let plain = start(&mut app, &["--model", "m"]);
         assert_eq!(plain["error"]["code"], "agent_pane_unavailable", "{plain}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_action_ends_at_once_when_the_omp_that_ran_it_exits() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::NewSession, serde_json::json!({})),
+        );
+        sent_action(&mut rx);
+        // The server looks at pending actions on its own, once a second, not only when a request
+        // comes in; with none pending it has nothing to look at.
+        assert!(app.next_pending_action_owner_check().is_some());
+        let later = Instant::now() + Duration::from_secs(2);
+        // The OMP is alive: the action keeps waiting.
+        app.check_pending_action_owners(later);
+        assert!(response.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(app.pending_action_acks.len(), 1);
+        // The OMP that owns it is killed while its session change runs; the pane stays open.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let owner = crate::platform::observe_process(child.id())
+            .unwrap()
+            .unwrap();
+        for pending in app.pending_action_acks.values_mut() {
+            pending.owner = owner.clone();
+        }
+        app.check_pending_action_owners(later + Duration::from_secs(2));
+        assert_eq!(app.pending_action_acks.len(), 1, "the owner still runs");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        app.check_pending_action_owners(later + Duration::from_secs(4));
+        // The caller hears at once, not after the session ack deadline of 120 s.
+        let ended = response.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(ended.contains("action_unconfirmed"), "{ended}");
+        assert!(app.pending_action_acks.is_empty());
+        assert!(app.next_pending_action_owner_check().is_none());
     }
 
     #[cfg(target_os = "linux")]

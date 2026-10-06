@@ -45,6 +45,24 @@ impl App {
         self.expire_instruction_acks();
     }
 
+    /// When to look next at the actions that wait for a result: their OMP may have exited or been
+    /// killed, which nothing else reports while the pane stays open.
+    pub(crate) fn next_pending_action_owner_check(&self) -> Option<Instant> {
+        (!self.pending_action_acks.is_empty())
+            .then(|| self.action_owner_checked_at + super::PENDING_ACTION_OWNER_CHECK_INTERVAL)
+    }
+
+    /// Ends the pending actions whose OMP is gone, once the check is due.
+    pub(crate) fn check_pending_action_owners(&mut self, now: Instant) {
+        if self
+            .next_pending_action_owner_check()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.action_owner_checked_at = now;
+            self.expire_instruction_acks();
+        }
+    }
+
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
     }
@@ -162,6 +180,7 @@ impl App {
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
+            self.next_pending_action_owner_check(),
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.next_tab_bar_status_deadline(),

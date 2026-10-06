@@ -39,6 +39,8 @@ const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// How often a pending `agent.action` is checked for an owner process that exited.
+const PENDING_ACTION_OWNER_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
@@ -134,6 +136,8 @@ pub struct App {
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    /// When the server last looked at the pending `agent.action` results for an owner that is gone.
+    pub(crate) action_owner_checked_at: Instant,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
     pub(crate) omp_launchers: std::collections::BTreeMap<String, String>,
@@ -600,6 +604,7 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            action_owner_checked_at: Instant::now(),
             startup_per_agent_delay: Duration::from_millis(
                 config.session.startup_per_agent_delay_ms.into(),
             ),
