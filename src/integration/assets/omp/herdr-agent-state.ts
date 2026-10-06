@@ -7,8 +7,7 @@
 
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdtemp, open, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, open, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import net from "node:net";
 import path from "node:path";
@@ -386,10 +385,6 @@ const BARE_ENTER = /^(?:\r|\x1b\[13(?:;1)?u)$/;
 const PASTE_THEN_ENTER = /^\x1b\[200~([\s\S]*)\x1b\[201~(?:\r|\x1b\[13(?:;1)?u)$/;
 // OMP's default retry keys (F5, Alt+R, and their kitty forms), which start a turn with no submit.
 const RETRY_KEY = /^(?:\x1b\[15(?:;1)?~|\x1br|\x1b\[114;3u)$/;
-// Put before an editor text of `.` or `c` during a herdr session change, so OMP's submit does not
-// take it as a continue shortcut (which starts a turn before the input event) and herdr's input
-// handler holds it. Invisible, and never part of what is sent.
-const HOLD_MARK = "\u200b";
 const ESCAPE_KEY = /^\x1b(?:\[27(?:;\d+(?::\d+)?)?u)?$/;
 const SUBAGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const SUBAGENT_STATUSES = new Set(["running", "idle", "parked", "aborted"]);
@@ -2286,7 +2281,9 @@ export default function (pi) {
         const late = sessionChangeBlocked(ctx, session);
         if (late) return { ok: false, error: late };
       }
-      const hold: SessionHold = { session, summarizing, held: false, personSubmitted: false };
+      const hold: SessionHold = { session, summarizing, held: false, retryIgnored: false, personSubmitted: false };
+      // The terminal UI, so the key hold can see which component has focus.
+      captureTui(ctx);
       sessionHold = hold;
       try {
         ctx?.ui?.setStatus?.(
@@ -2350,10 +2347,10 @@ export default function (pi) {
         };
       } finally {
         if (sessionHold === hold) sessionHold = undefined;
-        restoreHeld(ctx);
         try {
           ctx?.ui?.setStatus?.(HOLD_STATUS_KEY, undefined);
           if (hold.held) ctx?.ui?.notify?.("herdr kept your prompt in the editor during a session change; press Enter to send it", "info");
+          if (hold.retryIgnored) ctx?.ui?.notify?.("herdr ignored the retry key during a session change; press it again", "info");
         } catch {}
       }
       if (cancelled) {
@@ -2370,7 +2367,10 @@ export default function (pi) {
       if (op !== "tree" && isAbsoluteSessionPath(previous)) data.previous_session_path = previous;
       return { ok: true, data };
     };
-    void run().then(finish);
+    void run().then(async (result) => {
+      await finish(result);
+      replayHeld(ctx);
+    });
     return rest;
   }
 
@@ -2384,16 +2384,48 @@ export default function (pi) {
     summarizing: boolean;
     // The summary's abort signal, from OMP's `session_before_tree`.
     signal?: AbortSignal;
+    // A text prompt went back into the editor.
     held: boolean;
+    // A retry key was ignored.
+    retryIgnored: boolean;
     personSubmitted: boolean;
   };
   let sessionHold: SessionHold | undefined;
 
-  // The raw keys the `input` event cannot see: Esc during a summary, OMP's retry keys, and an
-  // Enter that would submit a continue shortcut (`.` or `c`), which starts a turn before the input
-  // event. That Enter is not consumed: the editor text gets a mark, so whatever has focus (another
-  // extension's dialog, or the editor) still gets the Enter, and an editor submit reaches the
-  // input event, which holds it.
+  // OMP's terminal UI. Extensions get it only as the first argument of a widget factory, so a
+  // widget that renders nothing is set and removed at once to read it.
+  let tuiRef: any;
+  function captureTui(ctx: any) {
+    if (tuiRef) return;
+    const key = "herdr-focus-probe";
+    try {
+      ctx?.ui?.setWidget?.(
+        key,
+        (tui: any) => {
+          if (typeof tui?.getFocused === "function") tuiRef = tui;
+          return { render: () => [], invalidate: () => {} };
+        },
+        { placement: "belowEditor" },
+      );
+      ctx?.ui?.setWidget?.(key, undefined);
+    } catch {}
+  }
+
+  // Whether OMP's core editor has keyboard focus: the component the input controller gave its
+  // retry and dequeue handlers. False when focus is unknown, so a key meant for a dialog, a
+  // selector or an overlay is never taken.
+  function editorFocused(): boolean {
+    try {
+      const focused = tuiRef?.getFocused?.();
+      return typeof focused?.onRetry === "function" && typeof focused?.onDequeue === "function";
+    } catch {
+      return false;
+    }
+  }
+
+  // The raw keys the `input` event cannot see, and only while OMP's core editor has focus: Esc
+  // during a summary, OMP's retry keys, and an Enter that would submit a continue shortcut (`.` or
+  // `c`, typed, or pasted with the Enter in one read), which starts a turn before the input event.
   function holdKey(ctx: any, data: string) {
     const hold = sessionHold;
     if (!hold) return undefined;
@@ -2406,91 +2438,62 @@ export default function (pi) {
       // Only while OMP's summarizer runs does the abort take; any other Esc is the editor's.
       return signal.aborted ? { consume: true } : undefined;
     }
-    if (RETRY_KEY.test(data)) {
-      hold.held = true;
+    const retry = RETRY_KEY.test(data);
+    const paste = PASTE_THEN_ENTER.exec(data);
+    if (!retry && !paste && !BARE_ENTER.test(data)) return undefined;
+    if (!editorFocused()) return undefined;
+    if (retry) {
+      hold.retryIgnored = true;
       return { consume: true };
     }
-    const paste = PASTE_THEN_ENTER.exec(data);
-    if (!paste && !BARE_ENTER.test(data)) return undefined;
     let draft: unknown;
     try {
       draft = ctx?.ui?.getEditorText?.();
     } catch {}
-    if (typeof draft !== "string" || draft.includes(HOLD_MARK)) return undefined;
+    if (typeof draft !== "string") return undefined;
     const text = (draft + (paste?.[1] ?? "")).trim();
     if (text !== "." && text !== "c") return undefined;
-    try {
-      ctx.ui.setEditorText(HOLD_MARK + draft);
-    } catch {}
-    return undefined;
+    hold.held = true;
+    // The paste reaches the editor; the Enter does not.
+    return paste ? { data: data.slice(0, data.lastIndexOf("\x1b[201~") + "\x1b[201~".length) } : { consume: true };
   }
 
-  // Images of a held submission, written to private files and pasted back into the editor (as a
-  // person pastes an image path) once the change ended.
-  let heldImages: string[] = [];
-  let heldImageDir: string | undefined;
-  async function keepImages(images: any[]): Promise<boolean> {
-    try {
-      heldImageDir ??= await mkdtemp(path.join(tmpdir(), "herdr-held-"));
-      for (const image of images) {
-        const type = typeof image?.mimeType === "string" ? image.mimeType.split("/")[1] : "";
-        const ext = type === "jpeg" ? "jpg" : ["png", "gif", "webp"].includes(type) ? type : undefined;
-        if (!ext || typeof image.data !== "string") return false;
-        const file = path.join(heldImageDir, `${crypto.randomUUID()}.${ext}`);
-        await writeFile(file, Buffer.from(image.data, "base64"), { mode: 0o600, flag: "wx" });
-        heldImages.push(file);
-      }
-      return true;
-    } catch {
-      return false;
+  // Held submissions with images, sent once, in order, with their own image data, to the session
+  // OMP runs when the change ended. The editor cannot take images back without losing where they
+  // came from (OMP tells the model each image's source file).
+  let heldReplays: { text: string; images: unknown[] }[] = [];
+  function replayHeld(ctx: any) {
+    const replays = heldReplays;
+    heldReplays = [];
+    for (const { text, images } of replays) {
+      try {
+        const content = [...(text ? [{ type: "text", text }] : []), ...images];
+        pi.sendUserMessage(content, ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
+      } catch {}
     }
-  }
-
-  function restoreHeld(ctx: any) {
-    const files = heldImages;
-    heldImages = [];
-    try {
-      const draft = ctx?.ui?.getEditorText?.();
-      if (typeof draft === "string") {
-        let text = draft.replaceAll(HOLD_MARK, "");
-        // The images attach at the end of the text, after a space.
-        if (files.length > 0 && text && !/\s$/.test(text)) text += " ";
-        if (text !== draft) ctx.ui.setEditorText(text);
-      }
-    } catch {}
-    if (files.length === 0) return;
-    try {
-      ctx.ui.pasteToEditor(files.join(" "));
-    } catch {}
-    // OMP reads the files while it attaches them; they go once it has.
-    const cleanup = setTimeout(() => {
-      for (const file of files) void rm(file, { force: true });
-    }, 60_000);
-    cleanup.unref?.();
+    if (replays.length > 0) {
+      try {
+        ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
+      } catch {}
+    }
   }
 
   // A prompt the person submits while herdr's session change runs. The editor cleared it before
-  // this event; it goes back into the editor (its images too, once the change ended), so nothing
-  // runs and the person sends it into the session they now see, as typed: a slash command stays
-  // a command. A marked submit (see `holdKey`) that arrives just after the change is held too.
-  pi.on("input", async (event: any, ctx: any) => {
+  // this event, and nothing runs now. A text prompt goes back into the editor as typed (a slash
+  // command stays a command), and the person sends it into the session they now see. A prompt
+  // with images is sent once after the change.
+  pi.on("input", (event: any, ctx: any) => {
     const hold = sessionHold;
-    const raw = typeof event?.text === "string" ? event.text : "";
-    if (event?.source !== "interactive" || (!hold && !raw.includes(HOLD_MARK))) return undefined;
-    const text = raw.replaceAll(HOLD_MARK, "");
+    if (!hold || event?.source !== "interactive") return undefined;
+    const text = typeof event.text === "string" ? event.text : "";
     const images = Array.isArray(event.images) ? event.images : [];
-    // The vision markers (`[Image #1, 64x64]`) name the attachments; the pasted images get new ones.
-    const kept = images.length > 0 ? text.replace(/\[(?:Image|Video) #\d+[^\]\n]*\](?: attachment:\/\/\d+)?/g, "").trim() : text;
-    const draft = ctx?.ui?.getEditorText?.() ?? "";
-    if (kept) ctx?.ui?.setEditorText?.(draft ? `${kept}\n${draft}` : kept);
-    if (hold) hold.held = true;
-    if (images.length > 0 && !(await keepImages(images))) {
-      try {
-        ctx?.ui?.notify?.("herdr could not keep the images of your held prompt; attach them again", "warning");
-      } catch {}
+    if (images.length > 0) {
+      heldReplays.push({ text, images });
+    } else if (text) {
+      hold.held = true;
+      const draft = ctx?.ui?.getEditorText?.() ?? "";
+      ctx?.ui?.setEditorText?.(draft ? `${text}\n${draft}` : text);
     }
-    // The change may have ended while the images were written: put them back now.
-    if (!sessionHold) restoreHeld(ctx);
     return { handled: true };
   });
 

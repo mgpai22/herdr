@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterEach, expect, mock, setSystemTime, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { access, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3706,25 +3706,35 @@ test("Oh My Pi labels entries and renames the session", async () => {
   expect(calls).toEqual([["setSessionName", "Parser fix"]]);
 });
 
-test("Oh My Pi holds a prompt sent during a herdr branch summary, never the keys, and lets Esc cancel it", async () => {
+test("Oh My Pi holds a prompt sent during a herdr branch summary, holds keys only for the editor, and lets Esc cancel it", async () => {
   const statuses: unknown[] = [];
   const notices: unknown[] = [];
+  const widgets: unknown[] = [];
   const { omp, state, calls, appended } = await installOmpForSessions("omp-session-summary-hold");
+  // OMP's terminal UI, which an extension sees only in a widget factory. The core editor is the
+  // component the input controller gave its retry and dequeue handlers.
+  const coreEditor = { onRetry: () => {}, onDequeue: () => {} };
+  const dialog = { onSubmit: () => {} };
+  let focused: unknown = coreEditor;
+  const tui = { getFocused: () => focused };
   Object.assign(omp.harness.context.ui as Record<string, unknown>, {
     setStatus: (key: string, text: unknown) => statuses.push([key, text]),
     notify: (text: string) => notices.push(text),
+    setWidget: (key: string, content: unknown) => {
+      widgets.push([key, typeof content]);
+      if (typeof content === "function") expect((content as (tui: unknown) => any)(tui).render()).toEqual([]);
+    },
   });
-  const pasted: string[] = [];
-  Object.assign(omp.harness.context.ui as Record<string, unknown>, { pasteToEditor: (text: string) => pasted.push(text) });
   const submit = (text: string, images?: unknown[]) =>
     omp.harness.handlers.get("input")?.({ type: "input", text, images, source: "interactive" }, omp.harness.context);
   state.summary = Promise.withResolvers<boolean>();
   const id = "f".repeat(32);
   expect(omp.listener(actionBlock(id, { op: "tree", args: { entry_id: "u1", summarize: true } }))).toEqual({ consume: true });
   await waitFor(() => calls.length === 1);
+  // The probe widget is set and removed at once.
+  expect(widgets).toEqual([["herdr-focus-probe", "function"], ["herdr-focus-probe", "undefined"]]);
   expect(statuses.at(-1)).toEqual(["herdr-session-change", "herdr: summarizing the branch; a prompt you send waits, Esc cancels"]);
-  // Keys reach whatever has focus: another extension's dialog takes Enter, and a paste with its
-  // Enter in one read goes to OMP as one input.
+  // Keys reach whatever has focus, and a paste with its Enter in one read goes to OMP as one input.
   expect(omp.listener("\r")).toBeUndefined();
   expect(omp.listener("\x1b[200~PANERUN-X\x1b[201~\r")).toBeUndefined();
   expect(omp.listener("\x1b[13;2u")).toBeUndefined();
@@ -3732,21 +3742,22 @@ test("Oh My Pi holds a prompt sent during a herdr branch summary, never the keys
   expect(await submit("PANERUN-X")).toEqual({ handled: true });
   expect(omp.editor()).toBe("PANERUN-X");
   expect(omp.harness.sent).toEqual([]);
-  // A continue shortcut submits before the input event. Its Enter still goes to whatever has
-  // focus (a dialog keeps it), but the editor text gets a mark, so an editor submit is no longer
-  // the shortcut and reaches the input event, which holds it as typed.
+  // A continue shortcut submits before the input event. With the editor focused, its Enter is held
+  // (typed, or pasted with the Enter in one read: the paste still reaches the editor).
+  omp.setEditor(".");
+  expect(omp.listener("\r")).toEqual({ consume: true });
+  expect(omp.editor()).toBe(".");
+  omp.setEditor("");
+  expect(omp.listener("\x1b[200~c\x1b[201~\r")).toEqual({ data: "\x1b[200~c\x1b[201~" });
+  // A dialog with focus gets Enter and retry keys, whatever the editor holds.
+  focused = dialog;
   omp.setEditor(".");
   expect(omp.listener("\r")).toBeUndefined();
-  expect(omp.editor()).toBe("\u200b.");
-  // OMP clears the editor before the input event.
-  omp.setEditor("");
-  expect(await submit("\u200b.")).toEqual({ handled: true });
+  expect(omp.listener("\x1b[200~.\x1b[201~\r")).toBeUndefined();
+  expect(omp.listener("\x1b[15~")).toBeUndefined();
   expect(omp.editor()).toBe(".");
-  // The same for a paste of `c` with its Enter in one read (`herdr pane run <pane> c`).
-  omp.setEditor("");
-  expect(omp.listener("\x1b[200~c\x1b[201~\r")).toBeUndefined();
-  expect(omp.editor()).toBe("\u200b");
-  // A dialog took that Enter: the mark goes when the change ends (checked below).
+  focused = coreEditor;
+  omp.setEditor("PANERUN-X");
   // OMP's retry keys start a turn with no submit: held.
   expect(omp.listener("\x1b[15~")).toEqual({ consume: true });
   expect(omp.listener("\x1br")).toEqual({ consume: true });
@@ -3756,38 +3767,55 @@ test("Oh My Pi holds a prompt sent during a herdr branch summary, never the keys
   const ack = await omp.finalAck(id);
   expect(ack.error).toStartWith("cancelled: the person pressed Esc");
   expect(appended).toEqual([]);
-  expect(omp.editor()).toBe("");
   expect(statuses.at(-1)).toEqual(["herdr-session-change", undefined]);
-  expect(notices).toEqual(["herdr kept your prompt in the editor during a session change; press Enter to send it"]);
-  // Afterwards submissions, Esc, retry and continue shortcuts pass again.
+  expect(notices).toEqual([
+    "herdr kept your prompt in the editor during a session change; press Enter to send it",
+    "herdr ignored the retry key during a session change; press it again",
+  ]);
+  // Afterwards submissions, Esc, retry and continue shortcuts pass again, and text with a zero
+  // width space is the person's own.
   expect(await submit("later")).toBeUndefined();
+  expect(await submit("a\u200bb")).toBeUndefined();
   expect(omp.listener("\x1b")).toBeUndefined();
   expect(omp.listener("\x1b[15~")).toBeUndefined();
   omp.setEditor(".");
   expect(omp.listener("\r")).toBeUndefined();
-  expect(omp.editor()).toBe(".");
   omp.setEditor("");
 
-  // A summary that ends acks only once the leaf moved. A held prompt with an image goes back into
-  // the editor too, as typed (a slash command stays a command): the text at once, the image
-  // pasted as a private file path once the change ended. Nothing is sent.
+  // A summary that ends acks only once the leaf moved. A held prompt with images is sent once,
+  // after the change, with its own image data. Only a retry key held: only its notice.
+  notices.length = 0;
   state.summary = Promise.withResolvers<boolean>();
   const next = "e".repeat(32);
   omp.listener(actionBlock(next, { op: "tree", args: { entry_id: "u1", summarize: true } }));
   await waitFor(() => calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 2);
+  expect(omp.listener("\x1br")).toEqual({ consume: true });
   const image = { type: "image", data: "aGk=", mimeType: "image/png" };
-  expect(await submit("/plan see [Image #1, 1x1] this", [image])).toEqual({ handled: true });
-  expect(omp.editor()).toBe("/plan see  this");
+  expect(await submit("see [Image #1, 1x1] this", [image])).toEqual({ handled: true });
+  expect(omp.editor()).toBe("");
   await Bun.sleep(30);
   expect(omp.acks().some((ack) => ack.action_id === next)).toBe(false);
-  expect(pasted).toEqual([]);
+  expect(omp.harness.sent).toEqual([]);
   state.summary.resolve(true);
   expect((await omp.finalAck(next)).data).toMatchObject({ entry_id: "u1", leaf_id: "custom1" });
-  expect(pasted).toHaveLength(1);
-  expect(pasted[0]).toMatch(/herdr-held-[^/]+\/[0-9a-f-]+\.png$/);
-  expect((await Bun.file(pasted[0]).text())).toBe("hi");
-  expect(((await stat(pasted[0])).mode & 0o777).toString(8)).toBe("600");
-  expect(omp.harness.sent).toEqual([]);
+  await waitFor(() => omp.harness.sent.length === 1);
+  expect(omp.harness.sent[0]).toEqual([[{ type: "text", text: "see [Image #1, 1x1] this" }, image], undefined]);
+  expect(notices).toEqual([
+    "herdr ignored the retry key during a session change; press it again",
+    "herdr sent your prompt with images after the session change",
+  ]);
+});
+
+test("Oh My Pi holds no key when it cannot tell what has focus", async () => {
+  const { omp, state, calls } = await installOmpForSessions("omp-session-no-focus");
+  let keys: unknown[] = [];
+  state.duringChange = () => {
+    omp.setEditor(".");
+    keys = [omp.listener("\r"), omp.listener("\x1b[15~")];
+  };
+  expect((await omp.act({ op: "new_session", args: {} })).ack.ok).toBe(true);
+  expect(calls).toContainEqual(["newSession"]);
+  expect(keys).toEqual([undefined, undefined]);
 });
 
 test("Oh My Pi passes an Esc outside the summarizer and reports a cancel as the extension's", async () => {
