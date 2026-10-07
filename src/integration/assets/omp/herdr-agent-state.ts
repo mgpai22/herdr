@@ -2707,7 +2707,7 @@ export default function (pi) {
   function writeSpool(ctx: any): Promise<void> {
     spoolQueue = spoolQueue.then(async () => {
       const dir = artifactsDir(ctx);
-      if (heldReplays.length === 0) return;
+      if (heldReplays.length === 0 && pendingTakes.length === 0) return;
       try {
         if (!dir) throw new Error("no artifact directory");
         await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -2725,7 +2725,7 @@ export default function (pi) {
           } else if (found.state === "ok") inherited = found.prompts;
         }
         const prompts: SpoolPrompt[] = [];
-        for (const { text, images, savedAt } of heldReplays) {
+        for (const { text, images, savedAt } of [...pendingTakes.flatMap((take) => take.prompts), ...heldReplays]) {
           const held: string[] = [];
           for (const image of images) {
             let source = imageSourcePath(image, dir);
@@ -2791,6 +2791,110 @@ export default function (pi) {
     } catch {}
   }
 
+  // Sent held prompts that OMP has not yet taken: the spool (the only durable copy of their images
+  // and words) and their words in the editor stay until OMP has the message in its session.
+  type PendingTake = { prompts: HeldPrompt[]; taking: boolean };
+  let pendingTakes: PendingTake[] = [];
+  // How long to wait for OMP to put a taken prompt in its session before leaving the spool for the
+  // next start (which looks in the session file first).
+  const takeWaitMs = 5000;
+
+  // An object's fields as unknown values (an empty record for anything else).
+  function recordOf(value: unknown): Record<string, unknown> {
+    return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  }
+
+  // Whether a user message's content carries these prompts: their words as typed (without OMP's
+  // image markers) and, when they had images, at least one image.
+  function contentHasPrompts(content: unknown, prompts: { text: string; images: unknown[] }[]): boolean {
+    const parts = Array.isArray(content) ? content.map(recordOf) : typeof content === "string" ? [{ type: "text", text: content }] : [];
+    const text = typedText(
+      parts
+        .map((part) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
+        .filter(Boolean)
+        .join("\n"),
+    );
+    if (prompts.some((prompt) => prompt.images.length > 0) && !parts.some((part) => part.type === "image")) return false;
+    return prompts.every((prompt) => {
+      const words = wordsOf(prompt.text);
+      return !words || text.includes(words);
+    });
+  }
+
+  // Whether a session entry is the user message that carries these prompts, written after they were held.
+  function entryHasPrompts(entry: unknown, prompts: { text: string; images: unknown[]; savedAt: number }[]): boolean {
+    const record = recordOf(entry);
+    const message = recordOf(record.message);
+    if (record.type !== "message" || message.role !== "user") return false;
+    const at = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
+    if (Number.isFinite(at) && at < Math.max(...prompts.map((prompt) => prompt.savedAt)) - 1000) return false;
+    return contentHasPrompts(message.content, prompts);
+  }
+
+  // The user messages in the session file OMP runs now (none when it cannot be read).
+  async function userEntriesOfSession(ctx: any): Promise<unknown[]> {
+    try {
+      const file = ctx?.sessionManager?.getSessionFile?.();
+      if (typeof file !== "string") return [];
+      const entries: unknown[] = [];
+      for (const line of (await readFile(file, "utf8")).split("\n")) {
+        if (!/"role"\s*:\s*"user"/.test(line)) continue;
+        try {
+          entries.push(JSON.parse(line));
+        } catch {}
+      }
+      return entries;
+    } catch {
+      return [];
+    }
+  }
+
+  function removeHeldCopies(prompts: HeldPrompt[]): Promise<unknown> {
+    return Promise.all(
+      prompts
+        .flatMap(({ images }) => images.map((image) => heldImageFiles.get(image)))
+        .filter((copy): copy is string => copy !== undefined)
+        .map((copy) => unlink(copy).catch(() => {})),
+    );
+  }
+
+  // OMP's user message that carries a sent held prompt has started: the words leave the editor now
+  // (the message shows in the transcript), and the spool goes once the entry is in the session
+  // file. When OMP never writes it, the spool stays, and the next start looks in the session file
+  // before it puts the prompt back.
+  async function completeTake(ctx: any, take: PendingTake) {
+    take.taking = true;
+    removeWords(ctx, take.prompts.map((prompt) => wordsOf(prompt.text)));
+    try {
+      ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
+    } catch {}
+    const manager = ctx?.sessionManager;
+    const until = Date.now() + takeWaitMs;
+    let saved = false;
+    while (!saved && Date.now() < until) {
+      try {
+        saved = ((manager?.getEntries?.() ?? []) as unknown[]).slice(-40).some((entry) => entryHasPrompts(entry, take.prompts));
+      } catch {
+        return;
+      }
+      if (!saved) await delay(25);
+    }
+    if (!saved) return;
+    try {
+      await manager?.flush?.();
+    } catch {
+      return;
+    }
+    pendingTakes = pendingTakes.filter((other) => other !== take);
+    if (heldReplays.length > 0 || pendingTakes.length > 0) {
+      // Another change holds prompts, or another sent prompt waits: the spool goes on without this one.
+      await removeHeldCopies(take.prompts);
+      await writeSpool(ctx);
+    } else {
+      await dropSpool(ctx, take.prompts);
+    }
+  }
+
   function replayHeld(ctx: any) {
     const prompts = heldReplays;
     heldReplays = [];
@@ -2798,7 +2902,7 @@ export default function (pi) {
     // One message, in the order typed: two sends would race (the first waits for OMP to prepare its
     // images, the second then queues ahead of it). Later prompts' image markers follow the earlier
     // prompts' images.
-    const images: any[] = [];
+    const images: unknown[] = [];
     const texts: string[] = [];
     for (const prompt of prompts) {
       texts.push(shiftMarkers(prompt.text, images.length, prompt.images.length));
@@ -2806,7 +2910,7 @@ export default function (pi) {
     }
     const text = texts.filter(Boolean).join("\n\n");
     try {
-      pi.sendUserMessage([...(text ? [{ type: "text", text }] : []), ...images], ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
+      pi.sendUserMessage([...(text ? [{ type: "text", text }] : []), ...images] as never, ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
     } catch {
       // Nothing was sent: the words are still in the editor, and the spool puts the images back.
       const own = heldSpool?.file;
@@ -2817,11 +2921,8 @@ export default function (pi) {
         .catch(() => {});
       return;
     }
-    removeWords(ctx, prompts.map((prompt) => wordsOf(prompt.text)));
-    void dropSpool(ctx, prompts);
-    try {
-      ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
-    } catch {}
+    // Queued, not taken: the spool and the editor words stay until OMP's `message_start` for it.
+    pendingTakes.push({ prompts, taking: false });
   }
 
   // What a chip looks like in the editor's text: an icon, then `#N`.
@@ -2956,6 +3057,10 @@ export default function (pi) {
     // By time, not by name: a pid sorts as text, and the main file has none.
     const oldestOf = (item: { prompts: SpoolPrompt[] }) => Math.min(Infinity, ...item.prompts.map((prompt) => prompt.savedAt));
     items.sort((a, b) => oldestOf(a) - oldestOf(b));
+    // A prompt OMP already wrote into the session (it died after taking the prompt, before herdr
+    // removed the spool) is not put back: it would be sent twice.
+    const sessionUsers = await userEntriesOfSession(ctx);
+    for (const item of items) item.prompts = item.prompts.filter((prompt) => !sessionUsers.some((entry) => entryHasPrompts(entry, [prompt])));
     const prompts = items.flatMap((item) => item.prompts);
     const ui = ctx?.ui;
     let result = { lost: 0, slow: 0 };
@@ -3227,7 +3332,7 @@ export default function (pi) {
     registerInstructionListener(ctx);
     // A held prompt's spool follows the session into its new directory; a spool that an earlier OMP
     // left is offered back to the editor.
-    if (heldReplays.length > 0 && heldSpool && path.dirname(heldSpool.file) !== artifactsDir(ctx)) void writeSpool(ctx);
+    if ((heldReplays.length > 0 || pendingTakes.length > 0) && heldSpool && path.dirname(heldSpool.file) !== artifactsDir(ctx)) void writeSpool(ctx);
     scheduleSpoolRestore(ctx);
     updateSessionRef(ctx);
     void reportSession(sessionStartSource);
@@ -3340,6 +3445,8 @@ export default function (pi) {
 
   pi.on("message_start", (event, ctx) => {
     if (noteSubagent("message_start", event, ctx)) return;
+    const taken = pendingTakes.find((take) => !take.taking && recordOf(event?.message).role === "user" && contentHasPrompts(recordOf(event?.message).content, take.prompts));
+    if (taken && rootSession) void completeTake(ctx, taken);
     const message = event?.message;
     if (!rootSession || awaitingAdmission.length === 0 || message?.role !== "user") {
       return;
