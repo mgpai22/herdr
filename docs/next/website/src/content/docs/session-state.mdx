@@ -87,6 +87,8 @@ A blocked pane restores as a shell with its saved screen, followed by a `herdr:`
 
 Herdr starts a recovered OMP process with `OMP_PROFILE` set to the saved profile. Before it starts the process, it saves an owner-unknown barrier to private durable storage. A failed save prevents the process from starting. The resumed OMP process uses the saved foreground OMP directory, including directory changes made after launch.
 
+OMP writes a session's file when it gets its first reply, or when it saves an unsent draft on exit. A saved OMP session whose file does not exist (the agent never got a reply) has nothing to resume, and OMP 18.7 stops at `--resume=<missing file>` with `Session "<file>" not found`. Herdr then starts OMP without `--resume` in the pane; the new session replaces the saved reference when OMP reports it.
+
 :::caution[Back up before downgrade]
 An older Herdr binary can replace a version 4 snapshot and erase saved layout and OMP recovery data. Downgrade is unsupported. Back up the session directory and use an isolated data path before you run an older binary.
 :::

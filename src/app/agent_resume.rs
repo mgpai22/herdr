@@ -246,6 +246,10 @@ impl App {
             .first_mut()
             .ok_or("saved OMP resume command is empty")?;
         *command = executable;
+        if crate::agent_resume::omp_session_file_is_missing(&session.session_ref) {
+            // Nothing was written to resume; OMP 18.7 would stop at `--resume=<missing file>`.
+            plan.argv.truncate(1);
+        }
         Ok(session.launch_profile.clone())
     }
 
@@ -704,6 +708,53 @@ mod tests {
                 .unwrap_err()
                 .contains("no longer matches")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pending_omp_resume_starts_fresh_when_the_session_file_was_never_written() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-omp-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = dir.join("written.jsonl");
+        std::fs::write(&written, "{}\n").unwrap();
+        let never_written = dir.join("never-written.jsonl");
+        let launchers =
+            std::collections::BTreeMap::from([("default".into(), "/opt/omp-wrapper".into())]);
+        for (path, argv) in [
+            (
+                &written,
+                vec![
+                    "/opt/omp-wrapper".to_string(),
+                    format!("--resume={}", written.display()),
+                ],
+            ),
+            (&never_written, vec!["/opt/omp-wrapper".to_string()]),
+        ] {
+            let session_ref =
+                crate::agent_resume::AgentSessionRef::path(path.to_str().unwrap()).unwrap();
+            let mut plan = crate::agent_resume::plan("herdr:omp", "omp", &session_ref).unwrap();
+            let session = crate::agent_resume::PersistedAgentSession {
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                session_ref,
+                launch_profile: Some("default".into()),
+                owner_process: Some(crate::platform::OwnerProcessIncarnation {
+                    pid: u32::MAX,
+                    boot_id: "old-boot".into(),
+                    start_time_ticks: 1,
+                }),
+            };
+            App::refresh_omp_resume_executable(&mut plan, Some(&session), &launchers).unwrap();
+            assert_eq!(plan.argv, argv, "{}", path.display());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(unix)]

@@ -194,6 +194,20 @@ pub fn persisted_session_from_launch_args(
     })
 }
 
+/// Whether `session_ref` names a session file OMP never wrote. OMP writes a session's file at the
+/// first reply (or when it saves a draft), so a pane that got neither has none. OMP 18.7 refuses
+/// `--resume=<missing file>` with "Session ... not found" and exits (18.6 opened an empty session
+/// there), so a recovery has to start OMP fresh instead.
+pub fn omp_session_file_is_missing(session_ref: &AgentSessionRef) -> bool {
+    session_ref.kind == AgentSessionRefKind::Path
+        && std::fs::metadata(&session_ref.value).is_err_and(|err| {
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
+        })
+}
+
 /// The session values an OMP command line asks to resume: `--resume`, `-r` and `--session`, as
 /// `--flag value` (a value that does not start with `-`) or `--flag=value`.
 pub fn omp_resume_args(args: &[String]) -> Vec<&str> {
@@ -550,6 +564,32 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    #[test]
+    fn an_omp_session_file_is_missing_only_when_the_path_names_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-omp-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = dir.join("written.jsonl");
+        std::fs::write(&written, "{}\n").unwrap();
+        let path = |p: &std::path::Path| AgentSessionRef::path(p.to_str().unwrap()).unwrap();
+        assert!(!omp_session_file_is_missing(&path(&written)));
+        assert!(!omp_session_file_is_missing(&path(&dir)));
+        assert!(omp_session_file_is_missing(&path(&dir.join("none.jsonl"))));
+        assert!(omp_session_file_is_missing(&path(
+            &written.join("below.jsonl")
+        )));
+        assert!(!omp_session_file_is_missing(
+            &AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f").unwrap()
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]
