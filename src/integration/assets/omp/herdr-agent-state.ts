@@ -2850,14 +2850,16 @@ export default function (pi) {
     registeredArtifacts = artifactsDir(ctx);
   }
 
-  // The text without the held words herdr put at its start (`shown` in the `input` hold: the
-  // words of each held prompt, one per line, then the person's draft). Each word is cut in order,
-  // with the one newline herdr put after it. The same words anywhere else are the person's own,
-  // and so are words the person edited or typed in front of: they stay.
+  // The text without the held words herdr put at its start. The `input` hold writes the words of
+  // each held prompt, one per line, then a newline, then the person's draft (see the `input` hold).
+  // Each word is cut in order, only with the newline after it. A draft that merely starts with the
+  // same words (the person typed them, or herdr already took its own out) has no newline there
+  // and stays whole, as do the same words elsewhere and words the person edited or typed in front
+  // of.
   function withoutHeldWords(text: string, words: string[]): string {
     let rest = text;
     for (const word of words) {
-      if (word && rest.startsWith(word)) rest = rest.slice(word.length).replace(/^\n/, "");
+      if (word && rest.startsWith(`${word}\n`)) rest = rest.slice(word.length + 1);
     }
     return rest;
   }
@@ -3042,25 +3044,29 @@ export default function (pi) {
 
   // Puts spooled prompts into the editor as the person typed them: words and image chips in their
   // original order, then the draft that was there (minus the words OMP's own draft restore already
-  // brought back). The words go in exactly as saved, with only OMP's marker for each chip and the
-  // one space OMP put after it left out: OMP puts that space back with the chip. Text and image
-  // paths go in as pastes, one at a time, because OMP turns an image path into a chip only as a
-  // paste and sets the chip into the text once the file is read. The draft goes back even when a
-  // paste throws, and the error goes on to the caller. Returns how many images could not be put
-  // back and how many were slow to appear.
+  // brought back: they go whatever the draft holds, see `withoutHeldWords`). The words go in
+  // exactly as saved, with only OMP's marker for each chip and the one space OMP put after it left
+  // out: OMP puts that space back with the chip. Text and image paths go in as pastes, one at a
+  // time, because OMP turns an image path into a chip only as a paste and sets the chip into the
+  // text once the file is read. The draft goes back even when a paste throws, and the error goes
+  // on to the caller. Returns how many images could not be put back and how many were slow to
+  // appear.
   async function putBack(ui: any, prompts: SpoolPrompt[]): Promise<{ lost: number; slow: number }> {
     let lost = 0;
     let slow = 0;
     const current = ui?.getEditorText?.();
-    // With chips already in the editor `setEditorText` would drop them: add at the cursor then.
-    const rebuild = typeof current === "string" && !EDITOR_CHIP.test(current);
+    const draft = typeof current === "string" ? withoutHeldWords(current, prompts.map((prompt) => wordsOf(prompt.text))) : undefined;
+    // OMP keeps the images of chips and the text of `[Paste #N]` markers apart from the editor's
+    // text, so `setEditorText` leaves them. Their labels still have to be in the text, though:
+    // with chips in the draft it stays where it is and the prompts are added at the cursor;
+    // without, it goes back after them.
+    const rebuild = draft !== undefined && !EDITOR_CHIP.test(draft);
     let remaining = "";
     if (rebuild) {
-      remaining = withoutHeldWords(
-        current,
-        prompts.map((prompt) => wordsOf(prompt.text)),
-      );
+      remaining = draft;
       ui.setEditorText?.("");
+    } else if (draft !== undefined && draft !== current) {
+      ui.setEditorText?.(draft);
     }
     let wrote = false;
     const pasteText = (text: string) => {
@@ -3243,28 +3249,31 @@ export default function (pi) {
   // this event, and nothing runs now. A text prompt goes back into the editor as typed (a slash
   // command stays a command), and the person sends it into the session they now see. A prompt
   // with images is held (see above); the words of every held prompt go back into the editor at once
-  // too, so OMP's draft keeps them if OMP exits during the change.
+  // too, so OMP's draft keeps them if OMP exits during the change. They are the lines at the start
+  // of the editor, the last one closed by a newline, then the person's draft: `withoutHeldWords`
+  // takes exactly that out, and nothing the person typed.
   pi.on("input", async (event: any, ctx: any) => {
     const hold = sessionHold;
     if (!hold || event?.source !== "interactive" || !editorIsReal(ctx)) return undefined;
     let text = typeof event.text === "string" ? event.text : "";
     const images = Array.isArray(event.images) ? event.images : [];
     const draft = ctx?.ui?.getEditorText?.() ?? "";
+    const heldWords = () => heldReplays.map((prompt) => wordsOf(prompt.text)).filter(Boolean).join("\n");
     if (images.length > 0) {
       // The editor still showed the words of earlier held prompts, so a person who goes on typing
       // sends them again: they are already held, and are not part of this prompt.
-      for (const earlier of heldReplays) {
-        const words = wordsOf(earlier.text);
-        const at = words ? text.indexOf(words) : -1;
-        if (at >= 0) text = text.slice(0, at) + text.slice(at + words.length).replace(/^[ \n]/, "");
-      }
+      text = withoutHeldWords(text, heldReplays.map((earlier) => wordsOf(earlier.text)));
       heldReplays.push({ text, images, savedAt: Date.now() });
-      const shown = heldReplays.map((prompt) => wordsOf(prompt.text)).filter(Boolean).join("\n");
-      if (shown) ctx?.ui?.setEditorText?.(draft ? `${shown}\n${draft}` : shown);
+      const shown = heldWords();
+      if (shown) ctx?.ui?.setEditorText?.(`${shown}\n${draft}`);
       await writeSpool(ctx);
     } else if (text) {
       hold.held = true;
-      ctx?.ui?.setEditorText?.(draft ? `${text}\n${draft}` : text);
+      // OMP trims the text it submits: Enter on an editor that holds only the held words brings
+      // them back without the newline that closes them, so the line is closed again.
+      const held = heldWords();
+      const typed = held && text === held ? `${text}\n` : text;
+      ctx?.ui?.setEditorText?.(draft ? `${typed}\n${draft}` : typed);
     }
     return { handled: true };
   });

@@ -3829,9 +3829,9 @@ test("Oh My Pi holds a prompt sent during a herdr branch summary, holds keys onl
   const image = { type: "image", data: "aGk=", mimeType: "image/png", [sourceTag]: { path: "local://pasted-image-1", kind: "image" } };
   const fileImage = { type: "image", data: "aGk=", mimeType: "image/png", [sourceTag]: { path: "/proj/original.png", kind: "image" } };
   expect(await submit("see [Image #1, 1x1] and [Image #2, 1x1]", [image, fileImage])).toEqual({ handled: true });
-  // The words are back in the editor at once (OMP saves them as its draft if it exits now), and the
-  // images wait in a private spool file beside the session.
-  expect(omp.editor()).toBe("see and");
+  // The words are back in the editor at once, closed by a newline (OMP saves them as its draft if
+  // it exits now), and the images wait in a private spool file beside the session.
+  expect(omp.editor()).toBe("see and\n");
   const spoolFile = join(artifacts(), "herdr-held-prompt.json");
   const spool = JSON.parse(await readFile(spoolFile, "utf8"));
   expect(spool.prompts).toHaveLength(1);
@@ -3923,12 +3923,12 @@ test("Oh My Pi sends two held image prompts as one message, in the order they we
   const first = { type: "image", data: "b25l", mimeType: "image/png" };
   const second = { type: "image", data: "dHdv", mimeType: "image/png" };
   expect(await submit("FIRST [Image #1, 1x1]", [first])).toEqual({ handled: true });
-  expect(omp.editor()).toBe("FIRST");
+  expect(omp.editor()).toBe("FIRST\n");
   // OMP cleared the editor for the submit; the person had gone on typing after the words herdr put
-  // back, so the second submit carries the first prompt's words again.
+  // back (on the line below), so the second submit carries the first prompt's words again.
   omp.setEditor("");
-  expect(await submit("FIRST[Image #1, 1x1] SECOND", [second])).toEqual({ handled: true });
-  expect(omp.editor()).toBe("FIRST\nSECOND");
+  expect(await submit("FIRST\n[Image #1, 1x1] SECOND", [second])).toEqual({ handled: true });
+  expect(omp.editor()).toBe("FIRST\nSECOND\n");
   const spool = JSON.parse(await readFile(join(artifacts(), "herdr-held-prompt.json"), "utf8"));
   expect(spool.prompts.map((prompt: { text: string }) => prompt.text)).toEqual(["FIRST [Image #1, 1x1]", "[Image #1, 1x1] SECOND"]);
   expect(omp.harness.sent).toEqual([]);
@@ -3945,18 +3945,63 @@ test("Oh My Pi sends two held image prompts as one message, in the order they we
   await waitFor(() => !existsSync(join(artifacts(), "herdr-held-prompt.json")));
 });
 
+test("Oh My Pi keeps the words of a second held prompt that start like the first prompt's words", async () => {
+  const { omp, state, calls, artifacts, take } = await installOmpForSessions("omp-session-held-same-start");
+  const submit = (text: string, images: unknown[]) =>
+    omp.harness.handlers.get("input")?.({ type: "input", text, images, source: "interactive" }, omp.harness.context);
+  state.summary = Promise.withResolvers<boolean>();
+  const id = "a".repeat(32);
+  omp.listener(actionBlock(id, { op: "tree", args: { entry_id: "u1", summarize: true } }));
+  await waitFor(() => calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 1);
+  const first = { type: "image", data: "b25l", mimeType: "image/png" };
+  const second = { type: "image", data: "dHdv", mimeType: "image/png" };
+  const third = { type: "image", data: "dGhyZWU=", mimeType: "image/png" };
+  expect(await submit("ok [Image #1, 1x1]", [first])).toEqual({ handled: true });
+  expect(omp.editor()).toBe("ok\n");
+  // Enter on an editor that holds only herdr's words: OMP trims the submitted text, and the words
+  // come back as a plain prompt, closed by their newline again.
+  omp.setEditor("");
+  expect(await submit("ok", [])).toEqual({ handled: true });
+  expect(omp.editor()).toBe("ok\n");
+  // The person cleared the editor and typed new words that begin like the first prompt's: herdr
+  // wrote `ok` and a newline, and this text has no newline after its `ok`, so it is all theirs.
+  omp.setEditor("");
+  expect(await submit("ok then [Image #1, 1x1]", [second])).toEqual({ handled: true });
+  // Herdr's own words left in the editor and sent again are cut, as before (OMP cleared the editor
+  // for the submit, so the text carries them).
+  omp.setEditor("");
+  expect(await submit("ok\nok then\n[Image #1, 1x1] last", [third])).toEqual({ handled: true });
+  const spool = JSON.parse(await readFile(join(artifacts(), "herdr-held-prompt.json"), "utf8"));
+  expect(spool.prompts.map((prompt: { text: string }) => prompt.text)).toEqual([
+    "ok [Image #1, 1x1]",
+    "ok then [Image #1, 1x1]",
+    "[Image #1, 1x1] last",
+  ]);
+  expect(omp.editor()).toBe("ok\nok then\nlast\n");
+  state.summary.resolve(true);
+  await omp.finalAck(id);
+  await waitFor(() => omp.harness.sent.length > 0);
+  // All three prompts' words, and nothing else, left the editor with the message.
+  expect(omp.editor()).toBe("");
+  await take();
+  await waitFor(() => !existsSync(join(artifacts(), "herdr-held-prompt.json")));
+});
+
 test("Oh My Pi takes only the words it put at the start of the editor out when it sends a held prompt, and leaves the person's own text", async () => {
   const image = { type: "image", data: "b25l", mimeType: "image/png" };
-  // The editor when the prompt is sent (herdr put `alpha` in it), and what is left after. The
-  // person's own text stays, also where it holds the same word; words the person typed in front of
-  // or replaced are theirs now.
+  // The editor when the prompt is sent (herdr put `alpha` and a newline in it), and what is left
+  // after. The person's own text stays, also where it starts with or holds the same word; words
+  // the person typed in front of, or replaced, are theirs now.
   const editors: [string, string][] = [
-    ["alpha", ""],
-    ["alpha then alpha again", " then alpha again"],
+    ["alpha\n", ""],
+    ["alpha\nthen alpha again", "then alpha again"],
     ["alpha\nalpha beta", "alpha beta"],
+    ["alpha\nalpha\n", "alpha\n"],
+    ["alpha again", "alpha again"],
+    ["alpha", "alpha"],
     ["I said alpha twice", "I said alpha twice"],
-    ["note: alpha", "note: alpha"],
-    ["\nalpha", "\nalpha"],
+    ["note: alpha\n", "note: alpha\n"],
+    ["\nalpha\n", "\nalpha\n"],
   ];
   for (const [index, [typed, left]] of editors.entries()) {
     const run = await installOmpForSessions(`omp-session-words-span-${index}`);
@@ -3967,7 +4012,7 @@ test("Oh My Pi takes only the words it put at the start of the editor out when i
     run.omp.listener(actionBlock(id, { op: "tree", args: { entry_id: "u1", summarize: true } }));
     await waitFor(() => run.calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 1);
     expect(await submit("alpha [Image #1, 1x1]", [image])).toEqual({ handled: true });
-    expect(run.omp.editor()).toBe("alpha");
+    expect(run.omp.editor()).toBe("alpha\n");
     run.omp.setEditor(typed);
     run.state.summary.resolve(true);
     await run.omp.finalAck(id);
@@ -3987,8 +4032,21 @@ test("Oh My Pi keeps a held image prompt when OMP exits during the change, and p
   await writeFile(photo, "png-bytes");
   const tag = Symbol("image.attachmentSource");
   const spoolName = "herdr-held-prompt.json";
-  for (const [label, restoredDraft] of [["an empty editor", ""], ["a draft OMP restored", "describe  and  please"]]) {
-    const run = await installOmpForSessions(`omp-session-spool-exit-${label.length}`);
+  const prompt = "describe 🖼 #1  and 🖼 #2  please";
+  // What OMP restored as the draft (the held words, a newline, then the person's text, whatever
+  // OMP's draft save kept), and the editor after the restore. The person's own text stays: after
+  // the prompt, or where it is when it holds a chip. Text that merely starts with the words
+  // (without the newline herdr wrote after them) is the person's own too.
+  const cases: [string, string, string, string[]][] = [
+    ["an empty editor", "", prompt, []],
+    ["a draft OMP restored", "describe  and  please\n", prompt, []],
+    ["a draft with text after the words", "describe  and  please\nmy own text", `${prompt}\nmy own text`, ["\n", "my own text"]],
+    ["a draft with a chip after the words", "describe  and  please\n🖼 #5 TT", `🖼 #5 TT${prompt}`, []],
+    ["a draft with a paste marker after the words", "describe  and  please\nTT [Paste #1, +12 lines]", `TT [Paste #1, +12 lines]${prompt}`, []],
+    ["the same words typed again", "describe  and  please again", `${prompt}\ndescribe  and  please again`, ["\n", "describe  and  please again"]],
+  ];
+  for (const [index, [, restoredDraft, expectedEditor, afterPastes]] of cases.entries()) {
+    const run = await installOmpForSessions(`omp-session-spool-exit-${index}`);
     const coreEditor = { onRetry: () => {}, onDequeue: () => {} };
     Object.assign(run.omp.harness.context.ui as Record<string, unknown>, {
       setWidget: (_key: string, content: unknown) => {
@@ -4011,7 +4069,7 @@ test("Oh My Pi keeps a held image prompt when OMP exits during the change, and p
     );
     // OMP saves the editor text as its draft when it exits now. The images are in the spool: the
     // person's own file by name, the clipboard image as a private copy beside the session.
-    expect(run.omp.editor()).toBe("describe  and  please");
+    expect(run.omp.editor()).toBe("describe  and  please\n");
     const spoolFile = join(run.artifacts(), spoolName);
     const spool = JSON.parse(await readFile(spoolFile, "utf8"));
     expect(spool).toMatchObject({ v: 2, pid: process.pid });
@@ -4024,7 +4082,7 @@ test("Oh My Pi keeps a held image prompt when OMP exits during the change, and p
     expect((await readdir(run.artifacts())).filter((name) => name.startsWith("herdr-held-") && name.endsWith(".webp"))).toEqual([]);
 
     // OMP exits here; the change never ends. The same session starts again.
-    const restarted = await installOmpForSessions(`omp-session-spool-restart-${label.length}`, { artifactsRoot: run.artifactsRoot });
+    const restarted = await installOmpForSessions(`omp-session-spool-restart-${index}`, { artifactsRoot: run.artifactsRoot });
     const pastes: string[] = [];
     const notices: string[] = [];
     const restartedOmp = restarted.omp;
@@ -4034,8 +4092,8 @@ test("Oh My Pi keeps a held image prompt when OMP exits during the change, and p
     await waitFor(() => notices.length === 1);
     // The words once, the chips where the person typed them (a path with a space is quoted), and
     // nothing sent.
-    expect(pastes).toEqual(["describe ", `"${photo}"`, " and ", copy, " please"]);
-    expect(restartedOmp.editor()).toBe("describe 🖼 #1  and 🖼 #2  please");
+    expect(pastes).toEqual(["describe ", `"${photo}"`, " and ", copy, " please", ...afterPastes]);
+    expect(restartedOmp.editor()).toBe(expectedEditor);
     expect(notices).toEqual([
       expect.stringMatching(
         /^herdr put the prompt you sent during a session change back in the editor after OMP restarted; nothing was sent\. Press Enter to send it \(saved \d+ s ago\)$/,
@@ -4196,14 +4254,20 @@ test("Oh My Pi keeps a second copy of a held prompt in the registered session un
 test("Oh My Pi offers nothing and takes only the words it put at the start of the restored draft out of it when either session already has the held prompt", async () => {
   process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
   const image = { type: "image", data: "aGk=", mimeType: "image/png" };
-  // The editor OMP restored from its draft, and what is left of it. The person's own text stays,
-  // also where it holds the same words; text with the words only inside it was never herdr's.
+  // The editor OMP restored from its draft, and what is left of it. Herdr's words are the lines at
+  // the start closed by a newline; they go whatever follows, a chip or a paste marker included.
+  // The person's own text stays, also where it holds or merely starts with the same words (herdr
+  // had taken its own out of the draft before OMP saved it).
   const drafts: [string, string, string][] = [
-    ["omp-instruct", "look WRITTEN", ""],
+    ["omp-instruct", "look WRITTEN\n", ""],
     ["omp-new", "look WRITTEN\nmy own text", "my own text"],
     ["omp-new", "look WRITTEN\nI wrote look WRITTEN in my notes", "I wrote look WRITTEN in my notes"],
     ["omp-instruct", "I wrote look WRITTEN in my notes", "I wrote look WRITTEN in my notes"],
     ["omp-new", "\nlook WRITTEN", "\nlook WRITTEN"],
+    ["omp-new", "look WRITTEN again", "look WRITTEN again"],
+    ["omp-instruct", "look WRITTEN", "look WRITTEN"],
+    ["omp-new", "look WRITTEN\n🖼 #5 TT", "🖼 #5 TT"],
+    ["omp-instruct", "look WRITTEN\nTT [Paste #1, +12 lines]", "TT [Paste #1, +12 lines]"],
   ];
   for (const [index, [resumed, draft, left]] of drafts.entries()) {
     const release = Promise.withResolvers<void>();
@@ -4493,7 +4557,7 @@ test("Oh My Pi shows a held prompt in the editor with its indentation, so OMP's 
     { type: "input", text: "def f():\n    return [Image #1, 1x1]  x = 1\n        y = 2\n\n\tdone", images: [{ type: "image", data: "aGk=", mimeType: "image/png" }], source: "interactive" },
     omp.harness.context,
   );
-  expect(omp.editor()).toBe("def f():\n    return  x = 1\n        y = 2\n\n\tdone");
+  expect(omp.editor()).toBe("def f():\n    return  x = 1\n        y = 2\n\n\tdone\n");
   state.summary.resolve(true);
   await omp.finalAck("e".repeat(32));
 });
