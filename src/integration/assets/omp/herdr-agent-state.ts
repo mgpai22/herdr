@@ -2903,10 +2903,9 @@ export default function (pi) {
     return contentHasPrompts(message.content, prompts);
   }
 
-  // The user messages in the session file OMP runs now (none when it cannot be read).
-  async function userEntriesOfSession(ctx: any): Promise<unknown[]> {
+  // The user messages in a session file (none when it cannot be read).
+  async function userEntriesOfSession(file: unknown): Promise<unknown[]> {
     try {
-      const file = ctx?.sessionManager?.getSessionFile?.();
       if (typeof file !== "string") return [];
       const entries: unknown[] = [];
       for (const line of (await readFile(file, "utf8")).split("\n")) {
@@ -3130,9 +3129,14 @@ export default function (pi) {
     const oldestOf = (item: { prompts: SpoolPrompt[] }) => Math.min(Infinity, ...item.prompts.map((prompt) => prompt.savedAt));
     items.sort((a, b) => oldestOf(a) - oldestOf(b));
     // A prompt OMP already wrote into the session (it died after taking the prompt, before herdr
-    // removed the spool) is not put back: it would be sent twice.
-    const sessionUsers = await userEntriesOfSession(ctx);
-    for (const item of items) item.prompts = item.prompts.filter((prompt) => !sessionUsers.some((entry) => entryHasPrompts(entry, [prompt])));
+    // removed the spool) is not put back: it would be sent twice. A spool written as two copies
+    // (see `writeSpool`) also looks in the session of its other copy: herdr may have restarted the
+    // old session while the prompt is already in the new one.
+    const sessionUsers = await userEntriesOfSession(ctx?.sessionManager?.getSessionFile?.());
+    for (const item of items) {
+      const users = item.twin ? [...sessionUsers, ...(await userEntriesOfSession(`${path.dirname(item.twin.file)}.jsonl`))] : sessionUsers;
+      item.prompts = item.prompts.filter((prompt) => !users.some((entry) => entryHasPrompts(entry, [prompt])));
+    }
     const prompts = items.flatMap((item) => item.prompts);
     const ui = ctx?.ui;
     let result = { lost: 0, slow: 0 };

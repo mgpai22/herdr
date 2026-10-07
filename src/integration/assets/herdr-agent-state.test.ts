@@ -4159,6 +4159,61 @@ test("Oh My Pi keeps a second copy of a held prompt in the registered session un
   }
 });
 
+test("Oh My Pi does not offer a held prompt again when the session of its other copy already has it", async () => {
+  process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
+  const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+  const release = Promise.withResolvers<void>();
+  recordingDelay = (request) =>
+    request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl" ? release.promise : undefined;
+  try {
+    const run = await installOmpForSessions("omp-session-twin-written");
+    const started = run.omp.harness.reports().length;
+    await run.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, run.omp.harness.context);
+    await waitFor(() => run.omp.harness.reports().length > started);
+    run.state.duringChange = () =>
+      run.omp.harness.handlers.get("input")?.({ type: "input", text: "look WRITTEN [Image #1, 1x1]", images: [image], source: "interactive" }, run.omp.harness.context);
+    const id = "8".repeat(32);
+    run.omp.listener(actionBlock(id, { op: "new_session", args: {} }));
+    const before = join(run.artifactsRoot, "omp-instruct", "herdr-held-prompt.json");
+    const after = join(run.artifactsRoot, "omp-new", "herdr-held-prompt.json");
+    // The copy of the registered session is written first, so both are there once the second is.
+    await waitFor(() => existsSync(after));
+    expect(existsSync(before)).toBe(true);
+
+    // OMP wrote the prompt into the new session's file (beside its artifacts directory), then herdr
+    // and OMP died together before herdr saved the new session: the restart resumes the old one.
+    await writeFile(
+      join(run.artifactsRoot, "omp-new.jsonl"),
+      `${JSON.stringify({ type: "message", timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "look WRITTEN" }, image] } })}\n`,
+    );
+    const file = join(tmpdir(), `herdr-held-written-${process.pid}`, "omp-instruct.jsonl");
+    await mkdir(join(file, ".."), { recursive: true });
+    artifactRoots.push(join(file, ".."));
+    await writeFile(file, `${JSON.stringify({ type: "session", id: "omp-instruct", cwd: "/proj" })}\n`);
+    const restarted = await installOmpForSessions("omp-session-twin-written-restart", { artifactsRoot: run.artifactsRoot });
+    restarted.state.file = file;
+    const pastes: string[] = [];
+    const notices: string[] = [];
+    emulatePaste(restarted.omp, pastes, notices);
+    restarted.omp.setEditor("");
+    await restarted.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, restarted.omp.harness.context);
+    await waitFor(() => !existsSync(before));
+    // The integration restores on the real clock (the 20 ms poll set above), so a negative check
+    // needs one real wait past a poll; no fake clock reaches it.
+    await Bun.sleep(100);
+    // The new session has it: nothing goes back in the editor, and neither copy is left.
+    expect(pastes).toEqual([]);
+    expect(notices).toEqual([]);
+    expect(existsSync(before)).toBe(false);
+    expect(existsSync(after)).toBe(false);
+    release.resolve();
+    await run.omp.finalAck(id);
+  } finally {
+    release.resolve();
+    recordingDelay = undefined;
+  }
+});
+
 test("Oh My Pi leaves the spool when OMP starts a sent held prompt but never writes it", async () => {
   const image = { type: "image", data: "aGk=", mimeType: "image/png" };
   const { omp, state, artifactsRoot, take, entries } = await installOmpForSessions("omp-session-spool-unsaved");
