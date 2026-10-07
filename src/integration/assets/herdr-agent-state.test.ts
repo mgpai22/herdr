@@ -3852,17 +3852,18 @@ test("Oh My Pi holds a prompt sent during a herdr branch summary, holds keys onl
   expect(omp.harness.sent[0]).toEqual([[{ type: "text", text: "see [Image #1, 1x1] and [Image #2, 1x1]" }, image, fileImage], undefined]);
   expect((omp.harness.sent[0] as unknown[][])[0]?.[1]).toBe(image);
   expect((omp.harness.sent[0] as unknown[][])[0]?.[2]).toBe(fileImage);
-  // OMP only has the message queued: the spool (the one durable copy of the images) and the words
-  // in the editor stay, so an OMP killed now loses nothing.
+  // OMP only has the message queued: the spool (the one durable copy of the words and images) stays,
+  // so an OMP killed now loses nothing. The words are out of the editor already, so a draft OMP
+  // saves from here on (an exit that writes the message while it shuts down) never holds them
+  // next to the message.
   await Bun.sleep(150);
   expect(existsSync(spoolFile)).toBe(true);
   expect((await readdir(artifacts())).length).toBeGreaterThan(1);
-  expect(omp.editor()).toBe("see and");
-  // OMP starts the message but has not written it: the words leave the editor (the transcript shows
-  // them), the spool stays until the entry is in the session.
+  expect(omp.editor()).toBe("");
+  // OMP starts the message but has not written it: the spool stays until the entry is in the session.
   await take(false);
-  await waitFor(() => omp.editor() === "");
   await Bun.sleep(150);
+  expect(omp.editor()).toBe("");
   expect(existsSync(spoolFile)).toBe(true);
   // The entry is written: the spool and the image files are gone.
   await take();
@@ -3938,10 +3939,9 @@ test("Oh My Pi sends two held image prompts as one message, in the order they we
   expect(omp.harness.sent).toEqual([
     [[{ type: "text", text: "FIRST [Image #1, 1x1]\n\n[Image #2, 1x1] SECOND" }, first, second], undefined],
   ]);
-  // The words stay until OMP has the message; the entry carries both prompts' words.
-  expect(omp.editor()).toBe("FIRST\nSECOND");
+  // The words left the editor with the message; the entry carries both prompts' words.
+  expect(omp.editor()).toBe("");
   await take();
-  await waitFor(() => omp.editor() === "");
   await waitFor(() => !existsSync(join(artifacts(), "herdr-held-prompt.json")));
 });
 
@@ -4059,12 +4059,13 @@ test("Oh My Pi keeps a sent held prompt until OMP has it, and after an OMP kill 
       run.omp.harness.handlers.get("input")?.({ type: "input", text: "look KILLME [Image #1, 1x1]", images: [image], source: "interactive" }, run.omp.harness.context);
     expect((await run.omp.act({ op: "new_session", args: {} })).ack.ok).toBe(true);
     await waitFor(() => run.omp.harness.sent.length === 1);
-    // herdr sent the message and OMP is killed before it has written it: the spool and the editor
-    // words are there (the old code removed both right after the send).
+    // herdr sent the message and OMP is killed before it has written it: the spool is there (the old
+    // code removed it right after the send), the words are not in the editor, so a draft saved
+    // now has none.
     const spoolFile = join(run.artifactsRoot, "omp-new", "herdr-held-prompt.json");
     await Bun.sleep(100);
     expect(existsSync(spoolFile)).toBe(true);
-    expect(run.omp.editor()).toBe("look KILLME");
+    expect(run.omp.editor()).toBe("");
     const content = (run.omp.harness.sent[0] as unknown[][])[0];
 
     // The session file at the next start: with the user message when OMP had written it just
@@ -4159,58 +4160,69 @@ test("Oh My Pi keeps a second copy of a held prompt in the registered session un
   }
 });
 
-test("Oh My Pi does not offer a held prompt again when the session of its other copy already has it", async () => {
+test("Oh My Pi offers nothing and takes the words out of the restored draft when either session already has the held prompt", async () => {
   process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
   const image = { type: "image", data: "aGk=", mimeType: "image/png" };
-  const release = Promise.withResolvers<void>();
-  recordingDelay = (request) =>
-    request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl" ? release.promise : undefined;
-  try {
-    const run = await installOmpForSessions("omp-session-twin-written");
-    const started = run.omp.harness.reports().length;
-    await run.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, run.omp.harness.context);
-    await waitFor(() => run.omp.harness.reports().length > started);
-    run.state.duringChange = () =>
-      run.omp.harness.handlers.get("input")?.({ type: "input", text: "look WRITTEN [Image #1, 1x1]", images: [image], source: "interactive" }, run.omp.harness.context);
-    const id = "8".repeat(32);
-    run.omp.listener(actionBlock(id, { op: "new_session", args: {} }));
-    const before = join(run.artifactsRoot, "omp-instruct", "herdr-held-prompt.json");
-    const after = join(run.artifactsRoot, "omp-new", "herdr-held-prompt.json");
-    // The copy of the registered session is written first, so both are there once the second is.
-    await waitFor(() => existsSync(after));
-    expect(existsSync(before)).toBe(true);
+  for (const resumed of ["omp-instruct", "omp-new"]) {
+    const release = Promise.withResolvers<void>();
+    recordingDelay = (request) =>
+      request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl" ? release.promise : undefined;
+    try {
+      const run = await installOmpForSessions(`omp-session-twin-written-${resumed}`);
+      const started = run.omp.harness.reports().length;
+      await run.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, run.omp.harness.context);
+      await waitFor(() => run.omp.harness.reports().length > started);
+      run.state.duringChange = () =>
+        run.omp.harness.handlers.get("input")?.({ type: "input", text: "look WRITTEN [Image #1, 1x1]", images: [image], source: "interactive" }, run.omp.harness.context);
+      const id = "8".repeat(32);
+      run.omp.listener(actionBlock(id, { op: "new_session", args: {} }));
+      const before = join(run.artifactsRoot, "omp-instruct", "herdr-held-prompt.json");
+      const after = join(run.artifactsRoot, "omp-new", "herdr-held-prompt.json");
+      // The copy of the registered session is written first, so both are there once the second is.
+      await waitFor(() => existsSync(after));
+      expect(existsSync(before)).toBe(true);
 
-    // OMP wrote the prompt into the new session's file (beside its artifacts directory), then herdr
-    // and OMP died together before herdr saved the new session: the restart resumes the old one.
-    await writeFile(
-      join(run.artifactsRoot, "omp-new.jsonl"),
-      `${JSON.stringify({ type: "message", timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "look WRITTEN" }, image] } })}\n`,
-    );
-    const file = join(tmpdir(), `herdr-held-written-${process.pid}`, "omp-instruct.jsonl");
-    await mkdir(join(file, ".."), { recursive: true });
-    artifactRoots.push(join(file, ".."));
-    await writeFile(file, `${JSON.stringify({ type: "session", id: "omp-instruct", cwd: "/proj" })}\n`);
-    const restarted = await installOmpForSessions("omp-session-twin-written-restart", { artifactsRoot: run.artifactsRoot });
-    restarted.state.file = file;
-    const pastes: string[] = [];
-    const notices: string[] = [];
-    emulatePaste(restarted.omp, pastes, notices);
-    restarted.omp.setEditor("");
-    await restarted.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, restarted.omp.harness.context);
-    await waitFor(() => !existsSync(before));
-    // The integration restores on the real clock (the 20 ms poll set above), so a negative check
-    // needs one real wait past a poll; no fake clock reaches it.
-    await Bun.sleep(100);
-    // The new session has it: nothing goes back in the editor, and neither copy is left.
-    expect(pastes).toEqual([]);
-    expect(notices).toEqual([]);
-    expect(existsSync(before)).toBe(false);
-    expect(existsSync(after)).toBe(false);
-    release.resolve();
-    await run.omp.finalAck(id);
-  } finally {
-    release.resolve();
-    recordingDelay = undefined;
+      // OMP wrote the prompt into the new session's file (beside its artifacts directory), then herdr
+      // and OMP died together before herdr saved the new session: the restart resumes either one.
+      // OMP saved its draft while the words were still in the editor, and restores it at start.
+      const written = join(run.artifactsRoot, "omp-new.jsonl");
+      await writeFile(
+        written,
+        `${JSON.stringify({ type: "message", timestamp: new Date().toISOString(), message: { role: "user", content: [{ type: "text", text: "look WRITTEN" }, image] } })}\n`,
+      );
+      let file = written;
+      if (resumed === "omp-instruct") {
+        file = join(tmpdir(), `herdr-held-written-${process.pid}`, "omp-instruct.jsonl");
+        await mkdir(join(file, ".."), { recursive: true });
+        artifactRoots.push(join(file, ".."));
+        await writeFile(file, `${JSON.stringify({ type: "session", id: "omp-instruct", cwd: "/proj" })}\n`);
+      }
+      const restarted = await installOmpForSessions(`omp-session-twin-written-restart-${resumed}`, { artifactsRoot: run.artifactsRoot });
+      restarted.state.file = file;
+      const pastes: string[] = [];
+      const notices: string[] = [];
+      emulatePaste(restarted.omp, pastes, notices);
+      // The person's own text in the draft stays.
+      const own = resumed === "omp-new" ? "my own text" : "";
+      restarted.omp.setEditor(own ? `look WRITTEN\n${own}` : "look WRITTEN");
+      await restarted.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, restarted.omp.harness.context);
+      await waitFor(() => !existsSync(before));
+      // The integration restores on the real clock (the 20 ms poll set above), so a negative check
+      // needs one real wait past a poll; no fake clock reaches it.
+      await Bun.sleep(100);
+      // The session has it: nothing goes back in the editor, the restored draft loses the words
+      // (the message is in the transcript), and neither copy is left.
+      expect(pastes).toEqual([]);
+      expect(notices).toEqual([]);
+      expect(restarted.omp.editor()).toBe(own);
+      expect(existsSync(before)).toBe(false);
+      expect(existsSync(after)).toBe(false);
+      release.resolve();
+      await run.omp.finalAck(id);
+    } finally {
+      release.resolve();
+      recordingDelay = undefined;
+    }
   }
 });
 
@@ -4225,13 +4237,12 @@ test("Oh My Pi leaves the spool when OMP starts a sent held prompt but never wri
   // A message that is not the held prompt does not take it.
   await omp.harness.handlers.get("message_start")?.({ message: { role: "user", content: "unrelated" } }, omp.harness.context);
   await Bun.sleep(100);
-  expect(omp.editor()).toBe("look");
+  expect(omp.editor()).toBe("");
   expect(existsSync(spoolFile)).toBe(true);
-  // It starts, and no entry appears within the wait: the words go (the transcript shows them), the
-  // spool stays for the next start, which looks in the session file first.
+  // It starts, and no entry appears within the wait: the spool stays for the next start, which
+  // looks in the session file first.
   const before = entries.size;
   await take(false);
-  await waitFor(() => omp.editor() === "");
   await Bun.sleep(200);
   expect(entries.size).toBe(before);
   expect(existsSync(spoolFile)).toBe(true);

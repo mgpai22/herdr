@@ -2482,8 +2482,10 @@ export default function (pi) {
 
   // Prompts with images submitted during a change, oldest first. OMP cleared the editor and cannot
   // take images back, so herdr keeps them: in memory, and in a spool file beside the session in
-  // case OMP exits before the change ends. Their words are also back in the editor, so OMP's own
-  // draft save keeps those. A normal end sends them once, as one message, and removes the spool.
+  // case OMP exits before the change ends. Their words are also back in the editor while the change
+  // runs, so OMP's own draft save keeps those. The words leave the editor when the prompts are sent
+  // (the spool is the one copy from then on), so a draft saved after that never holds them next to
+  // a message OMP writes. A normal end sends them once, as one message, and removes the spool.
   //
   // The spool is never replaced blindly: a spool that is already in the session's directory (an
   // earlier OMP exited during a change and nobody reopened the session) keeps its prompts. They go
@@ -2864,7 +2866,7 @@ export default function (pi) {
   }
 
   // Sent held prompts that OMP has not yet taken: the spool (the only durable copy of their images
-  // and words) and their words in the editor stay until OMP has the message in its session.
+  // and words) stays until OMP has the message in its session.
   type PendingTake = { prompts: HeldPrompt[]; taking: boolean };
   let pendingTakes: PendingTake[] = [];
   // How long to wait for OMP to put a taken prompt in its session before leaving the spool for the
@@ -2920,6 +2922,16 @@ export default function (pi) {
     }
   }
 
+  // Which of these prompts a session file already carries, split from those none carries. `files`
+  // are the session files to look in: the one OMP runs now, and the session of a spool's other copy
+  // (herdr may have restarted the old session while the new one already has the prompt). Every
+  // path that would show a held prompt's words again asks this first.
+  async function splitWritten(files: unknown[], prompts: SpoolPrompt[]): Promise<{ written: SpoolPrompt[]; unwritten: SpoolPrompt[] }> {
+    const users = (await Promise.all(files.map((file) => userEntriesOfSession(file)))).flat();
+    const written = prompts.filter((prompt) => users.some((entry) => entryHasPrompts(entry, [prompt])));
+    return { written, unwritten: prompts.filter((prompt) => !written.includes(prompt)) };
+  }
+
   function removeHeldCopies(prompts: HeldPrompt[]): Promise<unknown> {
     return Promise.all(
       prompts
@@ -2929,13 +2941,11 @@ export default function (pi) {
     );
   }
 
-  // OMP's user message that carries a sent held prompt has started: the words leave the editor now
-  // (the message shows in the transcript), and the spool goes once the entry is in the session
-  // file. When OMP never writes it, the spool stays, and the next start looks in the session file
-  // before it puts the prompt back.
+  // OMP's user message that carries a sent held prompt has started (the transcript shows it now).
+  // The spool goes once the entry is in the session file. When OMP never writes it, the spool
+  // stays, and the next start looks in the session file before it puts the prompt back.
   async function completeTake(ctx: any, take: PendingTake) {
     take.taking = true;
-    removeWords(ctx, take.prompts.map((prompt) => wordsOf(prompt.text)));
     try {
       ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
     } catch {}
@@ -2980,10 +2990,14 @@ export default function (pi) {
       images.push(...prompt.images);
     }
     const text = texts.filter(Boolean).join("\n\n");
+    // The words leave the editor before the message does: an OMP that exits from here on saves its
+    // draft without them, and writes the message (or not) with the spool as the one other copy. A
+    // draft saved earlier still has them; the restore then finds the prompt in the session file.
+    removeWords(ctx, prompts.map((prompt) => wordsOf(prompt.text)));
     try {
       pi.sendUserMessage([...(text ? [{ type: "text", text }] : []), ...images] as never, ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
     } catch {
-      // Nothing was sent: the words are still in the editor, and the spool puts the images back.
+      // Nothing was sent: the spool puts the words and the images back.
       const own = heldSpool?.file;
       spoolQueue = spoolQueue
         .then(async () => {
@@ -2992,7 +3006,7 @@ export default function (pi) {
         .catch(() => {});
       return;
     }
-    // Queued, not taken: the spool and the editor words stay until OMP's `message_start` for it.
+    // Queued, not taken: the spool stays until OMP's `message_start` for it.
     pendingTakes.push({ prompts, taking: false });
   }
 
@@ -3128,15 +3142,19 @@ export default function (pi) {
     // By time, not by name: a pid sorts as text, and the main file has none.
     const oldestOf = (item: { prompts: SpoolPrompt[] }) => Math.min(Infinity, ...item.prompts.map((prompt) => prompt.savedAt));
     items.sort((a, b) => oldestOf(a) - oldestOf(b));
-    // A prompt OMP already wrote into the session (it died after taking the prompt, before herdr
+    // A prompt OMP already wrote into a session (it died after taking the prompt, before herdr
     // removed the spool) is not put back: it would be sent twice. A spool written as two copies
-    // (see `writeSpool`) also looks in the session of its other copy: herdr may have restarted the
-    // old session while the prompt is already in the new one.
-    const sessionUsers = await userEntriesOfSession(ctx?.sessionManager?.getSessionFile?.());
+    // (see `writeSpool`) also looks in the session of its other copy. Its words go out of the
+    // editor too: OMP's own draft restore ran first, and brings back the words of a prompt that was
+    // held when OMP exited.
+    const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+    const stale: string[] = [];
     for (const item of items) {
-      const users = item.twin ? [...sessionUsers, ...(await userEntriesOfSession(`${path.dirname(item.twin.file)}.jsonl`))] : sessionUsers;
-      item.prompts = item.prompts.filter((prompt) => !users.some((entry) => entryHasPrompts(entry, [prompt])));
+      const { written, unwritten } = await splitWritten(item.twin ? [sessionFile, `${path.dirname(item.twin.file)}.jsonl`] : [sessionFile], item.prompts);
+      item.prompts = unwritten;
+      stale.push(...written.map((prompt) => wordsOf(prompt.text)));
     }
+    removeWords(ctx, stale);
     const prompts = items.flatMap((item) => item.prompts);
     const ui = ctx?.ui;
     let result = { lost: 0, slow: 0 };
