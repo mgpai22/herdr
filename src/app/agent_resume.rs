@@ -246,9 +246,11 @@ impl App {
             .first_mut()
             .ok_or("saved OMP resume command is empty")?;
         *command = executable;
-        if crate::agent_resume::omp_session_file_is_missing(&session.session_ref) {
-            // Nothing was written to resume; OMP 18.7 would stop at `--resume=<missing file>`.
+        if let Some(fresh) = crate::agent_resume::omp_fresh_session_args(&session.session_ref) {
+            // The saved file cannot be opened (OMP 18.7 stops at `--resume=<it>`): start a new
+            // session in its directory, and never a bare launcher (see `omp_fresh_session_args`).
             plan.argv.truncate(1);
+            plan.argv.extend(fresh);
         }
         Ok(session.launch_profile.clone())
     }
@@ -712,7 +714,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn pending_omp_resume_starts_fresh_when_the_session_file_was_never_written() {
+    fn pending_omp_resume_never_restarts_a_session_it_cannot_open_as_a_bare_launcher() {
         let dir = std::env::temp_dir().join(format!(
             "herdr-omp-resume-{}-{}",
             std::process::id(),
@@ -725,20 +727,32 @@ mod tests {
         let written = dir.join("written.jsonl");
         std::fs::write(&written, "{}\n").unwrap();
         let never_written = dir.join("never-written.jsonl");
+        let empty = dir.join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
         let launchers =
             std::collections::BTreeMap::from([("default".into(), "/opt/omp-wrapper".into())]);
-        for (path, argv) in [
+        let launcher = || "/opt/omp-wrapper".to_string();
+        let in_dir = || {
+            vec![
+                launcher(),
+                "--session-dir".to_string(),
+                dir.to_str().unwrap().to_string(),
+            ]
+        };
+        let path = |file: &std::path::Path| {
+            crate::agent_resume::AgentSessionRef::path(file.to_str().unwrap()).unwrap()
+        };
+        let id = crate::agent_resume::AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f")
+            .unwrap();
+        for (session_ref, argv) in [
             (
-                &written,
-                vec![
-                    "/opt/omp-wrapper".to_string(),
-                    format!("--resume={}", written.display()),
-                ],
+                path(&written),
+                vec![launcher(), format!("--resume={}", written.display())],
             ),
-            (&never_written, vec!["/opt/omp-wrapper".to_string()]),
+            (path(&never_written), in_dir()),
+            (path(&empty), in_dir()),
+            (id, vec![launcher(), "--no-session".to_string()]),
         ] {
-            let session_ref =
-                crate::agent_resume::AgentSessionRef::path(path.to_str().unwrap()).unwrap();
             let mut plan = crate::agent_resume::plan("herdr:omp", "omp", &session_ref).unwrap();
             let session = crate::agent_resume::PersistedAgentSession {
                 source: "herdr:omp".into(),
@@ -752,7 +766,11 @@ mod tests {
                 }),
             };
             App::refresh_omp_resume_executable(&mut plan, Some(&session), &launchers).unwrap();
-            assert_eq!(plan.argv, argv, "{}", path.display());
+            assert_eq!(plan.argv, argv, "{:?}", session.session_ref);
+            assert!(
+                plan.argv.len() > 1,
+                "a bare launcher can pick another pane's session"
+            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1065,6 +1083,125 @@ mod tests {
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A launcher that behaves like OMP 18.7 with `autoResume: true` for the start arguments Herdr
+    /// can give it, and says what it did. A bare start continues another pane's session, which
+    /// a restored pane must never do.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn omp_restore_of_a_session_omp_cannot_open_never_takes_another_panes_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr-omp-resume-auto-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config_home = root.join("config");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let launcher = root.join("omp-auto-resume");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --resume=*) f=${1#--resume=}\n\
+               if [ -s \"$f\" ]; then echo \"outcome[resumed $f]\"; else echo \"outcome[session not found]\"; fi ;;\n\
+             --session-dir) echo \"outcome[new session in $2]\" ;;\n\
+             --no-session) echo \"outcome[in memory]\" ;;\n\
+             *) echo \"outcome[autoResume took another pane's session]\" ;;\n\
+             esac\n\
+             sleep 5\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let written = sessions.join("written.jsonl");
+        std::fs::write(&written, "{}\n").unwrap();
+        let empty = sessions.join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
+        let path = |file: &std::path::Path| {
+            crate::agent_resume::AgentSessionRef::path(file.to_str().unwrap()).unwrap()
+        };
+        let new_in_sessions = format!("outcome[new session in {}]", sessions.display());
+        let cases = [
+            (
+                path(&written),
+                format!("outcome[resumed {}]", written.display()),
+            ),
+            (
+                path(&sessions.join("never-written.jsonl")),
+                new_in_sessions.clone(),
+            ),
+            (path(&empty), new_in_sessions),
+            (
+                crate::agent_resume::AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f")
+                    .unwrap(),
+                "outcome[in memory]".to_string(),
+            ),
+        ];
+
+        for (session_ref, expected) in cases {
+            let (mut app, terminal_id) = {
+                // The barrier save reads the config home: hold the shared environment only
+                // while the restore starts, never across an await.
+                let _env = crate::config::test_config_env_lock().lock().unwrap();
+                std::env::remove_var(crate::session::SESSION_ENV_VAR);
+                std::env::set_var("XDG_CONFIG_HOME", &config_home);
+                let mut app = test_app();
+                app.policy.persist_session = true;
+                let workspace = crate::workspace::Workspace::test_new("restored");
+                let pane_id = workspace.tabs[0].root_pane;
+                let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+                app.state.workspaces = vec![workspace];
+                app.state.active = Some(0);
+                app.state.ensure_test_terminals();
+                app.omp_launchers = std::collections::BTreeMap::from([(
+                    "default".into(),
+                    launcher.display().to_string(),
+                )]);
+                let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+                terminal.pending_agent_resume_plan =
+                    crate::agent_resume::plan("herdr:omp", "omp", &session_ref);
+                terminal.persisted_agent_session =
+                    Some(crate::agent_resume::PersistedAgentSession {
+                        source: "herdr:omp".into(),
+                        agent: "omp".into(),
+                        session_ref: session_ref.clone(),
+                        launch_profile: Some("default".into()),
+                        owner_process: Some(crate::platform::OwnerProcessIncarnation {
+                            pid: u32::MAX,
+                            boot_id: "old-boot".into(),
+                            start_time_ticks: 1,
+                        }),
+                    });
+                assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 400, true));
+                std::env::remove_var("XDG_CONFIG_HOME");
+                (app, terminal_id)
+            };
+            let runtime = app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("the resume should start a shell");
+            let mut text = String::new();
+            for _ in 0..200 {
+                text = runtime.recent_unwrapped_text(40);
+                if text.contains("outcome[") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(text.contains(&expected), "{session_ref:?}: {text}");
+            assert!(!text.contains("autoResume took"), "{session_ref:?}: {text}");
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }

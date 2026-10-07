@@ -194,18 +194,34 @@ pub fn persisted_session_from_launch_args(
     })
 }
 
-/// Whether `session_ref` names a session file OMP never wrote. OMP writes a session's file at the
-/// first reply (or when it saves a draft), so a pane that got neither has none. OMP 18.7 refuses
-/// `--resume=<missing file>` with "Session ... not found" and exits (18.6 opened an empty session
-/// there), so a recovery has to start OMP fresh instead.
-pub fn omp_session_file_is_missing(session_ref: &AgentSessionRef) -> bool {
+/// Whether `session_ref` names a session file that OMP 18.7 cannot open: it does not exist, or it
+/// is empty. OMP writes a session's file at the first reply, when it saves an unsent draft, and
+/// when it stops a first prompt at exit; a pane with none of these has no file. OMP 18.7 refuses
+/// `--resume=<file>` for such a file and exits (`Session ... not found`, `the session file holds
+/// no entries`); 18.6 opened an empty session at that path.
+pub fn omp_session_file_is_unresumable(session_ref: &AgentSessionRef) -> bool {
     session_ref.kind == AgentSessionRefKind::Path
-        && std::fs::metadata(&session_ref.value).is_err_and(|err| {
-            matches!(
+        && match std::fs::metadata(&session_ref.value) {
+            Ok(meta) => meta.is_file() && meta.len() == 0,
+            Err(err) => matches!(
                 err.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            )
-        })
+            ),
+        }
+}
+
+/// The arguments that start a new OMP session in the saved session's directory, for a saved
+/// session OMP cannot open (see [`omp_session_file_is_unresumable`]). Never a bare launcher:
+/// with OMP's `autoResume` on, a bare `omp` continues the terminal's last session or the newest
+/// one in the directory, which another pane may be running. `--session-dir` is checked before
+/// `autoResume`, creates the new session there, and keeps a custom directory the pane was
+/// started with.
+pub fn omp_fresh_session_args(session_ref: &AgentSessionRef) -> Option<Vec<String>> {
+    if !omp_session_file_is_unresumable(session_ref) {
+        return None;
+    }
+    let dir = Path::new(&session_ref.value).parent()?.to_str()?;
+    Some(vec!["--session-dir".into(), dir.into()])
 }
 
 /// The session values an OMP command line asks to resume: `--resume`, `-r` and `--session`, as
@@ -419,10 +435,16 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
         }
-        ("herdr:omp", "omp", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
+        ("herdr:omp", "omp", AgentSessionRefKind::Path) => {
             // omp resume is `-r, --resume=<value>` (ID prefix or path); it has no
             // `--session` flag, unlike pi.
             vec!["omp".into(), format!("--resume={}", session_ref.value)]
+        }
+        ("herdr:omp", "omp", AgentSessionRefKind::Id) => {
+            // The integration reports a session id and no file for a session OMP keeps in
+            // memory (`--no-session`). There is nothing to resume by id: `--resume=<id>` stops
+            // with `Session ... not found`.
+            vec!["omp".into(), "--no-session".into()]
         }
         ("herdr:hermes", "hermes", AgentSessionRefKind::Id) => {
             vec![
@@ -567,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn an_omp_session_file_is_missing_only_when_the_path_names_nothing() {
+    fn an_omp_session_file_is_unresumable_when_the_path_names_nothing_or_an_empty_file() {
         let dir = std::env::temp_dir().join(format!(
             "herdr-omp-missing-{}-{}",
             std::process::id(),
@@ -579,17 +601,48 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let written = dir.join("written.jsonl");
         std::fs::write(&written, "{}\n").unwrap();
+        let empty = dir.join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
         let path = |p: &std::path::Path| AgentSessionRef::path(p.to_str().unwrap()).unwrap();
-        assert!(!omp_session_file_is_missing(&path(&written)));
-        assert!(!omp_session_file_is_missing(&path(&dir)));
-        assert!(omp_session_file_is_missing(&path(&dir.join("none.jsonl"))));
-        assert!(omp_session_file_is_missing(&path(
+        assert!(!omp_session_file_is_unresumable(&path(&written)));
+        assert!(!omp_session_file_is_unresumable(&path(&dir)));
+        assert!(omp_session_file_is_unresumable(&path(&empty)));
+        assert!(omp_session_file_is_unresumable(&path(
+            &dir.join("none.jsonl")
+        )));
+        assert!(omp_session_file_is_unresumable(&path(
             &written.join("below.jsonl")
         )));
-        assert!(!omp_session_file_is_missing(
-            &AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f").unwrap()
-        ));
+        let id = AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f").unwrap();
+        assert!(!omp_session_file_is_unresumable(&id));
+
+        // A session OMP cannot open restarts in its own directory, never as a bare launcher.
+        let in_its_dir = Some(vec![
+            "--session-dir".to_string(),
+            dir.to_str().unwrap().to_string(),
+        ]);
+        assert_eq!(omp_fresh_session_args(&path(&empty)), in_its_dir);
+        assert_eq!(
+            omp_fresh_session_args(&path(&dir.join("none.jsonl"))),
+            in_its_dir
+        );
+        assert_eq!(omp_fresh_session_args(&path(&written)), None);
+        assert_eq!(omp_fresh_session_args(&id), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_omp_session_reported_without_a_file_restores_as_no_session() {
+        let id = AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f").unwrap();
+        assert_eq!(
+            plan("herdr:omp", "omp", &id).unwrap().argv,
+            vec!["omp", "--no-session"]
+        );
+        let path = AgentSessionRef::path(absolute_test_path("omp-session.jsonl")).unwrap();
+        assert_eq!(
+            plan("herdr:omp", "omp", &path).unwrap().argv,
+            vec!["omp".to_string(), format!("--resume={}", path.value)]
+        );
     }
 
     #[cfg(target_os = "linux")]
