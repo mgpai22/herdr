@@ -2850,17 +2850,25 @@ export default function (pi) {
     registeredArtifacts = artifactsDir(ctx);
   }
 
-  // Takes held words out of the editor where hold put them, once, wherever they still are.
+  // The text without the held words herdr put at its start (`shown` in the `input` hold: the
+  // words of each held prompt, one per line, then the person's draft). Each word is cut in order,
+  // with the one newline herdr put after it. The same words anywhere else are the person's own,
+  // and so are words the person edited or typed in front of: they stay.
+  function withoutHeldWords(text: string, words: string[]): string {
+    let rest = text;
+    for (const word of words) {
+      if (word && rest.startsWith(word)) rest = rest.slice(word.length).replace(/^\n/, "");
+    }
+    return rest;
+  }
+
+  // Takes held words out of the editor, where hold put them (see `withoutHeldWords`).
   function removeWords(ctx: any, words: string[]) {
     if (!editorIsReal(ctx)) return;
     try {
       const before = ctx?.ui?.getEditorText?.();
       if (typeof before !== "string") return;
-      let text = before;
-      for (const word of words) {
-        const at = word ? text.indexOf(word) : -1;
-        if (at >= 0) text = (text.slice(0, at) + text.slice(at + word.length)).replace(/^\n/, "");
-      }
+      const text = withoutHeldWords(before, words);
       if (text !== before) ctx.ui.setEditorText?.(text);
     } catch {}
   }
@@ -3048,13 +3056,10 @@ export default function (pi) {
     const rebuild = typeof current === "string" && !EDITOR_CHIP.test(current);
     let remaining = "";
     if (rebuild) {
-      remaining = current;
-      for (const prompt of prompts) {
-        const words = wordsOf(prompt.text);
-        const at = words ? remaining.indexOf(words) : -1;
-        if (at >= 0) remaining = remaining.slice(0, at) + remaining.slice(at + words.length);
-      }
-      remaining = remaining.replace(/^\n/, "");
+      remaining = withoutHeldWords(
+        current,
+        prompts.map((prompt) => wordsOf(prompt.text)),
+      );
       ui.setEditorText?.("");
     }
     let wrote = false;

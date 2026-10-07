@@ -320,20 +320,41 @@ pub fn newest_session_beside(session_path: &str) -> Option<std::path::PathBuf> {
         .map(|(_, path)| path)
 }
 
+/// Whether two paths name the same session file: the same path or, for absolute paths, the same
+/// file by device and inode. That also covers a symlink, a `..` segment and a hard link, which
+/// are other names a second OMP could open to write the one file. Windows has no stable inode
+/// to read: there only paths that resolve to one canonical path match.
+pub fn same_session_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if !a.is_absolute() || !b.is_absolute() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!(
+            (std::fs::metadata(a), std::fs::metadata(b)),
+            (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
+}
+
 /// Whether `omp --resume <value>`, run in `cwd`, can open the session file `session_path`: the
-/// same file for a path value (one with a separator or ending in `.jsonl`); otherwise OMP's
-/// prefix rule, case-insensitive, on the file's name and on the session id at its end.
+/// same file (see `same_session_file`) for a path value (one with a separator or ending in
+/// `.jsonl`); otherwise OMP's prefix rule, case-insensitive, on the file's name and on the
+/// session id at its end.
 pub fn omp_resume_value_matches(value: &str, cwd: &Path, session_path: &str) -> bool {
     if value.contains('/') || value.contains('\\') || value.ends_with(".jsonl") {
-        let joined = cwd.join(value);
-        let same = |a: &Path, b: &Path| {
-            a == b
-                || matches!(
-                    (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-                    (Ok(a), Ok(b)) if a == b
-                )
-        };
-        return same(&joined, Path::new(session_path));
+        return same_session_file(&cwd.join(value), Path::new(session_path));
     }
     let prefix = value.to_lowercase();
     let Some(stem) = Path::new(session_path)
@@ -1331,5 +1352,55 @@ mod tests {
             newest_session_beside("/nonexistent-dir-for-herdr/x.jsonl"),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_session_file_is_found_under_every_name_a_second_omp_could_open_it_by() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-same-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let live = dir.join("2026-01-01T00-00-00-000Z_aaaa.jsonl");
+        let other = dir.join("2026-01-02T00-00-00-000Z_bbbb.jsonl");
+        std::fs::write(&live, "{}\n").unwrap();
+        std::fs::write(&other, "{}\n").unwrap();
+        let hard = dir.join("alias.jsonl");
+        std::fs::hard_link(&live, &hard).unwrap();
+        let soft = dir.join("soft.jsonl");
+        std::os::unix::fs::symlink(&live, &soft).unwrap();
+        let dotted = dir
+            .join("sub")
+            .join("..")
+            .join("2026-01-01T00-00-00-000Z_aaaa.jsonl");
+        for name in [&live, &hard, &soft, &dotted] {
+            assert!(same_session_file(name, &live), "{name:?}");
+            assert!(same_session_file(&live, name), "{name:?}");
+            assert!(
+                omp_resume_value_matches(name.to_str().unwrap(), &dir, live.to_str().unwrap()),
+                "{name:?}"
+            );
+        }
+        // A relative value is read from the pane's directory.
+        assert!(omp_resume_value_matches(
+            "alias.jsonl",
+            &dir,
+            live.to_str().unwrap()
+        ));
+        // Another file, a file that is gone and a relative path are not the same file.
+        assert!(!same_session_file(&other, &live));
+        assert!(!same_session_file(&dir.join("gone.jsonl"), &live));
+        assert!(!same_session_file(Path::new("alias.jsonl"), &live));
+        assert!(!omp_resume_value_matches(
+            other.to_str().unwrap(),
+            &dir,
+            live.to_str().unwrap()
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

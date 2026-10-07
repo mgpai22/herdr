@@ -290,7 +290,11 @@ impl App {
                     {
                         if let Some((holder, session)) = live.iter().find_map(|other| {
                             let session = other.agent_session.as_ref()?;
-                            (Path::new(&session.value) == newest).then_some((other, session))
+                            crate::agent_resume::same_session_file(
+                                Path::new(&session.value),
+                                &newest,
+                            )
+                            .then_some((other, session))
                         }) {
                             return Err(AgentStartError::SessionInUse {
                                 arg: "--continue".into(),

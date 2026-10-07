@@ -592,10 +592,18 @@ impl App {
             })
             .flatten();
         if let Some(path) = switch_target {
+            // The same file under another name (a hard link, a symlink, a `..` segment) is as taken
+            // as the path itself: a second OMP on it would write the one file.
+            let same_file = |other: &str| {
+                crate::agent_resume::same_session_file(
+                    std::path::Path::new(other),
+                    std::path::Path::new(path),
+                )
+            };
             if self
                 .pending_action_acks
                 .values()
-                .any(|pending| pending.switch_target.as_deref() == Some(path))
+                .any(|pending| pending.switch_target.as_deref().is_some_and(&same_file))
             {
                 return Err(encode_error(
                     id,
@@ -609,7 +617,7 @@ impl App {
                     && other
                         .agent_session
                         .as_ref()
-                        .is_some_and(|session| session.value == path)
+                        .is_some_and(|session| same_file(&session.value))
             });
             if let Some(other) = runs_it {
                 return Err(encode_error(
@@ -3643,6 +3651,198 @@ mod tests {
         // Without the flag nothing changes.
         let plain = start(&mut app, &["--model", "m"]);
         assert_eq!(plain["error"]["code"], "agent_pane_unavailable", "{plain}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A temporary directory with a session file and a hard link to it.
+    #[cfg(target_os = "linux")]
+    fn session_file_with_hard_link(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-{tag}-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("2026-01-01T00-00-00-000Z_0a1b2c3d-4e5f-6789-abcd-ef0123456789.jsonl");
+        std::fs::write(&live, "{}\n").unwrap();
+        let hard = dir.join("zz-alias.jsonl");
+        std::fs::hard_link(&live, &hard).unwrap();
+        (dir, live, hard)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn switch_session_is_refused_for_another_name_of_a_file_another_pane_runs_or_claims() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let (dir, live, hard) = session_file_with_hard_link("switch");
+        let soft = dir.join("soft.jsonl");
+        std::os::unix::fs::symlink(&live, &soft).unwrap();
+        let dotted = dir.join("sub").join("..").join(live.file_name().unwrap());
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].tabs[0].panes[&other_pane]
+            .attached_terminal_id
+            .clone();
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let terminal = app.state.terminals.get_mut(&other_terminal).unwrap();
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+        assert!(terminal
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::agent_resume::AgentSessionRef::path(live.display().to_string()),
+                Some(1),
+                Some("startup".into()),
+                Some(("default".into(), owner)),
+            )
+            .is_some());
+        // Every name the live pane's file has is as taken as its own path.
+        for name in [&live, &hard, &soft, &dotted] {
+            let refused = start_action(
+                &mut app,
+                action_params(
+                    &instruct,
+                    AgentActionOp::SwitchSession,
+                    serde_json::json!({ "session_path": name.display().to_string() }),
+                ),
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+            let refused: crate::api::schema::ErrorResponse =
+                serde_json::from_str(&refused).unwrap();
+            assert!(
+                refused.error.message.starts_with("session_in_use: agent"),
+                "{name:?}: {}",
+                refused.error.message
+            );
+        }
+        assert!(rx.try_recv().is_err(), "nothing was written");
+        // A file no pane runs is sent on; while its switch waits for a result, another name of it
+        // is claimed too.
+        let free = dir.join("free.jsonl");
+        std::fs::write(&free, "{}\n").unwrap();
+        let free_alias = dir.join("free-alias.jsonl");
+        std::fs::hard_link(&free, &free_alias).unwrap();
+        start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": free.display().to_string() }),
+            ),
+        );
+        assert_eq!(sent_action(&mut rx).1["op"], "switch_session");
+        for pending in app.pending_action_acks.values_mut() {
+            pending.terminal_id = other_terminal.clone();
+        }
+        let claimed = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": free_alias.display().to_string() }),
+            ),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+        let claimed: crate::api::schema::ErrorResponse = serde_json::from_str(&claimed).unwrap();
+        assert!(
+            claimed
+                .error
+                .message
+                .starts_with("session_in_use: another pane is switching"),
+            "{}",
+            claimed.error.message
+        );
+        assert!(rx.try_recv().is_err(), "nothing was written");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_start_refuses_to_resume_or_continue_another_name_of_a_file_a_live_omp_pane_runs()
+    {
+        let (mut app, _instruct, _rx) = guarded_fixture(AgentState::Idle);
+        let (dir, live, hard) = session_file_with_hard_link("start");
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let terminal_id = fixture_terminal_id(&app);
+        assert!(app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::agent_resume::AgentSessionRef::path(live.display().to_string()),
+                Some(2),
+                Some("startup".into()),
+                Some(("default".into(), owner)),
+            )
+            .is_some());
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let target_terminal = app.state.workspaces[1]
+            .terminal_id(target_pane)
+            .cloned()
+            .unwrap();
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, args: &[&str]| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: args.iter().map(|arg| arg.to_string()).collect(),
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        // Another name for the live pane's file opens that file: refused, as its own path is.
+        let hard_path = hard.display().to_string();
+        for args in [
+            vec!["--resume", hard_path.as_str()],
+            vec!["--session", hard_path.as_str()],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{args:?}: {response}"
+            );
+        }
+        // `--continue` opens the newest file of the live pane's directory, and that is the other
+        // name (the same modification time, the later name).
+        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
+        let response = start(&mut app, &["--continue"]);
+        assert_eq!(
+            response["error"]["code"], "agent_session_in_use",
+            "{response}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

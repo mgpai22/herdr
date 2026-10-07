@@ -3945,6 +3945,39 @@ test("Oh My Pi sends two held image prompts as one message, in the order they we
   await waitFor(() => !existsSync(join(artifacts(), "herdr-held-prompt.json")));
 });
 
+test("Oh My Pi takes only the words it put at the start of the editor out when it sends a held prompt, and leaves the person's own text", async () => {
+  const image = { type: "image", data: "b25l", mimeType: "image/png" };
+  // The editor when the prompt is sent (herdr put `alpha` in it), and what is left after. The
+  // person's own text stays, also where it holds the same word; words the person typed in front of
+  // or replaced are theirs now.
+  const editors: [string, string][] = [
+    ["alpha", ""],
+    ["alpha then alpha again", " then alpha again"],
+    ["alpha\nalpha beta", "alpha beta"],
+    ["I said alpha twice", "I said alpha twice"],
+    ["note: alpha", "note: alpha"],
+    ["\nalpha", "\nalpha"],
+  ];
+  for (const [index, [typed, left]] of editors.entries()) {
+    const run = await installOmpForSessions(`omp-session-words-span-${index}`);
+    const submit = (text: string, images: unknown[]) =>
+      run.omp.harness.handlers.get("input")?.({ type: "input", text, images, source: "interactive" }, run.omp.harness.context);
+    run.state.summary = Promise.withResolvers<boolean>();
+    const id = String(index + 1).repeat(32);
+    run.omp.listener(actionBlock(id, { op: "tree", args: { entry_id: "u1", summarize: true } }));
+    await waitFor(() => run.calls.filter((call) => (call as unknown[])[0] === "navigateTree").length === 1);
+    expect(await submit("alpha [Image #1, 1x1]", [image])).toEqual({ handled: true });
+    expect(run.omp.editor()).toBe("alpha");
+    run.omp.setEditor(typed);
+    run.state.summary.resolve(true);
+    await run.omp.finalAck(id);
+    await waitFor(() => run.omp.harness.sent.length === 1);
+    expect(run.omp.editor()).toBe(left);
+    await run.take();
+    await waitFor(() => !existsSync(join(run.artifacts(), "herdr-held-prompt.json")));
+  }
+});
+
 test("Oh My Pi keeps a held image prompt when OMP exits during the change, and puts it back after a restart without sending", async () => {
   process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
   const sources = join(tmpdir(), `herdr-held-source-${process.pid}`);
@@ -4160,15 +4193,24 @@ test("Oh My Pi keeps a second copy of a held prompt in the registered session un
   }
 });
 
-test("Oh My Pi offers nothing and takes the words out of the restored draft when either session already has the held prompt", async () => {
+test("Oh My Pi offers nothing and takes only the words it put at the start of the restored draft out of it when either session already has the held prompt", async () => {
   process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
   const image = { type: "image", data: "aGk=", mimeType: "image/png" };
-  for (const resumed of ["omp-instruct", "omp-new"]) {
+  // The editor OMP restored from its draft, and what is left of it. The person's own text stays,
+  // also where it holds the same words; text with the words only inside it was never herdr's.
+  const drafts: [string, string, string][] = [
+    ["omp-instruct", "look WRITTEN", ""],
+    ["omp-new", "look WRITTEN\nmy own text", "my own text"],
+    ["omp-new", "look WRITTEN\nI wrote look WRITTEN in my notes", "I wrote look WRITTEN in my notes"],
+    ["omp-instruct", "I wrote look WRITTEN in my notes", "I wrote look WRITTEN in my notes"],
+    ["omp-new", "\nlook WRITTEN", "\nlook WRITTEN"],
+  ];
+  for (const [index, [resumed, draft, left]] of drafts.entries()) {
     const release = Promise.withResolvers<void>();
     recordingDelay = (request) =>
       request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl" ? release.promise : undefined;
     try {
-      const run = await installOmpForSessions(`omp-session-twin-written-${resumed}`);
+      const run = await installOmpForSessions(`omp-session-twin-written-${index}`);
       const started = run.omp.harness.reports().length;
       await run.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, run.omp.harness.context);
       await waitFor(() => run.omp.harness.reports().length > started);
@@ -4197,14 +4239,12 @@ test("Oh My Pi offers nothing and takes the words out of the restored draft when
         artifactRoots.push(join(file, ".."));
         await writeFile(file, `${JSON.stringify({ type: "session", id: "omp-instruct", cwd: "/proj" })}\n`);
       }
-      const restarted = await installOmpForSessions(`omp-session-twin-written-restart-${resumed}`, { artifactsRoot: run.artifactsRoot });
+      const restarted = await installOmpForSessions(`omp-session-twin-written-restart-${index}`, { artifactsRoot: run.artifactsRoot });
       restarted.state.file = file;
       const pastes: string[] = [];
       const notices: string[] = [];
       emulatePaste(restarted.omp, pastes, notices);
-      // The person's own text in the draft stays.
-      const own = resumed === "omp-new" ? "my own text" : "";
-      restarted.omp.setEditor(own ? `look WRITTEN\n${own}` : "look WRITTEN");
+      restarted.omp.setEditor(draft);
       await restarted.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, restarted.omp.harness.context);
       await waitFor(() => !existsSync(before));
       // The integration restores on the real clock (the 20 ms poll set above), so a negative check
@@ -4214,7 +4254,7 @@ test("Oh My Pi offers nothing and takes the words out of the restored draft when
       // (the message is in the transcript), and neither copy is left.
       expect(pastes).toEqual([]);
       expect(notices).toEqual([]);
-      expect(restarted.omp.editor()).toBe(own);
+      expect(restarted.omp.editor()).toBe(left);
       expect(existsSync(before)).toBe(false);
       expect(existsSync(after)).toBe(false);
       release.resolve();
