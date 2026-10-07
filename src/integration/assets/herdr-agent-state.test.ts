@@ -122,6 +122,8 @@ function captureConnectionEndpoint() {
 
 // A test may answer some requests itself (an error, say); every other request is answered ok.
 let recordingReply: ((request: any) => unknown) | undefined;
+// Holds the answer to a request until the returned promise settles.
+let recordingDelay: ((request: any) => Promise<void> | undefined) | undefined;
 
 async function startRecordingServer(name: string): Promise<unknown[]> {
   const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
@@ -140,7 +142,10 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
       }
       const request = JSON.parse(input.slice(0, newline));
       requests.push(request);
-      socket.end(JSON.stringify(recordingReply?.(request) ?? { id: request.id, result: { type: "ok" } }) + "\n");
+      const answer = JSON.stringify(recordingReply?.(request) ?? { id: request.id, result: { type: "ok" } }) + "\n";
+      const held = recordingDelay?.(request);
+      if (held) void held.then(() => socket.end(answer));
+      else socket.end(answer);
     });
   });
   server = recordingServer;
@@ -3435,6 +3440,7 @@ async function installOmpForSessions(
     state.leaf = entry.id;
   };
   const appended: unknown[] = [];
+  const ensured: [string, number][] = [];
   const labels: unknown[] = [];
   const calls: unknown[] = [];
   const manager = {
@@ -3446,6 +3452,10 @@ async function installOmpForSessions(
     getArtifactsDir: () => join(artifactsRoot, basename(state.file, ".jsonl")),
     getEntries: () => [...entries.values()],
     flush: async () => {},
+    // The session file is written; remembers how many requests herdr had by then.
+    ensureOnDisk: async () => {
+      ensured.push([state.file, (omp?.harness.requests as unknown[] | undefined)?.length ?? 0]);
+    },
     appendLabelChange: (target: string, label: string | undefined) => {
       labels.push([target, label]);
       append({ id: `label${labels.length}`, type: "label", targetId: target, label });
@@ -3542,7 +3552,7 @@ async function installOmpForSessions(
     await emit("message_start", { message: { role: "user", content } });
     return content;
   };
-  return { omp, state, calls, appended, labels, artifactsRoot, take, entries, artifacts: () => manager.getArtifactsDir() };
+  return { omp, state, calls, appended, labels, artifactsRoot, take, entries, ensured, artifacts: () => manager.getArtifactsDir() };
 }
 
 test("Oh My Pi moves the tree leaf through the command context and keeps the move on disk", async () => {
@@ -4084,6 +4094,68 @@ test("Oh My Pi keeps a sent held prompt until OMP has it, and after an OMP kill 
     }
     expect(restarted.omp.harness.sent).toEqual([]);
     await rm(run.artifactsRoot, { recursive: true, force: true });
+  }
+});
+
+test("Oh My Pi keeps a second copy of a held prompt in the registered session until herdr accepts the new one, and a restart into either session offers it once", async () => {
+  process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
+  const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+  for (const resumed of ["omp-instruct", "omp-new"]) {
+    const release = Promise.withResolvers<void>();
+    recordingDelay = (request) =>
+      request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl" ? release.promise : undefined;
+    try {
+      const run = await installOmpForSessions(`omp-session-twin-${resumed}`);
+      // herdr has registered the session OMP runs now (the start the harness ran had no session
+      // manager yet, so the session starts once more).
+      const started = run.omp.harness.reports().length;
+      await run.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, run.omp.harness.context);
+      await waitFor(() => run.omp.harness.reports().length > started);
+      await Bun.sleep(50);
+      run.state.duringChange = () =>
+        run.omp.harness.handlers.get("input")?.({ type: "input", text: "look TWIN [Image #1, 1x1]", images: [image], source: "interactive" }, run.omp.harness.context);
+      const id = "7".repeat(32);
+      run.omp.listener(actionBlock(id, { op: "new_session", args: {} }));
+      const before = join(run.artifactsRoot, "omp-instruct", "herdr-held-prompt.json");
+      const after = join(run.artifactsRoot, "omp-new", "herdr-held-prompt.json");
+      // OMP swapped to the new session; herdr has not accepted its report. Both copies are there,
+      // each naming the other, so a kill now loses the prompt in neither session.
+      await waitFor(() => existsSync(after));
+      await Bun.sleep(100);
+      const copies = [JSON.parse(await readFile(before, "utf8")), JSON.parse(await readFile(after, "utf8"))];
+      expect(copies.map((copy) => copy.prompts.map((prompt: { text: string }) => prompt.text))).toEqual([["look TWIN [Image #1, 1x1]"], ["look TWIN [Image #1, 1x1]"]]);
+      expect(copies[0].id).toBe(copies[1].id);
+      expect(copies[0].twin.file).toBe(after);
+      expect(copies[1].twin.file).toBe(before);
+      // herdr is told of the new session only once its file is written, and after both copies are.
+      expect(run.ensured.map(([file]) => file)).toContain("/tmp/omp-new.jsonl");
+      const requests = run.omp.harness.requests as { method?: string; params?: Record<string, unknown> }[];
+      const newReport = requests.findIndex((request) => request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl");
+      expect(newReport).toBeGreaterThanOrEqual(run.ensured.find(([file]) => file === "/tmp/omp-new.jsonl")![1]);
+
+      // OMP is killed here; herdr restarts the session it knows (the old one) or the new one.
+      const file = join(tmpdir(), `herdr-held-twin-${process.pid}`, `${resumed}.jsonl`);
+      await mkdir(join(file, ".."), { recursive: true });
+      artifactRoots.push(join(file, ".."));
+      await writeFile(file, `${JSON.stringify({ type: "session", id: resumed, cwd: "/proj" })}\n`);
+      const restarted = await installOmpForSessions(`omp-session-twin-restart-${resumed}`, { artifactsRoot: run.artifactsRoot });
+      restarted.state.file = file;
+      const pastes: string[] = [];
+      const notices: string[] = [];
+      emulatePaste(restarted.omp, pastes, notices);
+      restarted.omp.setEditor("");
+      await restarted.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, restarted.omp.harness.context);
+      await waitFor(() => notices.length === 1);
+      // Offered once: the other copy is gone, so the other session does not offer it again.
+      expect(pastes.join("")).toContain("look TWIN");
+      expect(existsSync(before)).toBe(false);
+      expect(existsSync(after)).toBe(false);
+      release.resolve();
+      await run.omp.finalAck(id);
+    } finally {
+      release.resolve();
+      recordingDelay = undefined;
+    }
   }
 });
 

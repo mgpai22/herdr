@@ -2515,7 +2515,12 @@ export default function (pi) {
   // Files herdr wrote for held images that have no file of their own (a pasted clipboard image).
   const heldImageFiles = new WeakMap<object, string>();
   // The spool this process wrote, and the prompts that were already in that very file.
-  let heldSpool: { file: string; inherited: SpoolPrompt[] } | undefined;
+  let heldSpool: { file: string; inherited: SpoolPrompt[]; id?: string } | undefined;
+  // While herdr has not accepted the report of the session OMP changed to: the second copy of the
+  // spool, in the directory of the session herdr has registered (the one a restart resumes).
+  let heldTwin: { file: string; inherited: SpoolPrompt[] } | undefined;
+  // The artifact directory of the session herdr last accepted a report for.
+  let registeredArtifacts: string | undefined;
   let spoolQueue: Promise<void> = Promise.resolve();
   let spoolWarned = false;
   let spoolWrites = 0;
@@ -2632,9 +2637,29 @@ export default function (pi) {
     }
   }
 
+  type SpoolPrompts = { prompts: SpoolPrompt[] };
+  // `id` names a spool written as two copies (see `writeSpool`); `twin` is the other copy, and
+  // `keep` the prompts that stay in it when this copy is restored.
+  type SpoolTwin = { file: string; keep: SpoolPrompt[] };
+  type SpoolMeta = { id: string; twin?: SpoolTwin };
+  type SpoolItem = SpoolPrompts & { file: string; id?: string; twin?: SpoolTwin };
   type SpoolRead =
     | { state: "none" | "unreadable" | "corrupt" }
-    | { state: "ok"; prompts: SpoolPrompt[]; pid: number | undefined; savedAt: number };
+    | { state: "ok"; prompts: SpoolPrompt[]; pid: number | undefined; savedAt: number; id?: string; twin?: SpoolTwin };
+
+  // The prompts of a spool's `prompts` array, or undefined when one of them is not valid.
+  function parseSpoolPrompts(list: unknown, fallback: number): SpoolPrompt[] | undefined {
+    if (!Array.isArray(list)) return undefined;
+    const sane = (time: unknown): number => (typeof time === "number" && time > 1e12 && time <= Date.now() + 60_000 ? time : fallback);
+    const prompts: SpoolPrompt[] = [];
+    for (const prompt of list) {
+      const record = recordOf(prompt);
+      if (typeof record.text !== "string" || !Array.isArray(record.images)) return undefined;
+      if (record.images.some((image: unknown) => typeof image !== "string")) return undefined;
+      prompts.push({ text: record.text, images: record.images as string[], savedAt: sane(record.savedAt) });
+    }
+    return prompts;
+  }
 
   // What a spool file holds. A file that is not a spool this code can read in full is `corrupt`, so
   // nothing in it is dropped without a word; one that cannot be read at all is `unreadable`.
@@ -2658,17 +2683,27 @@ export default function (pi) {
     const sane = (time: unknown, fallback: number): number =>
       typeof time === "number" && time > 1e12 && time <= Date.now() + 60_000 ? time : fallback;
     const savedAt = sane(spool.savedAt, mtime);
-    const prompts: SpoolPrompt[] = [];
-    for (const prompt of spool.prompts) {
-      if (typeof prompt?.text !== "string" || !Array.isArray(prompt.images)) return { state: "corrupt" };
-      if (prompt.images.some((image: unknown) => typeof image !== "string")) return { state: "corrupt" };
-      prompts.push({ text: prompt.text, images: prompt.images, savedAt: sane(prompt.savedAt, savedAt) });
-    }
-    return { state: "ok", prompts, pid: typeof spool.pid === "number" ? spool.pid : undefined, savedAt };
+    const prompts = parseSpoolPrompts(spool.prompts, savedAt);
+    if (!prompts) return { state: "corrupt" };
+    // The twin is a hint for the restore: one that is not valid is left out.
+    const twinRecord = recordOf(spool.twin);
+    const keep = parseSpoolPrompts(twinRecord.keep, savedAt);
+    const twin =
+      typeof spool.id === "string" && typeof twinRecord.file === "string" && path.isAbsolute(twinRecord.file) && keep
+        ? { file: twinRecord.file, keep }
+        : undefined;
+    return {
+      state: "ok",
+      prompts,
+      pid: typeof spool.pid === "number" ? spool.pid : undefined,
+      savedAt,
+      id: typeof spool.id === "string" ? spool.id : undefined,
+      twin,
+    };
   }
 
-  async function writeSpoolFile(file: string, prompts: SpoolPrompt[]): Promise<void> {
-    await writeAtomic(file, JSON.stringify({ v: 2, pid: process.pid, savedAt: Date.now(), prompts }));
+  async function writeSpoolFile(file: string, prompts: SpoolPrompt[], meta?: SpoolMeta): Promise<void> {
+    await writeAtomic(file, JSON.stringify({ v: 2, pid: process.pid, savedAt: Date.now(), ...meta, prompts }));
   }
 
   function warnOnce(ctx: any, text: string) {
@@ -2702,8 +2737,12 @@ export default function (pi) {
 
   // Writes every held prompt to one spool file in the session's artifact directory (mode 0600, the
   // images by path). Writes run one at a time and replace the file whole. A spool already there
-  // (not this process's) keeps its prompts, in front. When the session changed, the spool of the
-  // session left is rewritten with only the prompts that were already in it, or removed.
+  // (not this process's) keeps its prompts, in front. While herdr has not yet accepted the report
+  // of the session OMP changed to, a second copy stays in the directory of the session herdr has
+  // registered (the one a restart resumes), and each names the other (`twin`) so that whichever
+  // is restored removes the other. The copy stays until the prompt is in the new session (`dropSpool`),
+  // when the spool of the session left is rewritten with only the prompts that were already in it,
+  // or removed.
   function writeSpool(ctx: any): Promise<void> {
     spoolQueue = spoolQueue.then(async () => {
       const dir = artifactsDir(ctx);
@@ -2735,9 +2774,32 @@ export default function (pi) {
           }
           prompts.push({ text, images: held, savedAt });
         }
-        await writeSpoolFile(file, [...inherited, ...prompts]);
-        heldSpool = { file, inherited };
-        if (previous && previous.file !== file) await leaveSpoolBehind(previous);
+        // The second copy, in the session herdr has registered while it is not this one.
+        const twinDir = registeredArtifacts !== undefined && registeredArtifacts !== dir ? registeredArtifacts : undefined;
+        let twin = heldTwin;
+        if (!twin && previous && previous.file !== file && twinDir !== undefined && path.dirname(previous.file) === twinDir) {
+          twin = { file: previous.file, inherited: previous.inherited };
+        }
+        if (!twin && twinDir !== undefined) {
+          try {
+            await mkdir(twinDir, { recursive: true, mode: 0o700 });
+            let twinFile = path.join(twinDir, SPOOL_NAME);
+            const found = await readSpool(twinFile);
+            if (found.state === "ok" && ownedByOtherLiveProcess(found)) twinFile = path.join(twinDir, `herdr-held-prompt.${process.pid}.json`);
+            // A file that cannot be read stays as it is: this copy is only a second chance.
+            if (found.state === "none" || found.state === "ok") {
+              twin = { file: twinFile, inherited: found.state === "ok" && twinFile === path.join(twinDir, SPOOL_NAME) ? found.prompts : [] };
+            }
+          } catch {}
+        }
+        const id = previous?.id ?? crypto.randomUUID();
+        // The copy in the registered session first: an OMP killed between the two writes is
+        // resumed in that session, and there the prompt is.
+        if (twin) await writeSpoolFile(twin.file, [...twin.inherited, ...prompts], { id, twin: { file, keep: inherited } }).catch(() => {});
+        await writeSpoolFile(file, [...inherited, ...prompts], { id, twin: twin ? { file: twin.file, keep: twin.inherited } : undefined });
+        heldSpool = { file, inherited, id };
+        heldTwin = twin;
+        if (previous && previous.file !== file && previous.file !== twin?.file) await leaveSpoolBehind(previous);
       } catch {
         warnOnce(ctx, "herdr could not save your prompt's images; if OMP exits before the session change ends, they are lost");
       }
@@ -2760,13 +2822,16 @@ export default function (pi) {
   function dropSpool(ctx: any, prompts: HeldPrompt[]): Promise<void> {
     spoolQueue = spoolQueue.then(async () => {
       const spool = heldSpool;
+      const twin = heldTwin;
       heldSpool = undefined;
+      heldTwin = undefined;
       for (const { images } of prompts) {
         for (const image of images) {
           const copy = heldImageFiles.get(image);
           if (copy) await unlink(copy).catch(() => {});
         }
       }
+      if (twin) await leaveSpoolBehind(twin);
       if (!spool) return;
       await leaveSpoolBehind(spool);
       if (spool.inherited.length > 0 && path.dirname(spool.file) === artifactsDir(ctx)) {
@@ -2774,6 +2839,13 @@ export default function (pi) {
       }
     });
     return spoolQueue;
+  }
+
+  // herdr accepted the report of the session OMP runs now. The spool copy kept in the session OMP
+  // left stays until the prompt is in the new session's file (`dropSpool`): herdr's own saved state
+  // may still name the old session when OMP dies right after the report.
+  function sessionRegistered(ctx: any) {
+    registeredArtifacts = artifactsDir(ctx);
   }
 
   // Takes held words out of the editor where hold put them, once, wherever they still are.
@@ -3021,8 +3093,8 @@ export default function (pi) {
     ctx: any,
     file: string,
     own: boolean,
-  ): Promise<{ item?: { file: string; prompts: SpoolPrompt[] }; wait?: number }> {
-    if (!own && heldSpool?.file === file) return {};
+  ): Promise<{ item?: SpoolItem; wait?: number }> {
+    if (!own && (heldSpool?.file === file || heldTwin?.file === file)) return {};
     const found = await readSpool(file);
     if (found.state === "none" || found.state === "unreadable") return {};
     if (found.state === "corrupt") {
@@ -3030,7 +3102,7 @@ export default function (pi) {
       return {};
     }
     if (!own && ownedByOtherLiveProcess(found)) return { wait: spoolPollMs };
-    return { item: { file, prompts: found.prompts } };
+    return { item: { file, prompts: found.prompts, id: found.id, twin: found.twin } };
   }
 
   // Puts the prompts of the spool files beside the session (or just `only`, this process's own)
@@ -3047,7 +3119,7 @@ export default function (pi) {
     await removeDeadTemporaries(dir);
     const names = only !== undefined ? [path.basename(only)] : (await readdir(dir).catch(() => [] as string[])).filter((name) => SPOOL_FILE.test(name));
     let again: number | undefined;
-    const items: { file: string; prompts: SpoolPrompt[] }[] = [];
+    const items: SpoolItem[] = [];
     for (const name of names) {
       const { item, wait } = await readForRestore(ctx, path.join(dir, name), only !== undefined);
       if (item) items.push(item);
@@ -3079,7 +3151,19 @@ export default function (pi) {
     // The saved copies go before the notice, so the notice never shows while they are still there.
     for (const { file } of items) {
       if (heldSpool?.file === file) heldSpool = undefined;
+      if (heldTwin?.file === file) heldTwin = undefined;
       await unlink(file).catch(() => {});
+    }
+    // The other copy of a spool written while a session change was not yet registered goes too
+    // (or keeps only the prompts that were in its file before), so the prompt is offered once.
+    for (const { id, twin } of items) {
+      if (!twin || id === undefined) continue;
+      const other = await readSpool(twin.file);
+      if (other.state !== "ok" || other.id !== id) continue;
+      if (heldSpool?.file === twin.file) heldSpool = undefined;
+      if (heldTwin?.file === twin.file) heldTwin = undefined;
+      if (twin.keep.length > 0) await writeSpoolFile(twin.file, twin.keep).catch(() => {});
+      else await unlink(twin.file).catch(() => {});
     }
     if (worth) {
       const { lost, slow } = result;
@@ -3278,6 +3362,7 @@ export default function (pi) {
       moveWatch.unref?.();
     }
     onRegistered = (lost) => {
+      sessionRegistered(detailCtx ?? ctx);
       if (lost) publishState(true);
       if (instructionListener) scheduleDetail(undefined, true);
     };
@@ -3335,7 +3420,20 @@ export default function (pi) {
     if ((heldReplays.length > 0 || pendingTakes.length > 0) && heldSpool && path.dirname(heldSpool.file) !== artifactsDir(ctx)) void writeSpool(ctx);
     scheduleSpoolRestore(ctx);
     updateSessionRef(ctx);
-    void reportSession(sessionStartSource);
+    if (sessionHold || heldReplays.length > 0 || pendingTakes.length > 0) {
+      // A restart resumes the session herdr has registered. During a change herdr runs, the new
+      // session is registered only once its file exists (a session OMP never wrote restarts as a
+      // different one, away from a held prompt's spool) and the spool copies are written.
+      void (async () => {
+        await spoolQueue;
+        try {
+          await ctx?.sessionManager?.ensureOnDisk?.();
+        } catch {}
+        await reportSession(sessionStartSource);
+      })();
+    } else {
+      void reportSession(sessionStartSource);
+    }
     return true;
   }
 
