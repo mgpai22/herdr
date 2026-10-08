@@ -5,9 +5,10 @@
 // HERDR_INTEGRATION_VERSION=16
 // @ts-nocheck
 
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
-import { access, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import net from "node:net";
 import path from "node:path";
@@ -199,6 +200,9 @@ const admissionPollMs = parseDurationEnv("HERDR_OMP_INSTRUCTION_POLL_MS", 250);
 // agent tag before the turn starts.
 const MODEL_MENTION = /(^|\s)\^[^\s^]+(?=\s|$)/g;
 let instructionListener = false;
+// Whether that listener may also run `agent.action` ops: only in OMP's terminal UI, where the editor
+// and the session commands they use are real. RPC and print mode have a stand-in UI.
+let actionListener = false;
 let unsubscribeInstructions: (() => void) | undefined;
 // Idle deliveries handed to OMP and acked as taken, acked again when OMP starts their turn or
 // goes idle without starting it.
@@ -755,7 +759,7 @@ function sessionReport(sessionStartSource: string, sessionRef: Record<string, un
       launch_profile: launchProfile,
       agent_pid: process.pid,
       accepts_instructions: instructionListener,
-      accepts_actions: instructionListener,
+      accepts_actions: instructionListener && actionListener,
       runtime_instance: runtimeInstance,
       block_token: blockTokens.current,
       ...sessionRef,
@@ -2268,6 +2272,24 @@ export default function (pi) {
       }
     };
     const summarizing = op === "tree" && args.summarize === true;
+    // The hold lasts until the held prompts are replayed (see `endHold`), not until the change
+    // itself ends: after the swap herdr still waits for the new session to register, for its own
+    // ack, and only then sends the held words. An Enter in that gap would otherwise submit them as
+    // a message of its own, and the replay would send the prompt again.
+    let hold: SessionHold | undefined;
+    const endHold = () => {
+      const ending = hold;
+      hold = undefined;
+      if (!ending) return;
+      // A change that started meanwhile owns the hold and its status now.
+      const owned = sessionHold === ending;
+      if (owned) sessionHold = undefined;
+      try {
+        if (owned) ctx?.ui?.setStatus?.(HOLD_STATUS_KEY, undefined);
+        if (ending.held) ctx?.ui?.notify?.("herdr kept your prompt in the editor during a session change; press Enter to send it", "info");
+        if (ending.retryIgnored) ctx?.ui?.notify?.("herdr ignored the retry key during a session change; press it again", "info");
+      } catch {}
+    };
     const run = async (): Promise<{ ok: boolean; error?: string; data?: Record<string, unknown> }> => {
       if (op === "switch_session") {
         const dir = isAbsoluteSessionPath(previous) ? path.dirname(previous) : undefined;
@@ -2284,7 +2306,8 @@ export default function (pi) {
         const late = sessionChangeBlocked(ctx, session);
         if (late) return { ok: false, error: late };
       }
-      const hold: SessionHold = { session, summarizing, held: false, retryIgnored: false, personSubmitted: false };
+      const current: SessionHold = { session, summarizing, held: false, retryIgnored: false, personSubmitted: false };
+      hold = current;
       // The terminal UI, so the key hold can see which component has focus.
       captureTui(ctx);
       if (!tuiRef && !focusNoticeShown) {
@@ -2298,7 +2321,7 @@ export default function (pi) {
           );
         } catch {}
       }
-      sessionHold = hold;
+      sessionHold = current;
       try {
         ctx?.ui?.setStatus?.(
           HOLD_STATUS_KEY,
@@ -2359,20 +2382,13 @@ export default function (pi) {
           ok: false,
           error: busy ? "busy: the agent is working; retry when it is idle" : `failed: ${cap(error?.message ?? error, 200)}`,
         };
-      } finally {
-        if (sessionHold === hold) sessionHold = undefined;
-        try {
-          ctx?.ui?.setStatus?.(HOLD_STATUS_KEY, undefined);
-          if (hold.held) ctx?.ui?.notify?.("herdr kept your prompt in the editor during a session change; press Enter to send it", "info");
-          if (hold.retryIgnored) ctx?.ui?.notify?.("herdr ignored the retry key during a session change; press it again", "info");
-        } catch {}
       }
       if (cancelled) {
         await restore();
-        if (hold.personSubmitted) {
+        if (current.personSubmitted) {
           return { ok: false, error: "busy: a prompt was submitted as the change started; the session did not change" };
         }
-        if (hold.signal?.aborted) return { ok: false, error: "cancelled: the person pressed Esc during the summary; the leaf did not move" };
+        if (current.signal?.aborted) return { ok: false, error: "cancelled: the person pressed Esc during the summary; the leaf did not move" };
         return { ok: false, error: "cancelled: another extension cancelled the change; the session did not change" };
       }
       await restore();
@@ -2381,10 +2397,26 @@ export default function (pi) {
       if (op !== "tree" && isAbsoluteSessionPath(previous)) data.previous_session_path = previous;
       return { ok: true, data };
     };
-    void run().then(async (result) => {
-      await finish(result);
-      replayHeld(ctx);
-    });
+    void (async () => {
+      let result: { ok: boolean; error?: string; data?: Record<string, unknown> };
+      try {
+        result = await run();
+      } catch (error: any) {
+        // Nothing may leave the hold set, or the caller without an answer.
+        result = { ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` };
+      }
+      try {
+        await finish(result);
+      } finally {
+        // The held prompts go out while the hold still stands, and the hold ends the moment they
+        // are sent: no Enter can fall between the change and the replay.
+        try {
+          replayHeld(ctx);
+        } finally {
+          endHold();
+        }
+      }
+    })();
     return rest;
   }
 
@@ -2646,31 +2678,110 @@ export default function (pi) {
   type SpoolMeta = { id: string; twin?: SpoolTwin };
   type SpoolItem = SpoolPrompts & { file: string; id?: string; twin?: SpoolTwin };
   type SpoolRead =
-    | { state: "none" | "unreadable" | "corrupt" }
+    | { state: "none" | "unreadable" | "corrupt" | "unverified" }
     | { state: "ok"; prompts: SpoolPrompt[]; pid: number | undefined; savedAt: number; id?: string; twin?: SpoolTwin };
 
-  // The prompts of a spool's `prompts` array, or undefined when one of them is not valid.
-  function parseSpoolPrompts(list: unknown, fallback: number): SpoolPrompt[] | undefined {
+  // What a spool may hold, at most. A person submits a held prompt in the few seconds of a session
+  // change (a branch summary can take a minute or two), so these are far above any real use; the
+  // writer refuses what the reader would refuse.
+  const SPOOL_MAX_PROMPTS = 50;
+  const SPOOL_MAX_IMAGES = 50;
+  const SPOOL_MAX_TEXT = 1_000_000;
+  const SPOOL_MAX_BYTES = 16 * 1024 * 1024;
+
+  function withinSpoolCaps(list: { text: string; images: unknown[] }[]): boolean {
+    return list.length <= SPOOL_MAX_PROMPTS && list.every((prompt) => prompt.text.length <= SPOOL_MAX_TEXT && prompt.images.length <= SPOOL_MAX_IMAGES);
+  }
+
+  // The key that signs spool files. A spool is read back as the person's prompt, with image files
+  // named in it put in the editor, so only a file this integration wrote may stand for one: a file
+  // planted beside a session (a session directory shared or synced from elsewhere, or anything else
+  // that writes there) has no signature made with this user's key. The key is 32 random bytes in a
+  // 0600 file made the first time a spool is written, in herdr's configuration directory
+  // (`HERDR_OMP_SPOOL_KEY_FILE` names another file).
+  let spoolKeyCache: Buffer | undefined;
+  async function spoolKey(create: boolean): Promise<Buffer | undefined> {
+    if (spoolKeyCache) return spoolKeyCache;
+    const file =
+      process.env.HERDR_OMP_SPOOL_KEY_FILE || path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "herdr", "omp-spool.key");
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        const text = (await readFile(file, "utf8")).trim();
+        if (/^[0-9a-f]{64}$/.test(text)) return (spoolKeyCache = Buffer.from(text, "hex"));
+        // Not a key, or one another process is still writing: look again.
+      } catch (error: any) {
+        if (error?.code !== "ENOENT" || !create) return undefined;
+        try {
+          await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+          await writeFile(file, `${randomBytes(32).toString("hex")}\n`, { flag: "wx", mode: 0o600 });
+        } catch (writeError: any) {
+          if (writeError?.code !== "EEXIST") return undefined;
+        }
+        continue;
+      }
+      await delay(20);
+    }
+    return undefined;
+  }
+
+  // What the signature covers: every field of a spool but the signature, in a fixed order.
+  function spoolSignedText(spool: any): string {
+    const prompt = (item: any) => [item.text, item.images, item.savedAt ?? null];
+    const twin = spool.twin ? [spool.twin.file, spool.twin.keep.map(prompt)] : null;
+    return JSON.stringify([spool.pid ?? null, spool.savedAt ?? null, spool.id ?? null, twin, spool.sources ?? [], spool.prompts.map(prompt)]);
+  }
+
+  function spoolSignature(key: Buffer, spool: any): string {
+    return createHmac("sha256", key).update(spoolSignedText(spool)).digest("hex");
+  }
+
+  // Whether `file` is inside `root`, by name.
+  function pathInside(root: string, file: string): boolean {
+    const relative = path.relative(root, path.resolve(file));
+    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  }
+
+  // An image of a spool, if it may be put in the editor: one of OMP's session files (the project's
+  // sessions directory is two levels above the spool: `<sessions>/<session>/<spool>`) or one of the
+  // person's own files, as recorded when the prompt was held (`sources`). Anything else is gone.
+  function spoolImage(file: string, sources: string[], image: string): string {
+    if (!path.isAbsolute(image) || image.length > 4096 || image.includes("\0")) return "";
+    return pathInside(path.dirname(path.dirname(file)), image) || sources.includes(image) ? image : "";
+  }
+
+  // The prompts of a spool's `prompts` array, or undefined when one of them is not valid or the
+  // list is over the caps. `image` says which images stay.
+  function parseSpoolPrompts(list: unknown, fallback: number, image: (image: string) => string): SpoolPrompt[] | undefined {
     if (!Array.isArray(list)) return undefined;
     const sane = (time: unknown): number => (typeof time === "number" && time > 1e12 && time <= Date.now() + 60_000 ? time : fallback);
     const prompts: SpoolPrompt[] = [];
     for (const prompt of list) {
       const record = recordOf(prompt);
       if (typeof record.text !== "string" || !Array.isArray(record.images)) return undefined;
-      if (record.images.some((image: unknown) => typeof image !== "string")) return undefined;
-      prompts.push({ text: record.text, images: record.images as string[], savedAt: sane(record.savedAt) });
+      if (record.images.some((value: unknown) => typeof value !== "string")) return undefined;
+      // An image that may not go back stays a blank place, so the prompt's other images keep
+      // their markers; it is counted among the images that are gone.
+      prompts.push({ text: record.text, images: (record.images as string[]).map(image), savedAt: sane(record.savedAt) });
     }
-    return prompts;
+    return withinSpoolCaps(prompts) ? prompts : undefined;
   }
 
-  // What a spool file holds. A file that is not a spool this code can read in full is `corrupt`, so
-  // nothing in it is dropped without a word; one that cannot be read at all is `unreadable`.
+  // What a spool file holds. A file that is not a spool this code wrote and can read in full is
+  // `corrupt` (a link, too big, not valid, over the caps) or `unverified` (no signature
+  // of this user's key), so nothing in it is dropped without a word and nothing planted is
+  // believed; one that cannot be read at all is `unreadable`.
   async function readSpool(file: string): Promise<SpoolRead> {
     let raw: string;
     let mtime: number;
     try {
+      // Looked at without following a link, and before it is read: a link, a FIFO or a huge file
+      // named like a spool must not make the restore follow it or wait on it. A link is set aside
+      // itself (its target stays as it is), a file of another kind is left alone.
+      const info = await lstat(file);
+      if (info.isSymbolicLink() || (info.isFile() && info.size > SPOOL_MAX_BYTES)) return { state: "corrupt" };
+      if (!info.isFile()) return { state: "unreadable" };
+      mtime = info.mtimeMs;
       raw = await readFile(file, "utf8");
-      mtime = (await stat(file)).mtimeMs;
     } catch (error: any) {
       return { state: error?.code === "ENOENT" ? "none" : "unreadable" };
     }
@@ -2681,15 +2792,25 @@ export default function (pi) {
       return { state: "corrupt" };
     }
     if (!Array.isArray(spool?.prompts)) return { state: "corrupt" };
-    // A save time that cannot be one (a planted file) is the file's modification time.
+    const key = await spoolKey(false);
+    let signed = false;
+    try {
+      const expected = key && typeof spool.sig === "string" ? Buffer.from(spoolSignature(key, spool), "hex") : undefined;
+      const given = Buffer.from(typeof spool.sig === "string" ? spool.sig : "", "hex");
+      signed = expected !== undefined && expected.length === given.length && timingSafeEqual(expected, given);
+    } catch {}
+    if (!signed) return { state: "unverified" };
+    // A save time that cannot be one is the file's modification time.
     const sane = (time: unknown, fallback: number): number =>
       typeof time === "number" && time > 1e12 && time <= Date.now() + 60_000 ? time : fallback;
     const savedAt = sane(spool.savedAt, mtime);
-    const prompts = parseSpoolPrompts(spool.prompts, savedAt);
+    const sources = Array.isArray(spool.sources) ? spool.sources.filter((source: unknown): source is string => typeof source === "string") : [];
+    const image = (value: string) => spoolImage(file, sources, value);
+    const prompts = parseSpoolPrompts(spool.prompts, savedAt, image);
     if (!prompts) return { state: "corrupt" };
     // The twin is a hint for the restore: one that is not valid is left out.
     const twinRecord = recordOf(spool.twin);
-    const keep = parseSpoolPrompts(twinRecord.keep, savedAt);
+    const keep = parseSpoolPrompts(twinRecord.keep, savedAt, image);
     const twin =
       typeof spool.id === "string" && typeof twinRecord.file === "string" && path.isAbsolute(twinRecord.file) && keep
         ? { file: twinRecord.file, keep }
@@ -2705,7 +2826,17 @@ export default function (pi) {
   }
 
   async function writeSpoolFile(file: string, prompts: SpoolPrompt[], meta?: SpoolMeta): Promise<void> {
-    await writeAtomic(file, JSON.stringify({ v: 2, pid: process.pid, savedAt: Date.now(), ...meta, prompts }));
+    const key = await spoolKey(true);
+    if (!key) throw new Error("no key to sign the spool with");
+    if (!withinSpoolCaps(prompts) || !withinSpoolCaps(meta?.twin?.keep ?? [])) throw new Error("too many held prompts, images or words");
+    // The person's own image files: the ones outside OMP's session directories.
+    const root = path.dirname(path.dirname(file));
+    const sources = [...new Set([...prompts, ...(meta?.twin?.keep ?? [])].flatMap((prompt) => prompt.images).filter((image) => image && !pathInside(root, image)))];
+    const spool: any = { v: 3, pid: process.pid, savedAt: Date.now(), ...meta, sources, prompts };
+    spool.sig = spoolSignature(key, spool);
+    const text = JSON.stringify(spool);
+    if (Buffer.byteLength(text) > SPOOL_MAX_BYTES) throw new Error("the spool is too big");
+    await writeAtomic(file, text);
   }
 
   function warnOnce(ctx: any, text: string) {
@@ -2716,17 +2847,22 @@ export default function (pi) {
     } catch {}
   }
 
-  // Sets a spool that cannot be read in full aside, where the person can find it. Returns whether
-  // it is out of the way.
-  async function setSpoolAside(ctx: any, file: string): Promise<boolean> {
-    const aside = path.join(path.dirname(file), `herdr-held-prompt.corrupt-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.json`);
+  // Sets a spool that cannot be read in full, or that this integration did not write, aside where
+  // the person can find it (it is not put in the editor). Returns whether it is out of the way.
+  async function setSpoolAside(ctx: any, file: string, reason: "corrupt" | "unverified" = "corrupt"): Promise<boolean> {
+    const aside = path.join(path.dirname(file), `herdr-held-prompt.${reason}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.json`);
     try {
       await rename(file, aside);
     } catch {
       return false;
     }
     try {
-      ctx?.ui?.notify?.(`herdr could not read a held prompt saved beside this session and set the file aside as ${aside}`, "warning");
+      ctx?.ui?.notify?.(
+        reason === "unverified"
+          ? `herdr found a held prompt beside this session that it did not write, did not put it in the editor, and set the file aside as ${aside}`
+          : `herdr could not read a held prompt saved beside this session and set the file aside as ${aside}`,
+        "warning",
+      );
     } catch {}
     return true;
   }
@@ -2758,7 +2894,7 @@ export default function (pi) {
         if (previous?.file !== file) {
           const found = await readSpool(file);
           // Never write over what cannot be read: set it aside, and stop when that fails.
-          if (found.state === "corrupt" && !(await setSpoolAside(ctx, file))) throw new Error("spool cannot be set aside");
+          if ((found.state === "corrupt" || found.state === "unverified") && !(await setSpoolAside(ctx, file, found.state))) throw new Error("spool cannot be set aside");
           else if (found.state === "unreadable") throw new Error("spool unreadable");
           else if (found.state === "ok" && ownedByOtherLiveProcess(found)) {
             // Another running OMP's spool is theirs: write ours beside it, taking none of its prompts.
@@ -3121,8 +3257,8 @@ export default function (pi) {
     if (!own && (heldSpool?.file === file || heldTwin?.file === file)) return {};
     const found = await readSpool(file);
     if (found.state === "none" || found.state === "unreadable") return {};
-    if (found.state === "corrupt") {
-      await setSpoolAside(ctx, file);
+    if (found.state === "corrupt" || found.state === "unverified") {
+      await setSpoolAside(ctx, file, found.state);
       return {};
     }
     if (!own && ownedByOtherLiveProcess(found)) return { wait: spoolPollMs };
@@ -3307,6 +3443,7 @@ export default function (pi) {
       return taken;
     });
     instructionListener = typeof unsubscribeInstructions === "function";
+    actionListener = instructionListener && editorIsReal(ctx);
   }
 
   // Removes herdr blocks for this runtime from the editor text; returns whether it found any.

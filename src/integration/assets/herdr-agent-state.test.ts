@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { afterEach, expect, mock, setSystemTime, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { access, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 
 const originalPlatform = process.platform;
 const originalArgv = process.argv;
@@ -22,6 +22,10 @@ const originalEnvironment = {
   OMP_PROFILE: process.env.OMP_PROFILE,
   PI_PROFILE: process.env.PI_PROFILE,
 };
+
+// The key the asset signs its spool files with: one file for these tests, made new for each of them.
+const spoolKeyFile = join(tmpdir(), `herdr-spool-key-${process.pid}`, "omp-spool.key");
+process.env.HERDR_OMP_SPOOL_KEY_FILE = spoolKeyFile;
 
 let server: Server | undefined;
 let socketPath: string | undefined;
@@ -55,7 +59,28 @@ afterEach(async () => {
     }
   }
   for (const root of artifactRoots.splice(0)) await rm(root, { recursive: true, force: true });
+  await rm(dirname(spoolKeyFile), { recursive: true, force: true });
 });
+
+// A spool file as the integration writes it: the person's own image files (those outside OMP's
+// session directories) listed in `sources`, every field signed with the key. Fields of `spool`
+// that are not valid are written as they are, so a test can plant a signed file that is malformed.
+async function signedSpool(file: string, spool: Record<string, any>): Promise<string> {
+  await mkdir(dirname(spoolKeyFile), { recursive: true, mode: 0o700 });
+  await writeFile(spoolKeyFile, `${randomBytes(32).toString("hex")}\n`, { flag: "wx", mode: 0o600 }).catch((error: { code?: string }) => {
+    if (error.code !== "EEXIST") throw error;
+  });
+  const key = Buffer.from((await readFile(spoolKeyFile, "utf8")).trim(), "hex");
+  const root = dirname(dirname(file));
+  const prompts: any[] = spool.prompts ?? [];
+  const outside = (image: unknown) => typeof image === "string" && image !== "" && relative(root, image).startsWith("..");
+  const sources = [...new Set([...prompts, ...(spool.twin?.keep ?? [])].flatMap((prompt) => (Array.isArray(prompt?.images) ? prompt.images : [])).filter(outside))];
+  const full: Record<string, any> = { v: 3, sources, ...spool };
+  const prompt = (item: any) => [item.text, item.images, item.savedAt ?? null];
+  const twin = full.twin ? [full.twin.file, full.twin.keep.map(prompt)] : null;
+  const signed = JSON.stringify([full.pid ?? null, full.savedAt ?? null, full.id ?? null, twin, full.sources ?? [], prompts.map(prompt)]);
+  return JSON.stringify({ ...full, sig: createHmac("sha256", key).update(signed).digest("hex") });
+}
 
 const integrations = [
   { name: "Pi", modulePath: "./pi/herdr-agent-state.ts" },
@@ -3987,6 +4012,108 @@ test("Oh My Pi keeps the words of a second held prompt that start like the first
   await waitFor(() => !existsSync(join(artifacts(), "herdr-held-prompt.json")));
 });
 
+test("Oh My Pi keeps holding what the person submits until it has sent the held prompts, so nothing is sent twice", async () => {
+  const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+  // What the person submits with Enter in the time after the change and before the replay: the
+  // editor held the held words (and perhaps more), OMP cleared it and the input event carries them.
+  const cases: [string, string, string][] = [
+    ["W", "W\n", ""],
+    ["W\nmore", "W\nmore", "more"],
+  ];
+  for (const [index, [submitted, afterHold, afterSend]] of cases.entries()) {
+    const release = Promise.withResolvers<void>();
+    // herdr takes its time to accept the new session: the change has swapped, and the held prompt
+    // is still waiting to be sent.
+    recordingDelay = (request) =>
+      request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl" ? release.promise : undefined;
+    try {
+      const run = await installOmpForSessions(`omp-session-hold-gap-${index}`);
+      const started = run.omp.harness.reports().length;
+      await run.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, run.omp.harness.context);
+      await waitFor(() => run.omp.harness.reports().length > started);
+      const input = (text: string) =>
+        run.omp.harness.handlers.get("input")?.({ type: "input", text, images: [], source: "interactive" }, run.omp.harness.context);
+      run.state.duringChange = () =>
+        run.omp.harness.handlers.get("input")?.({ type: "input", text: "W [Image #1, 1x1]", images: [image], source: "interactive" }, run.omp.harness.context);
+      const id = String(index + 1).repeat(32);
+      run.omp.listener(actionBlock(id, { op: "new_session", args: {} }));
+      const requests = run.omp.harness.requests as { method?: string; params?: Record<string, unknown> }[];
+      await waitFor(() => requests.some((request) => request.method === "pane.report_agent_session_v2" && request.params?.agent_session_path === "/tmp/omp-new.jsonl"));
+      // The change's own steps run on timers: wait past them to be in the time after the swap.
+      await Bun.sleep(50);
+      expect(run.calls).toContainEqual(["newSession"]);
+      expect(run.omp.editor()).toBe("W\n");
+      run.omp.setEditor("");
+      // The Enter is held like any other: it goes back into the editor, and nothing is sent.
+      expect(await input(submitted)).toEqual({ handled: true });
+      expect(run.omp.editor()).toBe(afterHold);
+      expect(run.omp.harness.sent).toEqual([]);
+      release.resolve();
+      await run.omp.finalAck(id);
+      await waitFor(() => run.omp.harness.sent.length === 1);
+      // The prompt goes out once, with its image; the words left the editor with it.
+      expect(run.omp.harness.sent[0]).toEqual([[{ type: "text", text: "W [Image #1, 1x1]" }, image], undefined]);
+      expect(run.omp.editor()).toBe(afterSend);
+      // The prompts are sent: the next Enter is OMP's own.
+      expect(await input("later")).toBeUndefined();
+      expect(run.omp.harness.sent).toHaveLength(1);
+    } finally {
+      release.resolve();
+      recordingDelay = undefined;
+    }
+  }
+});
+
+test("Oh My Pi ends its hold, and answers, however a session change ends", async () => {
+  const statuses = async (name: string) => {
+    const run = await installOmpForSessions(name);
+    const marks: unknown[] = [];
+    Object.assign(run.omp.harness.context.ui as Record<string, unknown>, { setStatus: (_key: string, text: unknown) => marks.push(text) });
+    const input = () =>
+      run.omp.harness.handlers.get("input")?.({ type: "input", text: "hello", images: [], source: "interactive" }, run.omp.harness.context);
+    // The hold is up once the status shows, and down once the status is cleared.
+    const over = () => waitFor(() => marks.length >= 2 && marks.at(-1) === undefined);
+    return { ...run, marks, input, over };
+  };
+  // Another extension cancels the change.
+  const cancelled = await statuses("omp-session-hold-cancelled");
+  cancelled.state.cancel = true;
+  expect((await cancelled.omp.act({ op: "new_session", args: {} })).ack.error).toStartWith("cancelled: another extension");
+  await cancelled.over();
+  expect(await cancelled.input()).toBeUndefined();
+  // OMP refuses the change.
+  const busy = await statuses("omp-session-hold-busy");
+  busy.state.forkBusy = true;
+  expect((await busy.omp.act({ op: "fork", args: {} })).ack.error).toStartWith("busy:");
+  await busy.over();
+  expect(await busy.input()).toBeUndefined();
+  // A step after the change throws: the caller still gets an answer.
+  const broken = await statuses("omp-session-hold-broken");
+  const ui = broken.omp.harness.context.ui as { onTerminalInput: (handler: unknown) => unknown };
+  const register = ui.onTerminalInput;
+  let failing = false;
+  ui.onTerminalInput = (handler) => {
+    if (failing) throw new Error("input listener failed");
+    return register(handler);
+  };
+  failing = true;
+  expect((await broken.omp.act({ op: "new_session", args: {} })).ack.error).toStartWith("failed: input listener failed");
+  failing = false;
+  await broken.over();
+  expect(await broken.input()).toBeUndefined();
+});
+
+test("Oh My Pi reports that it takes actions only in OMP's terminal UI", async () => {
+  const tui = await installOmpForSessions("omp-session-actions-tui");
+  expect(tui.omp.harness.reports().at(-1)?.params).toMatchObject({ accepts_instructions: true, accepts_actions: true });
+  // RPC mode has a stand-in UI (no editor, no session commands): no action reaches it.
+  const rpc = await installOmpForSessions("omp-session-actions-rpc", { mode: "rpc" });
+  const started = rpc.omp.harness.reports().length;
+  await rpc.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, rpc.omp.harness.context);
+  await waitFor(() => rpc.omp.harness.reports().length > started);
+  expect(rpc.omp.harness.reports().at(-1)?.params).toMatchObject({ accepts_instructions: true, accepts_actions: false });
+});
+
 test("Oh My Pi takes only the words it put at the start of the editor out when it sends a held prompt, and leaves the person's own text", async () => {
   const image = { type: "image", data: "b25l", mimeType: "image/png" };
   // The editor when the prompt is sent (herdr put `alpha` and a newline in it), and what is left
@@ -4072,7 +4199,7 @@ test("Oh My Pi keeps a held image prompt when OMP exits during the change, and p
     expect(run.omp.editor()).toBe("describe  and  please\n");
     const spoolFile = join(run.artifacts(), spoolName);
     const spool = JSON.parse(await readFile(spoolFile, "utf8"));
-    expect(spool).toMatchObject({ v: 2, pid: process.pid });
+    expect(spool).toMatchObject({ v: 3, pid: process.pid });
     expect(Date.now() - spool.savedAt).toBeLessThan(60_000);
     expect(spool.prompts[0].images[0]).toBe(photo);
     const copy: string = spool.prompts[0].images[1];
@@ -4390,14 +4517,18 @@ async function sourceImage(name: string): Promise<string> {
 // the artifact directory known, as the restart of a session does).
 async function restartWithSpoolFiles(
   name: string,
-  files: Record<string, string>,
+  files: Record<string, string | Record<string, unknown>>,
   draft = "",
   chipDelayMs = 5,
 ) {
   process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
   const session = await installOmpForSessions(name);
   await mkdir(session.artifacts()!, { recursive: true });
-  for (const [file, content] of Object.entries(files)) await writeFile(join(session.artifacts()!, file), content);
+  // A string is written as it is; an object is a spool the integration wrote (signed).
+  for (const [file, content] of Object.entries(files)) {
+    const target = join(session.artifacts()!, file);
+    await writeFile(target, typeof content === "string" ? content : await signedSpool(target, content));
+  }
   const pastes: string[] = [];
   const notices: string[] = [];
   const seen = emulatePaste(session.omp, pastes, notices, chipDelayMs);
@@ -4416,8 +4547,8 @@ test("Oh My Pi keeps a spool that is already in the session it moves into, and o
   const target = join(artifactsRoot, "omp-new");
   await mkdir(target, { recursive: true });
   const spoolFile = join(target, "herdr-held-prompt.json");
-  // A spool from an earlier OMP that exited during a change and was never reopened (version 1).
-  await writeFile(spoolFile, JSON.stringify({ v: 1, prompts: [{ text: "STALE [Image #1, 1x1]", images: [staleImage] }] }));
+  // A spool from an earlier OMP that exited during a change and was never reopened.
+  await writeFile(spoolFile, await signedSpool(spoolFile, { prompts: [{ text: "STALE [Image #1, 1x1]", images: [staleImage] }] }));
   const pastes: string[] = [];
   const notices: string[] = [];
   emulatePaste(omp, pastes, notices);
@@ -4448,7 +4579,7 @@ test("Oh My Pi keeps a spool that is already in the session it moves into, and o
 test("Oh My Pi takes a spool only when the process that wrote it is gone or its change is long over", async () => {
   const dead = Bun.spawnSync(["true"]).pid;
   const prompt = (savedAt: number) => ({ text: "OTHERWORDS", images: [], savedAt });
-  const spool = (pid: number, savedAt: number) => JSON.stringify({ v: 2, pid, savedAt, prompts: [prompt(savedAt)] });
+  const spool = (pid: number, savedAt: number) => ({ pid, savedAt, prompts: [prompt(savedAt)] });
   // Another OMP that still runs wrote it a moment ago: its change is not over, and it sends the prompt.
   const live = await restartWithSpoolFiles("omp-session-spool-live", { "herdr-held-prompt.json": spool(process.ppid, Date.now()) });
   await Bun.sleep(100); // the restore looks 20 ms after the start: wait past it
@@ -4472,22 +4603,26 @@ test("Oh My Pi takes a spool only when the process that wrote it is gone or its 
 });
 
 test("Oh My Pi sets a spool it cannot read aside, drops an empty one quietly, and removes dead temporary files", async () => {
-  const aside = (dir: string | null) => readdir(dir!).then((names) => names.filter((name) => name.startsWith("herdr-held-prompt.corrupt-")));
-  for (const [name, content] of [
-    ["truncated", '{"v":2,"prompts":[{"text":"half'],
-    ["malformed prompt", '{"v":2,"prompts":[{"text":5,"images":[]}]}'],
-  ]) {
+  const aside = (dir: string | null, reason = "corrupt") => readdir(dir!).then((names) => names.filter((name) => name.startsWith(`herdr-held-prompt.${reason}-`)));
+  const cases: [string, string | Record<string, unknown>][] = [
+    ["truncated", '{"v":3,"prompts":[{"text":"half'],
+    ["malformed prompt", { prompts: [{ text: 5, images: [] }] }],
+  ];
+  for (const [name, content] of cases) {
     const run = await restartWithSpoolFiles(`omp-session-spool-corrupt-${name.length}`, { "herdr-held-prompt.json": content });
     await waitFor(() => run.notices.length === 1);
     const [moved] = await aside(run.artifacts());
     expect(run.notices[0]).toBe(`herdr could not read a held prompt saved beside this session and set the file aside as ${join(run.artifacts()!, moved)}`);
-    expect(await readFile(join(run.artifacts()!, moved), "utf8")).toBe(content);
+    const kept = await readFile(join(run.artifacts()!, moved), "utf8");
+    if (typeof content === "string") expect(kept).toBe(content);
+    else expect(JSON.parse(kept).prompts).toEqual(content.prompts);
     expect(existsSync(run.spool)).toBe(false);
     expect(run.omp.editor()).toBe("");
   }
   const dead = Bun.spawnSync(["true"]).pid;
-  for (const content of ['{"v":2,"prompts":[]}', '{"v":2,"prompts":[{"text":"[Image #1, 1x1]","images":[]}]}']) {
-    const run = await restartWithSpoolFiles(`omp-session-spool-empty-${content.length}`, {
+  const empties = [{ prompts: [] }, { prompts: [{ text: "[Image #1, 1x1]", images: [] }] }];
+  for (const [index, content] of empties.entries()) {
+    const run = await restartWithSpoolFiles(`omp-session-spool-empty-${index}`, {
       "herdr-held-prompt.json": content,
       [`herdr-held-prompt.json.${dead}.3.tmp`]: "half a write",
       [`herdr-held-prompt.json.${process.ppid}.3.tmp`]: "another process, still writing",
@@ -4497,6 +4632,125 @@ test("Oh My Pi sets a spool it cannot read aside, drops an empty one quietly, an
     expect(run.notices).toEqual([]);
     expect(await readdir(run.artifacts()!)).toEqual([`herdr-held-prompt.json.${process.ppid}.3.tmp`]);
   }
+});
+
+test("Oh My Pi does not believe a spool it did not write: no signature, a wrong one, a changed one, or another key's", async () => {
+  const secret = await sourceImage("secret");
+  const dead = Bun.spawnSync(["true"]).pid;
+  const planted = { pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "SECRET [Image #1, 1x1]", images: [secret], savedAt: Date.now() - 1000 }] };
+  const unsigned = JSON.stringify({ v: 3, ...planted, sources: [secret] });
+  const asideNotice = (dir: string, moved: string) =>
+    `herdr found a held prompt beside this session that it did not write, did not put it in the editor, and set the file aside as ${join(dir, moved)}`;
+  const forged = async (target: string, change: (spool: any) => void) => {
+    const spool = JSON.parse(await signedSpool(target, planted));
+    change(spool);
+    return JSON.stringify(spool);
+  };
+  // What the writer made, then changed: the image of another file, another text, a second prompt,
+  // a signature of nothing, no signature at all.
+  const variants: [string, (target: string) => Promise<string>][] = [
+    ["unsigned", async () => unsigned],
+    ["empty signature", (target) => forged(target, (spool) => (spool.sig = ""))],
+    ["wrong signature", (target) => forged(target, (spool) => (spool.sig = "0".repeat(64)))],
+    ["another image", (target) => forged(target, (spool) => (spool.prompts[0].images = ["/etc/passwd"]))],
+    ["another text", (target) => forged(target, (spool) => (spool.prompts[0].text = "OTHER"))],
+    ["another writer", (target) => forged(target, (spool) => (spool.pid = process.ppid))],
+  ];
+  for (const [index, [name, make]] of variants.entries()) {
+    process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
+    const session = await installOmpForSessions(`omp-session-spool-unverified-${index}`);
+    await mkdir(session.artifacts()!, { recursive: true });
+    const target = join(session.artifacts()!, "herdr-held-prompt.json");
+    const content = await make(target);
+    await writeFile(target, content);
+    const pastes: string[] = [];
+    const notices: string[] = [];
+    emulatePaste(session.omp, pastes, notices);
+    session.omp.setEditor("");
+    await session.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, session.omp.harness.context);
+    await waitFor(() => notices.length === 1);
+    const [moved] = (await readdir(session.artifacts()!)).filter((file) => file.startsWith("herdr-held-prompt.unverified-"));
+    expect(notices[0], name).toBe(asideNotice(session.artifacts()!, moved));
+    // Nothing reached the editor, and the file is kept as it was.
+    expect(pastes, name).toEqual([]);
+    expect(session.omp.editor(), name).toBe("");
+    expect(await readFile(join(session.artifacts()!, moved), "utf8"), name).toBe(content);
+    expect(existsSync(target), name).toBe(false);
+  }
+  // The same file under a key this install does not have.
+  process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
+  const session = await installOmpForSessions("omp-session-spool-other-key");
+  await mkdir(session.artifacts()!, { recursive: true });
+  const target = join(session.artifacts()!, "herdr-held-prompt.json");
+  const otherKey = randomBytes(32);
+  const text = await signedSpool(target, planted);
+  const parsed = JSON.parse(text);
+  const { sig: _sig, ...fields } = parsed;
+  const prompt = (item: any) => [item.text, item.images, item.savedAt ?? null];
+  const signed = JSON.stringify([fields.pid, fields.savedAt, null, null, fields.sources, fields.prompts.map(prompt)]);
+  await writeFile(target, JSON.stringify({ ...fields, sig: createHmac("sha256", otherKey).update(signed).digest("hex") }));
+  const notices: string[] = [];
+  emulatePaste(session.omp, [], notices);
+  session.omp.setEditor("");
+  await session.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, session.omp.harness.context);
+  await waitFor(() => notices.length === 1);
+  expect(notices[0]).toContain("did not write");
+  expect(session.omp.editor()).toBe("");
+});
+
+test("Oh My Pi sets aside a spool that is a link, too big or over its caps, and puts back only images of OMP's session files or the person's own", async () => {
+  const dead = Bun.spawnSync(["true"]).pid;
+  const now = Date.now() - 1000;
+  const prompt = (text: string, images: string[] = []) => ({ text, images, savedAt: now });
+  const asideOf = (dir: string | null) => readdir(dir!).then((names) => names.filter((name) => name.startsWith("herdr-held-prompt.corrupt-")));
+  // A link named like a spool is set aside itself, even one to a good spool: its target is not
+  // read or changed.
+  const target = join(tmpdir(), `herdr-spool-link-target-${process.pid}`);
+  artifactRoots.push(target);
+  const behindLink = await signedSpool(target, { pid: dead, savedAt: now, prompts: [prompt("VIA LINK")] });
+  await writeFile(target, behindLink);
+  process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
+  const linked = await installOmpForSessions("omp-session-spool-link");
+  await mkdir(linked.artifacts()!, { recursive: true });
+  await symlink(target, join(linked.artifacts()!, "herdr-held-prompt.json"));
+  const linkedPastes: string[] = [];
+  const linkedNotices: string[] = [];
+  emulatePaste(linked.omp, linkedPastes, linkedNotices);
+  linked.omp.setEditor("");
+  await linked.omp.harness.handlers.get("session_start")?.({ reason: "startup" }, linked.omp.harness.context);
+  await waitFor(() => linkedNotices.length === 1);
+  expect((await asideOf(linked.artifacts())).length).toBe(1);
+  expect(linkedPastes).toEqual([]);
+  expect(linked.omp.editor()).toBe("");
+  expect(await readFile(target, "utf8")).toBe(behindLink);
+  // Over the caps (signed, so written by the integration or by a bug): set aside, none of it staged.
+  const manyPrompts = { pid: dead, savedAt: now, prompts: Array.from({ length: 51 }, (_, index) => prompt(`P${index}`)) };
+  const manyImages = { pid: dead, savedAt: now, prompts: [prompt("X", Array.from({ length: 51 }, (_, index) => `/tmp/herdr-held-source-${index}.png`))] };
+  const longText = { pid: dead, savedAt: now, prompts: [prompt("x".repeat(1_000_001))] };
+  for (const [index, content] of [manyPrompts, manyImages, longText].entries()) {
+    const run = await restartWithSpoolFiles(`omp-session-spool-caps-${index}`, { "herdr-held-prompt.json": content });
+    await waitFor(() => run.notices.length === 1);
+    expect((await asideOf(run.artifacts())).length).toBe(1);
+    expect(run.pastes).toEqual([]);
+    expect(run.omp.editor()).toBe("");
+  }
+  // A spool of exactly the caps is believed.
+  const atCaps = { pid: dead, savedAt: now, prompts: Array.from({ length: 50 }, (_, index) => prompt(`P${index}`)) };
+  const full = await restartWithSpoolFiles("omp-session-spool-at-caps", { "herdr-held-prompt.json": atCaps });
+  await waitFor(() => full.notices.length === 1);
+  expect(full.omp.editor()).toContain("P49");
+  // An image that is neither one of OMP's session files (the directory of the sessions, two levels
+  // above the spool) nor listed as the person's own file is gone, even in a file with a good
+  // signature: the words come back and the notice counts it.
+  const own = await sourceImage("own-file");
+  const elsewhere = await sourceImage("not-recorded");
+  const images = await restartWithSpoolFiles("omp-session-spool-images", {
+    "herdr-held-prompt.json": { pid: dead, savedAt: now, sources: [own], prompts: [prompt("A [Image #1, 1x1] B [Image #2, 1x1]", [own, elsewhere])] },
+  });
+  await waitFor(() => images.notices.length === 1);
+  expect(images.pastes).toEqual(["A ", own, "B "]);
+  expect(images.notices[0]).toContain("; 1 image is gone");
+  expect(images.omp.editor()).toBe("A 🖼 #1 B ");
 });
 
 test("Oh My Pi leaves no temporary spool file when a write fails, and never writes over a spool it cannot read", async () => {
@@ -4533,15 +4787,14 @@ test("Oh My Pi puts a held prompt back byte for byte: indentation, tabs and blan
   const code = "def f():\n    return [Image #1, 1x1]  x = 1\n        y = 2\n\n\tdone";
   const more = "        keep eight\n\n\n    keep four [Image #1, 1x1]";
   const run = await restartWithSpoolFiles("omp-session-spool-indent", {
-    "herdr-held-prompt.json": JSON.stringify({
-      v: 2,
+    "herdr-held-prompt.json": {
       pid: dead,
       savedAt: Date.now() - 1000,
       prompts: [
         { text: code, images: [first], savedAt: Date.now() - 1000 },
         { text: more, images: [second], savedAt: Date.now() - 1000 },
       ],
-    }),
+    },
   });
   await waitFor(() => run.notices.length === 1);
   expect(run.pastes).toEqual(["def f():\n    return ", first, " x = 1\n        y = 2\n\n\tdone", "\n", "        keep eight\n\n\n    keep four ", second]);
@@ -4567,7 +4820,7 @@ test("Oh My Pi keeps what the person typed while a prompt is put back, and waits
   const dead = Bun.spawnSync(["true"]).pid;
   const run = await restartWithSpoolFiles(
     "omp-session-spool-chipwait",
-    { "herdr-held-prompt.json": JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "A [Image #1, 1x1]  B", images: [image], savedAt: Date.now() - 1000 }] }) },
+    { "herdr-held-prompt.json": { pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "A [Image #1, 1x1]  B", images: [image], savedAt: Date.now() - 1000 }] } },
     "",
     80,
   );
@@ -4589,7 +4842,7 @@ test("Oh My Pi keeps its spool when a restore is still running as a held prompt 
   const dead = Bun.spawnSync(["true"]).pid;
   const run = await restartWithSpoolFiles(
     "omp-session-spool-serialise",
-    { "herdr-held-prompt.json": JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "OLD [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] }) },
+    { "herdr-held-prompt.json": { pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "OLD [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] } },
     "",
     300,
   );
@@ -4616,7 +4869,7 @@ test("Oh My Pi keeps the saved prompt and the person's draft when putting it bac
   const session = await installOmpForSessions("omp-session-spool-throws");
   await mkdir(session.artifacts()!, { recursive: true });
   const spool = join(session.artifacts()!, "herdr-held-prompt.json");
-  await writeFile(spool, JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "BEFORE [Image #1, 1x1] THROW", images: [image], savedAt: Date.now() - 1000 }] }));
+  await writeFile(spool, await signedSpool(spool, { pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "BEFORE [Image #1, 1x1] THROW", images: [image], savedAt: Date.now() - 1000 }] }));
   const pastes: string[] = [];
   const notices: string[] = [];
   emulatePaste(session.omp, pastes, notices);
@@ -4639,7 +4892,7 @@ test("Oh My Pi writes its own spool beside another running OMP's, and neither ta
   const { omp, state, calls, artifacts, take } = await installOmpForSessions("omp-session-spool-two-writers");
   await mkdir(artifacts()!, { recursive: true });
   const theirs = join(artifacts()!, "herdr-held-prompt.json");
-  const theirContent = JSON.stringify({ v: 2, pid: process.ppid, savedAt: Date.now(), prompts: [{ text: "THEIRS", images: [], savedAt: Date.now() }] });
+  const theirContent = await signedSpool(theirs, { pid: process.ppid, savedAt: Date.now(), prompts: [{ text: "THEIRS", images: [], savedAt: Date.now() }] });
   await writeFile(theirs, theirContent);
   state.summary = Promise.withResolvers<boolean>();
   const id = "6".repeat(32);
@@ -4666,12 +4919,13 @@ test("Oh My Pi writes its own spool beside another running OMP's, and neither ta
 test("Oh My Pi leaves a spool alone outside OMP's terminal UI, and restores it when a terminal UI starts", async () => {
   const image = await sourceImage("rpc-mode");
   const dead = Bun.spawnSync(["true"]).pid;
-  const saved = JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "RPCWORDS [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] });
+  const content = { pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "RPCWORDS [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] };
   process.env.HERDR_OMP_SPOOL_RESTORE_MS = "20";
   // In RPC mode `ui` is a stand-in: reads give "" and writes are lines for a host.
   const session = await installOmpForSessions("omp-session-spool-rpc", { mode: "rpc" });
   await mkdir(session.artifacts()!, { recursive: true });
   const spool = join(session.artifacts()!, "herdr-held-prompt.json");
+  const saved = await signedSpool(spool, content);
   await writeFile(spool, saved);
   const calls: string[] = [];
   Object.assign(session.omp.harness.context.ui as Record<string, unknown>, {
@@ -4686,7 +4940,7 @@ test("Oh My Pi leaves a spool alone outside OMP's terminal UI, and restores it w
   expect(calls).toEqual([]);
   expect(await readFile(spool, "utf8")).toBe(saved);
   // The same session in a terminal UI later: the prompt is still there and comes back.
-  const tui = await restartWithSpoolFiles("omp-session-spool-rpc-then-tui", { "herdr-held-prompt.json": saved });
+  const tui = await restartWithSpoolFiles("omp-session-spool-rpc-then-tui", { "herdr-held-prompt.json": content });
   await waitFor(() => tui.notices.length === 1);
   expect(tui.omp.editor()).toBe("RPCWORDS 🖼 #1 ");
   expect(existsSync(tui.spool)).toBe(false);
@@ -4695,8 +4949,7 @@ test("Oh My Pi leaves a spool alone outside OMP's terminal UI, and restores it w
 test("Oh My Pi restores several spool files oldest first, whatever their names", async () => {
   const [first, second, third] = await Promise.all([sourceImage("order-a"), sourceImage("order-b"), sourceImage("order-c")]);
   const dead = Bun.spawnSync(["true"]).pid;
-  const file = (text: string, image: string, ago: number) =>
-    JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - ago, prompts: [{ text, images: [image], savedAt: Date.now() - ago }] });
+  const file = (text: string, image: string, ago: number) => ({ pid: dead, savedAt: Date.now() - ago, prompts: [{ text, images: [image], savedAt: Date.now() - ago }] });
   // By name the pid files sort before the main file, and pid 10 before pid 9; by time it is C, B, A.
   const run = await restartWithSpoolFiles("omp-session-spool-order", {
     "herdr-held-prompt.json": file("A [Image #1, 1x1]", first, 1000),
@@ -4716,7 +4969,7 @@ test("Oh My Pi looks for a spool again when a session starts again in the same d
   const session = await installOmpForSessions("omp-session-spool-reentry");
   await mkdir(session.artifacts()!, { recursive: true });
   const spool = join(session.artifacts()!, "herdr-held-prompt.json");
-  await writeFile(spool, JSON.stringify({ v: 2, pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "AGAIN [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] }));
+  await writeFile(spool, await signedSpool(spool, { pid: dead, savedAt: Date.now() - 1000, prompts: [{ text: "AGAIN [Image #1, 1x1]", images: [image], savedAt: Date.now() - 1000 }] }));
   const pastes: string[] = [];
   const notices: string[] = [];
   emulatePaste(session.omp, pastes, notices);
