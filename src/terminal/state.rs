@@ -38,6 +38,8 @@ pub(crate) struct HandoffAgentState {
     #[serde(default)]
     action_listener: bool,
     #[serde(default)]
+    ui_mode: Option<String>,
+    #[serde(default)]
     block_token: Option<String>,
     #[serde(default)]
     omp_detail: Option<crate::api::schema::OmpDetail>,
@@ -153,6 +155,8 @@ pub struct TerminalState {
     pub(crate) instruction_listener_runtime: Option<String>,
     /// The same listener also consumes `agent.action` blocks.
     pub(crate) action_listener: bool,
+    /// The mode OMP runs in, as the listener's integration reported it (`tui`, `rpc`, `print`).
+    pub(crate) ui_mode: Option<String>,
     /// The token the listener takes blocks with, when it is not its runtime id.
     pub(crate) block_token: Option<String>,
     /// The listener process's latest `pane.report_omp_detail`.
@@ -204,6 +208,7 @@ impl TerminalState {
             instruction_listener: None,
             instruction_listener_runtime: None,
             action_listener: false,
+            ui_mode: None,
             block_token: None,
             omp_detail: None,
             instruction_listener_withdrawn: None,
@@ -271,6 +276,7 @@ impl TerminalState {
             instruction_listener: self.instruction_listener.clone(),
             instruction_listener_runtime: self.instruction_listener_runtime.clone(),
             action_listener: self.action_listener,
+            ui_mode: self.ui_mode.clone(),
             block_token: self.block_token.clone(),
             omp_detail: self.omp_detail.clone(),
         })
@@ -289,6 +295,7 @@ impl TerminalState {
         self.instruction_listener = snapshot.instruction_listener;
         self.instruction_listener_runtime = snapshot.instruction_listener_runtime;
         self.action_listener = snapshot.action_listener;
+        self.ui_mode = snapshot.ui_mode;
         self.block_token = snapshot.block_token;
         self.omp_detail = snapshot.omp_detail;
     }
@@ -1491,7 +1498,7 @@ impl TerminalState {
                 | (
                     "herdr:omp",
                     "omp",
-                    Some("startup" | "new" | "resume" | "fork")
+                    Some("startup" | "new" | "resume" | "fork" | "branch")
                 )
                 | (
                     "herdr:qwen",

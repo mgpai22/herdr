@@ -410,6 +410,11 @@ pub struct PaneReportAgentSessionV2Params {
     /// The same listener also consumes `agent.action` blocks (OMP integration v14+).
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub accepts_actions: bool,
+    /// The mode OMP runs in (`tui`, `rpc`, `json` or `print`), when the integration says. A
+    /// listener in another mode than `tui` takes no actions, and Herdr refuses an action for it
+    /// as `unsupported_mode` (OMP integration v16+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_mode: Option<String>,
     /// Opaque id of the integration's JS runtime: the same across an extension reload, new after
     /// an exec restart of the same process.
     #[serde(default, skip_serializing_if = "Option::is_none")]

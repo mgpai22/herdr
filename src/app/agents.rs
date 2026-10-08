@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -209,6 +210,102 @@ impl App {
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
             return Err(AgentStartError::TargetBusy(params.pane_id));
         }
+        if kind == crate::detect::Agent::Omp {
+            let cwd = terminal.cwd.clone();
+            let mut values = crate::agent_resume::omp_resume_args(&params.args);
+            // `--continue <session id>` is `--resume <session id>` for OMP.
+            let continues = match crate::agent_resume::omp_continue(&params.args) {
+                crate::agent_resume::OmpContinue::Newest => true,
+                crate::agent_resume::OmpContinue::Session(id) => {
+                    values.push(id);
+                    false
+                }
+                crate::agent_resume::OmpContinue::Other => false,
+            };
+            if !values.is_empty() || continues {
+                let live: Vec<_> = self
+                    .collect_agent_infos()
+                    .into_iter()
+                    .filter(|other| {
+                        other.agent.as_deref() == Some("omp")
+                            && other.runtime_id.is_some()
+                            && other.agent_session.is_some()
+                    })
+                    .collect();
+                // A prefix, a path or a session id counts for a live pane in any directory: OMP looks
+                // a prefix up in its own project first and then in every other project, so it can
+                // open that pane's file from anywhere. A false refusal names the pane and the file;
+                // the caller can pass a longer id or a path.
+                for other in &live {
+                    let Some(session) = other.agent_session.as_ref() else {
+                        continue;
+                    };
+                    if let Some(value) = values.iter().find(|value| {
+                        crate::agent_resume::omp_resume_value_matches(value, &cwd, &session.value)
+                    }) {
+                        return Err(AgentStartError::SessionInUse {
+                            arg: format!("--resume {value}"),
+                            pane_id: other.pane_id.clone(),
+                            session: session.value.clone(),
+                        });
+                    }
+                }
+                // Another pane's `switch_session` that waits for its result is about to run that
+                // file: a second OMP on it would save to another file, as for a live pane.
+                for (claimant, target) in self.pending_switch_claims() {
+                    let Some(value) = values.iter().find(|value| {
+                        crate::agent_resume::omp_resume_value_matches(value, &cwd, &target)
+                    }) else {
+                        continue;
+                    };
+                    let pane_id = live
+                        .iter()
+                        .find(|other| other.terminal_id == claimant.as_str())
+                        .map_or_else(|| "another pane".to_string(), |other| other.pane_id.clone());
+                    return Err(AgentStartError::SessionInUse {
+                        arg: format!("--resume {value}"),
+                        pane_id,
+                        session: target,
+                    });
+                }
+                // `--continue` opens the newest session of this cwd and profile. A live pane with
+                // the same cwd and profile shows where those sessions are; the newest file there is
+                // the one that would open.
+                if continues {
+                    let profile = omp_launch_profile.as_deref().unwrap_or("default");
+                    let same_place = |other: &&crate::api::schema::AgentInfo| {
+                        other
+                            .cwd
+                            .as_deref()
+                            .is_some_and(|other_cwd| Path::new(other_cwd) == cwd)
+                            && other.launch_profile.as_deref().unwrap_or("default") == profile
+                    };
+                    for newest in live
+                        .iter()
+                        .filter(same_place)
+                        .filter_map(|other| other.agent_session.as_ref())
+                        .filter_map(|session| {
+                            crate::agent_resume::newest_session_beside(&session.value)
+                        })
+                    {
+                        if let Some((holder, session)) = live.iter().find_map(|other| {
+                            let session = other.agent_session.as_ref()?;
+                            crate::agent_resume::same_session_file(
+                                Path::new(&session.value),
+                                &newest,
+                            )
+                            .then_some((other, session))
+                        }) {
+                            return Err(AgentStartError::SessionInUse {
+                                arg: "--continue".into(),
+                                pane_id: holder.pane_id.clone(),
+                                session: session.value.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         let runtime = self
             .terminal_runtimes
             .get(&terminal_id)
@@ -310,6 +407,16 @@ impl App {
             AgentStartError::TargetBusy(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_busy".into(),
                 message: format!("agent target pane {target} is not an available shell"),
+            },
+            AgentStartError::SessionInUse {
+                arg,
+                pane_id,
+                session,
+            } => crate::api::schema::ErrorBody {
+                code: "agent_session_in_use".into(),
+                message: format!(
+                    "OMP in pane {pane_id} runs {session}, which `{arg}` can open; a second OMP on it would save to another file that Herdr cannot follow until its first write. Open another session, or close that pane first"
+                ),
             },
             AgentStartError::TargetUnavailable(target) => crate::api::schema::ErrorBody {
                 code: "agent_pane_unavailable".into(),
@@ -642,6 +749,12 @@ pub(super) enum AgentStartError {
     InvalidTimeout,
     TargetNotFound(String),
     TargetBusy(String),
+    /// `--resume` names, or `--continue` would open, a session file a live OMP pane runs.
+    SessionInUse {
+        arg: String,
+        pane_id: String,
+        session: String,
+    },
     TargetUnavailable(String),
     InputFailed(String),
     DuplicateName {

@@ -2,11 +2,14 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=15
+// HERDR_INTEGRATION_VERSION=16
 // @ts-nocheck
 
-import { createHash } from "node:crypto";
-import { access, writeFile } from "node:fs/promises";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { constants } from "node:fs";
+import { access, lstat, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { setTimeout as delay } from "node:timers/promises";
 import net from "node:net";
 import path from "node:path";
 
@@ -197,6 +200,12 @@ const admissionPollMs = parseDurationEnv("HERDR_OMP_INSTRUCTION_POLL_MS", 250);
 // agent tag before the turn starts.
 const MODEL_MENTION = /(^|\s)\^[^\s^]+(?=\s|$)/g;
 let instructionListener = false;
+// Whether that listener may also run `agent.action` ops: only in OMP's terminal UI, where the editor
+// and the session commands they use are real. RPC and print mode have a stand-in UI.
+let actionListener = false;
+// The mode OMP says it runs in (`tui`, `rpc`, `json`, `print`): herdr names it when it refuses an action
+// for a listener outside the terminal UI.
+let listenerMode: string | undefined;
 let unsubscribeInstructions: (() => void) | undefined;
 // Idle deliveries handed to OMP and acked as taken, acked again when OMP starts their turn or
 // goes idle without starting it.
@@ -362,6 +371,9 @@ const droppedWatchMs = 10_000;
 const switchWaitMs = parseDurationEnv("HERDR_OMP_SWITCH_WAIT_MS", 40_000);
 // Interval knobs are at least 10 ms: 0 would spin for the life of the pane.
 const switchPollMs = Math.max(parseDurationEnv("HERDR_OMP_SWITCH_POLL_MS", 1000), 10);
+// How long after OMP starts a session the integration looks for a prompt that OMP's exit left in
+// the session's spool. OMP restores its own draft at the end of its start-up; this runs after it.
+const spoolRestoreMs = parseDurationEnv("HERDR_OMP_SPOOL_RESTORE_MS", 1500);
 // How often the integration looks for a moved session file (`/move`, `/wt`).
 const moveWatchMs = Math.max(parseDurationEnv("HERDR_OMP_MOVE_WATCH_MS", 3000), 10);
 // How long OMP may take to report that a dialog closed after a person's key.
@@ -374,6 +386,16 @@ const SERVICE_TIERS: Record<string, string[]> = {
 };
 // The one status-line key the `status` op uses, so it never touches another extension's status.
 const STATUS_KEY = "herdr-sahur";
+// The status-line key of herdr's notice while a session change it started runs.
+const HOLD_STATUS_KEY = "herdr-session-change";
+// A bare Enter (no modifier): CR, or the kitty keyboard protocol's form.
+const BARE_ENTER = /^(?:\r|\x1b\[13(?:;1)?u)$/;
+// A bracketed paste with a bare Enter after it, as OMP's stdin buffer delivers a paste and an
+// Enter that arrive in one read (`herdr pane run`).
+const PASTE_THEN_ENTER = /^\x1b\[200~([\s\S]*)\x1b\[201~(?:\r|\x1b\[13(?:;1)?u)$/;
+// OMP's default retry keys (F5, Alt+R, and their kitty forms), which start a turn with no submit.
+const RETRY_KEY = /^(?:\x1b\[15(?:;1)?~|\x1br|\x1b\[114;3u)$/;
+const ESCAPE_KEY = /^\x1b(?:\[27(?:;\d+(?::\d+)?)?u)?$/;
 const SUBAGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const SUBAGENT_STATUSES = new Set(["running", "idle", "parked", "aborted"]);
 // Roster sizes, largest first; the detail uses the first that fits.
@@ -662,6 +684,28 @@ function followSessionMove(ctx: any): boolean {
   return true;
 }
 
+// OMP moved the session to a sibling file with a new id, with no session event: another omp
+// process holds the file (a second `--resume` of a running session), or the file changed on disk.
+// The conversation goes on in the new file, so herdr registers it, and a block herdr checked
+// against the old file is still for this conversation. Returns whether it followed.
+function followSessionRedirect(ctx: any): boolean {
+  const before = currentAgentSessionPath;
+  if (before === undefined || !liveSessionMoved(ctx)) return false;
+  let file: unknown;
+  try {
+    file = ctx?.sessionManager?.getSessionFile?.();
+  } catch {
+    return false;
+  }
+  if (!isAbsoluteSessionPath(file) || file === before) return false;
+  updateSessionRef(ctx);
+  movedSessionTags = [tagOf(before)];
+  movedSessionStems = before.endsWith(".jsonl") ? [before.slice(0, -".jsonl".length)] : [];
+  reportsLost = true;
+  void reportSession();
+  return true;
+}
+
 function currentSessionKey(): string | undefined {
   if (currentAgentSessionPath) return `path\0${currentAgentSessionPath}`;
   if (currentAgentSessionId) return `id\0${currentAgentSessionId}`;
@@ -718,7 +762,8 @@ function sessionReport(sessionStartSource: string, sessionRef: Record<string, un
       launch_profile: launchProfile,
       agent_pid: process.pid,
       accepts_instructions: instructionListener,
-      accepts_actions: instructionListener,
+      accepts_actions: instructionListener && actionListener,
+      ...(listenerMode ? { ui_mode: listenerMode } : {}),
       runtime_instance: runtimeInstance,
       block_token: blockTokens.current,
       ...sessionRef,
@@ -1144,6 +1189,10 @@ export default function (pi) {
   let detailRefused = false;
   let moveWatch: ReturnType<typeof setInterval> | undefined;
   let unsubscribeRegistry: (() => void) | undefined;
+  // OMP's notices that the session moved to a new file with a new id (another omp process holds
+  // the file, or the file changed under it), and the session manager they come from.
+  let unsubscribeRedirects: (() => void) | undefined;
+  let redirectManager: unknown;
   // Counts activations and shutdowns, so a pending withdrawal undo sees that a session event came.
   let activations = 0;
   let lastDetailAt = 0;
@@ -1369,6 +1418,12 @@ export default function (pi) {
     const tiers = serviceTiers();
     if (Object.keys(tiers).length > 0) detail.service_tiers = tiers;
     if (statusText !== undefined) detail.status_text = statusText;
+    try {
+      const name = pi.getSessionName?.();
+      if (typeof name === "string" && name) detail.session_name = cap(name, 200);
+      const leaf = ctx?.sessionManager?.getLeafId?.();
+      if (typeof leaf === "string" && leaf) detail.leaf_id = cap(leaf, 64);
+    } catch {}
     const fits = () => Buffer.byteLength(JSON.stringify(detail), "utf8") <= detailBudgetBytes;
     const head = dialogs[0];
     if (head) {
@@ -1742,6 +1797,15 @@ export default function (pi) {
         return answerDialog(ctx, actionId, args, finish, refuse, rest);
       case "command":
         return runCommand(args, finish, refuse, rest);
+      case "rename":
+        return renameSession(args.title, finish, refuse, rest);
+      case "label":
+        return labelEntry(ctx, args, finish, refuse, rest);
+      case "tree":
+      case "fork":
+      case "new_session":
+      case "switch_session":
+        return changeSession(ctx, request.op, args, finish, refuse, rest);
       case "set_service_tier": {
         const { family, tier } = args;
         if (typeof family !== "string" || !Object.hasOwn(SERVICE_TIERS, family)) {
@@ -1840,7 +1904,7 @@ export default function (pi) {
         .join(""),
     );
     // While an `ask` dialog is open, OMP sends every key but Esc to a person's unfinished draft.
-    if (head.kind === "ask" && !cancel) {
+    if (head.kind === "ask" && !cancel && editorIsReal(ctx)) {
       const draft = ctx?.ui?.getEditorText?.() ?? "";
       if (draft && PASTE_MARKER.test(draft)) {
         return refuse("draft_open: the person's draft holds a collapsed paste; it must be sent or cleared first");
@@ -2047,15 +2111,18 @@ export default function (pi) {
     return rest;
   }
 
-  // `name` is the only session command that 18.4.4 lets an extension run without driving the
-  // editor (session changes need a command handler, and an editor submit can reach a picker).
+  // `command name` is kept for callers from before the `rename` op.
   function runCommand(args: any, finish: any, refuse: any, rest: any) {
     const name = args.name;
     const sub = args.args && typeof args.args === "object" ? args.args : {};
     if (name !== "name") return refuse(`unsupported_op: command ${cap(name, 40)}`);
-    const title = sub.title;
+    return renameSession(sub.title, finish, refuse, rest);
+  }
+
+  // As `/rename <title>`: a user title, which stops OMP's automatic titles.
+  function renameSession(title: unknown, finish: any, refuse: any, rest: any) {
     if (!isOneLine(title, 200)) {
-      return refuse("invalid_args: name needs a one-line title of at most 200 characters");
+      return refuse("invalid_args: rename needs a one-line title of at most 200 characters");
     }
     Promise.resolve(pi.setSessionName(title.trim())).then(
       () => finish({ ok: true, data: { name: title.trim() } }),
@@ -2063,6 +2130,1337 @@ export default function (pi) {
     );
     return rest;
   }
+
+  // The root session and its command context (what a `/command` handler gets), reached through
+  // OMP's agent registry. Only when they belong to this binding (a task subagent has its own
+  // session manager) and OMP runs its TUI: elsewhere the command context's session methods do
+  // nothing and report success.
+  function rootCommandSession(ctx: any): { session: any; cc: any } | undefined {
+    if (ctx?.mode !== "tui" || ctx?.hasUI !== true) return undefined;
+    try {
+      const session = pi.pi?.AgentRegistry?.global?.()?.get?.(pi.pi?.MAIN_AGENT_ID)?.session;
+      if (!session || !ctx.sessionManager || session.sessionManager !== ctx.sessionManager) return undefined;
+      const cc = session.extensionRunner?.createCommandContext?.();
+      return cc ? { session, cc } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Why a session change may not run now: herdr never aborts a turn or acts past an open dialog.
+  function sessionChangeBlocked(ctx: any, session: any): string | undefined {
+    const dialog = dialogs[0];
+    if (dialog) return `dialog_open: ${dialog.kind} ${dialog.id} is open; it must be answered first`;
+    if (session.isSessionTransitioning === true) return "transitioning: OMP is changing its session now; retry when it ends";
+    if (ctx?.isIdle?.() !== true || agentActive || compacting || answering || ctx?.hasPendingMessages?.() === true) {
+      return "busy: the agent is working; retry when it is idle";
+    }
+    return undefined;
+  }
+
+  function labelEntry(ctx: any, args: any, finish: any, refuse: any, rest: any) {
+    const id = args.entry_id;
+    if (typeof id !== "string" || !id || id.length > 128) return refuse("invalid_args: label needs entry_id");
+    const clear = args.clear === true;
+    if (clear === (args.text !== undefined) || (!clear && !isOneLine(args.text, 200))) {
+      return refuse("invalid_args: label needs text (one line, 1-200 characters) or clear: true");
+    }
+    const access = rootCommandSession(ctx);
+    if (!access) return refuse("unsupported_mode: OMP runs no TUI session herdr can reach");
+    const manager = access.session.sessionManager;
+    if (!manager.getEntry?.(id)) return refuse(`no_entry: ${cap(id, 128)} is not an entry of this session`);
+    const label = clear ? undefined : args.text.trim();
+    try {
+      manager.appendLabelChange(id, label);
+    } catch (error) {
+      return refuse(`failed: ${cap(error?.message ?? error, 200)}`);
+    }
+    finish({ ok: true, data: { entry_id: id, label: label ?? null } });
+    return rest;
+  }
+
+  // The `cwd` in a session file's header, or undefined when it is not a session file.
+  async function sessionFileCwd(file: string): Promise<string | undefined> {
+    let handle: any;
+    try {
+      // No symlink, and no wait on a FIFO swapped in; the type is checked on the open file.
+      handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      if (!(await handle.stat()).isFile()) return undefined;
+      const buffer = Buffer.alloc(64 * 1024);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      // OMP 18.6 writes a padded title slot before the header once a session has a name.
+      for (const line of buffer.toString("utf8", 0, bytesRead).split("\n", 3)) {
+        const entry = JSON.parse(line);
+        if (entry?.type === "session") return typeof entry.cwd === "string" ? entry.cwd : undefined;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    } finally {
+      await handle?.close?.().catch?.(() => {});
+    }
+  }
+
+  // Whether the leaf already is where a move to `entryId` would put it: the leaf, past entries
+  // that are not conversation (herdr's own markers, labels, OMP's exit records), is that entry,
+  // or one of those markers records a herdr move to it.
+  function alreadyAt(manager: any, entryId: string): boolean {
+    let id = manager.getLeafId?.();
+    for (let step = 0; id && step < 64; step += 1) {
+      // OMP moves a user message target's leaf to its parent, so a leaf on it is not there yet.
+      if (id === entryId) return manager.getEntry?.(id)?.message?.role !== "user";
+      const entry = manager.getEntry?.(id);
+      if (entry?.type === "custom" && entry.customType === "herdr-leaf" && entry.data?.entry_id === entryId) return true;
+      if (entry?.type !== "custom" && entry?.type !== "label") return false;
+      id = entry.parentId;
+    }
+    return false;
+  }
+
+  // `tree`, `fork`, `new_session`, `switch_session`: OMP's own session changes, run through the
+  // command context (never the editor) while the agent is idle. The result follows herdr's
+  // registration of the session OMP runs afterwards, so the caller's next write can name it.
+  function changeSession(ctx: any, op: string, args: any, finish: any, refuse: any, rest: any) {
+    const entryId = args.entry_id;
+    if (entryId !== undefined && (typeof entryId !== "string" || !entryId || entryId.length > 128)) {
+      return refuse("invalid_args: entry_id must be an entry id");
+    }
+    if (op === "tree") {
+      if (entryId === undefined) return refuse("invalid_args: tree needs entry_id");
+      if (args.summarize !== undefined && typeof args.summarize !== "boolean") {
+        return refuse("invalid_args: summarize must be true or false");
+      }
+      if (args.label !== undefined && !isOneLine(args.label, 200)) {
+        return refuse("invalid_args: label must be one line of 1-200 characters");
+      }
+    }
+    const target = args.session_path;
+    if (op === "switch_session" && (!isAbsoluteSessionPath(target) || !target.endsWith(".jsonl") || target.length > 4096)) {
+      return refuse("invalid_args: switch_session needs an absolute session_path ending in .jsonl");
+    }
+    const access = rootCommandSession(ctx);
+    if (!access) return refuse("unsupported_mode: OMP runs no TUI session herdr can reach");
+    const { session, cc } = access;
+    const manager = session.sessionManager;
+    const blocked = sessionChangeBlocked(ctx, session);
+    if (blocked) return refuse(blocked);
+    if (entryId !== undefined) {
+      const entry = manager.getEntry?.(entryId);
+      if (!entry || (op === "fork" && entry.type !== "message")) {
+        return refuse(`no_entry: ${cap(entryId, 128)} is not ${op === "fork" ? "a message" : "an entry"} of this session`);
+      }
+    }
+    const previous = manager.getSessionFile?.();
+    const editorWasEmpty = !ctx?.ui?.getEditorText?.();
+    const sessionData = () => {
+      const file = manager.getSessionFile?.();
+      return {
+        ...(isAbsoluteSessionPath(file) ? { session_path: file } : {}),
+        session_id: manager.getSessionId?.(),
+      };
+    };
+    // A change that ended without a session event leaves the listener OMP dropped (or herdr's
+    // withdrawal) in place: register again now instead of after the settle wait. A change that
+    // ended with one has registered already.
+    const restore = async () => {
+      if (instructionListener) return;
+      clearInterval(withdrawalWatch);
+      withdrawalWatch = undefined;
+      registerInstructionListener(ctx);
+      await reportSession();
+    };
+    const settled = async () => {
+      const until = Date.now() + 10_000;
+      while (registeredSessionKey !== currentSessionKey() && Date.now() < until) {
+        await delay(20);
+      }
+    };
+    const summarizing = op === "tree" && args.summarize === true;
+    // The hold lasts until the held prompts are replayed (see `endHold`), not until the change
+    // itself ends: after the swap herdr still waits for the new session to register, for its own
+    // ack, and only then sends the held words. An Enter in that gap would otherwise submit them as
+    // a message of its own, and the replay would send the prompt again.
+    let hold: SessionHold | undefined;
+    const endHold = () => {
+      const ending = hold;
+      hold = undefined;
+      if (!ending) return;
+      // A change that started meanwhile owns the hold and its status now.
+      const owned = sessionHold === ending;
+      if (owned) sessionHold = undefined;
+      try {
+        if (owned) ctx?.ui?.setStatus?.(HOLD_STATUS_KEY, undefined);
+        if (ending.held) ctx?.ui?.notify?.("herdr kept your prompt in the editor during a session change; press Enter to send it", "info");
+        if (ending.retryIgnored) ctx?.ui?.notify?.("herdr ignored the retry key during a session change; press it again", "info");
+      } catch {}
+    };
+    const run = async (): Promise<{ ok: boolean; error?: string; data?: Record<string, unknown> }> => {
+      if (op === "switch_session") {
+        const dir = isAbsoluteSessionPath(previous) ? path.dirname(previous) : undefined;
+        if (target === previous) return { ok: false, error: "already_current: OMP runs that session now" };
+        if (dir === undefined || path.dirname(target) !== dir) {
+          return { ok: false, error: "not_same_project: session_path must be in the current session's directory" };
+        }
+        const cwd = await sessionFileCwd(target);
+        if (cwd === undefined) return { ok: false, error: "no_session_file: session_path is not a readable OMP session file" };
+        if (cwd !== manager.getCwd?.()) {
+          return { ok: false, error: "not_same_project: that session belongs to another directory" };
+        }
+        // The file read awaited: the agent may have started a turn meanwhile.
+        const late = sessionChangeBlocked(ctx, session);
+        if (late) return { ok: false, error: late };
+      }
+      const current: SessionHold = { session, summarizing, held: false, retryIgnored: false, personSubmitted: false };
+      hold = current;
+      // The terminal UI, so the key hold can see which component has focus.
+      captureTui(ctx);
+      if (!tuiRef && !focusNoticeShown) {
+        // The key hold needs OMP's focus; without it the editor's submit keys are held whatever has
+        // focus. Say so once, because a change of OMP's widget API would otherwise go unseen.
+        focusNoticeShown = true;
+        try {
+          ctx?.ui?.notify?.(
+            "herdr cannot read OMP's focus; during its session changes it holds Enter on . and c and the retry keys whatever has focus",
+            "warning",
+          );
+        } catch {}
+      }
+      sessionHold = current;
+      try {
+        ctx?.ui?.setStatus?.(
+          HOLD_STATUS_KEY,
+          summarizing
+            ? "herdr: summarizing the branch; a prompt you send waits, Esc cancels"
+            : "herdr: changing the session; a prompt you send waits",
+        );
+      } catch {}
+      let cancelled = false;
+      const data: Record<string, unknown> = {};
+      try {
+        if (op === "tree") {
+          if (alreadyAt(manager, entryId)) {
+            // The leaf is where a herdr move to this entry put it: moving again would only add
+            // a marker, and a summary of nothing.
+            if (args.label !== undefined) manager.appendLabelChange(entryId, args.label.trim());
+          } else {
+            cancelled = (await cc.navigateTree(entryId, { summarize: summarizing }))?.cancelled === true;
+            if (!cancelled) {
+              const leaf = manager.getLeafId?.();
+              const summarized = leaf ? manager.getEntry?.(leaf)?.type === "branch_summary" : false;
+              if (summarized) data.summary_entry_id = leaf;
+              // OMP restores the leaf from the last entry in the file: only an entry written now
+              // keeps the move across a restart.
+              if (args.label !== undefined) manager.appendLabelChange(entryId, args.label.trim());
+              else if (!summarized) pi.appendEntry("herdr-leaf", { entry_id: entryId });
+            }
+          }
+          if (!cancelled) {
+            data.entry_id = entryId;
+            data.leaf_id = manager.getLeafId?.();
+            // OMP puts a user message target into an empty editor; text the person typed during
+            // the change is not that.
+            const entry = manager.getEntry?.(entryId);
+            const text = entry?.type === "message" && entry.message?.role === "user" ? messageText(entry.message.content) : undefined;
+            data.editor_filled = editorWasEmpty && text !== undefined && ctx?.ui?.getEditorText?.()?.trim() === text.trim();
+          }
+        } else if (op === "fork") {
+          cancelled = (await session.fork(entryId, { requireIdle: true })) !== true;
+          // A fork at an entry swaps the session without redrawing it. The fork stands even when
+          // the redraw fails.
+          if (!cancelled && entryId !== undefined) {
+            try {
+              await cc.reload();
+            } catch {
+              data.redraw_failed = true;
+            }
+          }
+        } else if (op === "new_session") {
+          cancelled = (await cc.newSession())?.cancelled === true;
+        } else {
+          cancelled = (await cc.switchSession(target))?.cancelled === true;
+        }
+      } catch (error) {
+        await restore();
+        const busy = error?.name === "SessionBusyError";
+        return {
+          ok: false,
+          error: busy ? "busy: the agent is working; retry when it is idle" : `failed: ${cap(error?.message ?? error, 200)}`,
+        };
+      }
+      if (cancelled) {
+        await restore();
+        if (current.personSubmitted) {
+          return { ok: false, error: "busy: a prompt was submitted as the change started; the session did not change" };
+        }
+        if (current.signal?.aborted) return { ok: false, error: "cancelled: the person pressed Esc during the summary; the leaf did not move" };
+        return { ok: false, error: "cancelled: another extension cancelled the change; the session did not change" };
+      }
+      await restore();
+      await settled();
+      Object.assign(data, sessionData());
+      if (op !== "tree" && isAbsoluteSessionPath(previous)) data.previous_session_path = previous;
+      return { ok: true, data };
+    };
+    void (async () => {
+      let result: { ok: boolean; error?: string; data?: Record<string, unknown> };
+      try {
+        result = await run();
+      } catch (error: any) {
+        // Nothing may leave the hold set, or the caller without an answer.
+        result = { ok: false, error: `failed: ${cap(error?.message ?? error, 200)}` };
+      }
+      try {
+        await finish(result);
+      } finally {
+        // The held prompts go out while the hold still stands, and the hold ends the moment they
+        // are sent: no Enter can fall between the change and the replay.
+        try {
+          replayHeld(ctx);
+        } finally {
+          endHold();
+        }
+      }
+    })();
+    return rest;
+  }
+
+  // A session change herdr started and is running now. A prompt the person submits meanwhile
+  // would go to the session or branch the change is leaving (a summary model call runs before
+  // the move; other extensions' switch handlers run before the swap). OMP's `input` event holds
+  // it (see the handler below), so every key still reaches whatever has focus, a dialog included.
+  // Esc stops a branch summary, as in OMP's own `/tree`.
+  type SessionHold = {
+    session: any;
+    summarizing: boolean;
+    // The summary's abort signal, from OMP's `session_before_tree`.
+    signal?: AbortSignal;
+    // A text prompt went back into the editor.
+    held: boolean;
+    // A retry key was ignored.
+    retryIgnored: boolean;
+    personSubmitted: boolean;
+  };
+  let sessionHold: SessionHold | undefined;
+
+  // OMP's terminal UI. Extensions get it only as the first argument of a widget factory, so a
+  // widget that renders nothing is set and removed at once to read it.
+  let tuiRef: any;
+  function captureTui(ctx: any) {
+    if (tuiRef) return;
+    const key = "herdr-focus-probe";
+    try {
+      ctx?.ui?.setWidget?.(
+        key,
+        (tui: any) => {
+          if (typeof tui?.getFocused === "function") tuiRef = tui;
+          return { render: () => [], invalidate: () => {} };
+        },
+        { placement: "belowEditor" },
+      );
+      ctx?.ui?.setWidget?.(key, undefined);
+    } catch {}
+  }
+
+  let focusNoticeShown = false;
+
+  // Which component has keyboard focus: OMP's core editor (the component the input controller gave
+  // its retry and dequeue handlers), anything else (a dialog, a selector, an overlay), or unknown
+  // when the terminal UI could not be read.
+  function focusState(): "editor" | "other" | "unknown" {
+    if (!tuiRef) return "unknown";
+    try {
+      const focused = tuiRef.getFocused?.();
+      return typeof focused?.onRetry === "function" && typeof focused?.onDequeue === "function" ? "editor" : "other";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  // The raw keys the `input` event cannot see, and only while OMP's core editor has focus: Esc
+  // during a summary, OMP's retry keys, and an Enter that would submit a continue shortcut (`.` or
+  // `c`, typed, or pasted with the Enter in one read), which starts a turn before the input event.
+  function holdKey(ctx: any, data: string) {
+    const hold = sessionHold;
+    if (!hold) return undefined;
+    if (ESCAPE_KEY.test(data)) {
+      const signal = hold.signal;
+      if (!hold.summarizing || !signal || signal.aborted) return undefined;
+      // Esc belongs to whatever has focus: a dialog keeps its own, and an unreadable focus is not
+      // taken for the editor's.
+      if (focusState() !== "editor") return undefined;
+      try {
+        hold.session.abortBranchSummary?.();
+      } catch {}
+      // Only while OMP's summarizer runs does the abort take; any other Esc is the editor's.
+      return signal.aborted ? { consume: true } : undefined;
+    }
+    const retry = RETRY_KEY.test(data);
+    const paste = PASTE_THEN_ENTER.exec(data);
+    if (!retry && !paste && !BARE_ENTER.test(data)) return undefined;
+    // The submit path fails closed: with the focus unreadable the keys are held (a held Enter is
+    // never lost: the text stays in the editor).
+    if (focusState() === "other") return undefined;
+    if (retry) {
+      hold.retryIgnored = true;
+      return { consume: true };
+    }
+    let draft: unknown;
+    try {
+      draft = ctx?.ui?.getEditorText?.();
+    } catch {}
+    if (typeof draft !== "string") return undefined;
+    const text = (draft + (paste?.[1] ?? "")).trim();
+    if (text !== "." && text !== "c") return undefined;
+    hold.held = true;
+    // The paste reaches the editor; the Enter does not.
+    return paste ? { data: data.slice(0, data.lastIndexOf("\x1b[201~") + "\x1b[201~".length) } : { consume: true };
+  }
+
+  // Prompts with images submitted during a change, oldest first. OMP cleared the editor and cannot
+  // take images back, so herdr keeps them: in memory, and in a spool file beside the session in
+  // case OMP exits before the change ends. Their words are also back in the editor while the change
+  // runs, so OMP's own draft save keeps those. The words leave the editor when the prompts are sent
+  // (the spool is the one copy from then on), so a draft saved after that never holds them next to
+  // a message OMP writes. A normal end sends them once, as one message, and removes the spool.
+  //
+  // The spool is never replaced blindly: a spool that is already in the session's directory (an
+  // earlier OMP exited during a change and nobody reopened the session) keeps its prompts. They go
+  // first in the file, and after the send they are put back in the editor, never sent.
+  type HeldPrompt = { text: string; images: any[]; savedAt: number };
+  type SpoolPrompt = { text: string; images: string[]; savedAt: number };
+  let heldReplays: HeldPrompt[] = [];
+  const SPOOL_NAME = "herdr-held-prompt.json";
+  // A process that finds another live process's fresh spool at SPOOL_NAME writes its own beside it,
+  // as herdr-held-prompt.<pid>.json, so neither replaces the other's.
+  const SPOOL_FILE = /^herdr-held-prompt(?:\.\d+)?\.json$/;
+  const SPOOL_TEMPORARY = /^herdr-held-prompt(?:\.\d+)?\.json\.(\d+)\.\d+\.tmp$/;
+  // A spool whose writer still runs and wrote it this recently belongs to that process's change.
+  const spoolLiveMs = 10 * 60_000;
+  // How long to look again for a spool a running OMP wrote.
+  const spoolPollMs = 10_000;
+  // How long a pasted image path may take to become a chip in OMP's editor.
+  const chipWaitMs = 8000;
+  const IMAGE_EXTENSIONS: Record<string, string> = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+  };
+  // OMP's `[Image #N, WxH]` markers, which number a prompt's own images.
+  const IMAGE_MARKER = /\[(?:Image|Video) #[1-9]\d*(?:,[^\]\n]*)?\](?: attachment:\/\/\d+)?/g;
+  // What a chip or a collapsed paste looks like in the editor's text (an icon, then `#N`).
+  const EDITOR_CHIP = /[\p{So}\p{Sk}]\s?#\d+|\[Paste #\d+/u;
+  // Files herdr wrote for held images that have no file of their own (a pasted clipboard image).
+  const heldImageFiles = new WeakMap<object, string>();
+  // The spool this process wrote, and the prompts that were already in that very file.
+  let heldSpool: { file: string; inherited: SpoolPrompt[]; id?: string } | undefined;
+  // While herdr has not accepted the report of the session OMP changed to: the second copy of the
+  // spool, in the directory of the session herdr has registered (the one a restart resumes).
+  let heldTwin: { file: string; inherited: SpoolPrompt[] } | undefined;
+  // The artifact directory of the session herdr last accepted a report for.
+  let registeredArtifacts: string | undefined;
+  let spoolQueue: Promise<void> = Promise.resolve();
+  let spoolWarned = false;
+  let spoolWrites = 0;
+  let spoolRestoreTimer: ReturnType<typeof setTimeout> | undefined;
+  let spoolCheckedFor: string | undefined;
+
+  // OMP's editor is real only in its terminal UI. In RPC (and print) mode `ui` is a stand-in: reads
+  // return "" and writes are lines for a host, so nothing herdr puts there reaches a person and
+  // nothing it reads there is the person's. Every path that reads or writes the editor asks.
+  function editorIsReal(ctx: any): boolean {
+    return ctx?.mode === "tui" && ctx?.hasUI === true;
+  }
+
+  // The text of a held prompt as the person typed it. OMP wrote each chip as its `[Image #N, WxH]`
+  // marker plus the one space it puts after a chip; cutting exactly those leaves every other
+  // space, tab and newline as typed.
+  const MARKER_AND_SPACE = new RegExp(`${IMAGE_MARKER.source} ?`, "g");
+  function typedText(text: string): string {
+    return text.replace(MARKER_AND_SPACE, "");
+  }
+
+  // The same without the whitespace at the ends (OMP trims a submitted prompt, and its draft save
+  // may too), for finding a prompt's words in the editor.
+  function wordsOf(text: string): string {
+    return typedText(text).trim();
+  }
+
+  // The markers of the images of a prompt that follows `offset` earlier images.
+  function shiftMarkers(text: string, offset: number, count: number): string {
+    if (offset === 0) return text;
+    return text.replace(/\[(Image|Video) #([1-9]\d*)((?:,[^\]\n]*)?)\]/g, (marker, kind, number, tail) =>
+      Number(number) > count ? marker : `[${kind} #${Number(number) + offset}${tail}]`,
+    );
+  }
+
+  function artifactsDir(ctx: any): string | undefined {
+    try {
+      const dir = ctx?.sessionManager?.getArtifactsDir?.();
+      return typeof dir === "string" && path.isAbsolute(dir) ? dir : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // The person's own file behind an image, when OMP tagged one (the symbol property
+  // `image.attachmentSource`): an absolute path to an image.
+  // A `local://` source (OMP keeps a pasted clipboard image in the session's own `local` directory
+  // beside its artifacts) is that file, so herdr makes no copy of it.
+  function imageSourcePath(image: any, artifacts?: string): string | undefined {
+    for (const symbol of Object.getOwnPropertySymbols(image ?? {})) {
+      if (symbol.description !== "image.attachmentSource") continue;
+      const source = image[symbol];
+      if (source?.kind !== "image" || typeof source.path !== "string") continue;
+      if (path.isAbsolute(source.path)) return source.path;
+      if (artifacts && source.path.startsWith("local://")) {
+        const root = path.resolve(artifacts, "local");
+        const file = path.resolve(root, source.path.slice("local://".length));
+        if (file.startsWith(root + path.sep)) return file;
+      }
+    }
+    return undefined;
+  }
+
+  async function isFile(file: string): Promise<boolean> {
+    return stat(file).then((info) => info.isFile(), () => false);
+  }
+
+  function processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error: any) {
+      return error?.code === "EPERM";
+    }
+  }
+
+  function ageText(ms: number): string {
+    const seconds = Math.max(0, Math.round(ms / 1000));
+    if (seconds < 90) return `${seconds} s`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 90) return `${minutes} min`;
+    const hours = Math.round(minutes / 60);
+    return hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`;
+  }
+
+  // A private copy of an image that has no file of its own, in the session's artifact directory.
+  async function saveHeldImage(dir: string, image: any): Promise<string | undefined> {
+    const extension = IMAGE_EXTENSIONS[image?.mimeType];
+    if (!extension || typeof image.data !== "string" || image.data.startsWith("blob:")) return undefined;
+    const file = path.join(dir, `herdr-held-${crypto.randomUUID()}.${extension}`);
+    await writeFile(file, Buffer.from(image.data, "base64"), { flag: "wx", mode: 0o600 });
+    heldImageFiles.set(image, file);
+    return file;
+  }
+
+  // Replaces `file` whole: a 0600 temporary file in the same directory, flushed to disk, then
+  // renamed over it, so an exit leaves the old content or the new one. The temporary file goes on
+  // every error path.
+  async function writeAtomic(file: string, content: string): Promise<void> {
+    spoolWrites += 1;
+    const temporary = `${file}.${process.pid}.${spoolWrites}.tmp`;
+    try {
+      const handle = await open(temporary, "w", 0o600);
+      try {
+        await handle.writeFile(content);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(temporary, file);
+    } catch (error) {
+      await unlink(temporary).catch(() => {});
+      throw error;
+    }
+  }
+
+  type SpoolPrompts = { prompts: SpoolPrompt[] };
+  // `id` names a spool written as two copies (see `writeSpool`); `twin` is the other copy, and
+  // `keep` the prompts that stay in it when this copy is restored.
+  type SpoolTwin = { file: string; keep: SpoolPrompt[] };
+  type SpoolMeta = { id: string; twin?: SpoolTwin };
+  type SpoolItem = SpoolPrompts & { file: string; id?: string; twin?: SpoolTwin };
+  type SpoolRead =
+    | { state: "none" | "unreadable" | "corrupt" | "unverified" }
+    | { state: "ok"; prompts: SpoolPrompt[]; pid: number | undefined; savedAt: number; id?: string; twin?: SpoolTwin };
+
+  // What a spool may hold, at most. A person submits a held prompt in the few seconds of a session
+  // change (a branch summary can take a minute or two), so these are far above any real use; the
+  // writer refuses what the reader would refuse.
+  const SPOOL_MAX_PROMPTS = 50;
+  const SPOOL_MAX_IMAGES = 50;
+  const SPOOL_MAX_TEXT = 1_000_000;
+  const SPOOL_MAX_BYTES = 16 * 1024 * 1024;
+
+  function withinSpoolCaps(list: { text: string; images: unknown[] }[]): boolean {
+    return list.length <= SPOOL_MAX_PROMPTS && list.every((prompt) => prompt.text.length <= SPOOL_MAX_TEXT && prompt.images.length <= SPOOL_MAX_IMAGES);
+  }
+
+  // The key that signs spool files. A spool is read back as the person's prompt, with image files
+  // named in it put in the editor, so only a file this integration wrote may stand for one: a file
+  // planted beside a session (a session directory shared or synced from elsewhere, or anything else
+  // that writes there) has no signature made with this user's key. The key is 32 random bytes in a
+  // 0600 file made the first time a spool is written, in herdr's configuration directory
+  // (`HERDR_OMP_SPOOL_KEY_FILE` names another file).
+  let spoolKeyCache: Buffer | undefined;
+  // What a key file holds: the key, "missing", "invalid" (a file or directory that is not a key:
+  // empty, cut short, damaged) or "unreadable" (permissions and the like).
+  async function readSpoolKey(file: string): Promise<Buffer | "missing" | "invalid" | "unreadable"> {
+    try {
+      const text = (await readFile(file, "utf8")).trim();
+      return /^[0-9a-f]{64}$/.test(text) ? Buffer.from(text, "hex") : "invalid";
+    } catch (error: any) {
+      return error?.code === "ENOENT" ? "missing" : error?.code === "EISDIR" ? "invalid" : "unreadable";
+    }
+  }
+
+  // The key file once a process that is still writing it has had its time: a file made a moment ago
+  // is empty until its key is written.
+  async function settledSpoolKey(file: string): Promise<Buffer | "missing" | "invalid" | "unreadable"> {
+    let found = await readSpoolKey(file);
+    for (let attempt = 0; attempt < 5 && found === "invalid"; attempt += 1) {
+      await delay(20);
+      found = await readSpoolKey(file);
+    }
+    return found;
+  }
+
+  // The key, made when `create` and there is none. A key file that stays something else than a key
+  // (a crash between creating it and writing it, damage, a directory) is set aside, never deleted,
+  // and replaced on the next spool write; a notice names both files. A spool signed with the old
+  // key is then set aside as unverified, with its own notice.
+  async function spoolKey(create: boolean): Promise<Buffer | undefined> {
+    if (spoolKeyCache) return spoolKeyCache;
+    const file =
+      process.env.HERDR_OMP_SPOOL_KEY_FILE || path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "herdr", "omp-spool.key");
+    let found = await settledSpoolKey(file);
+    if (found instanceof Buffer) return (spoolKeyCache = found);
+    if (!create || found === "unreadable") return undefined;
+    try {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      if (found === "invalid") {
+        // Looked at once more: another process may have replaced it since.
+        const again = await readSpoolKey(file);
+        if (again instanceof Buffer) return (spoolKeyCache = again);
+        if (again === "invalid") {
+          const aside = `${file}.invalid-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+          await rename(file, aside);
+          try {
+            detailCtx?.ui?.notify?.(
+              `herdr found its held-prompt key file ${file} empty or damaged, kept it as ${aside}, and made a new key; a held prompt saved with the old key is set aside, not put in the editor`,
+              "warning",
+            );
+          } catch {}
+        }
+      }
+      await writeFile(file, `${randomBytes(32).toString("hex")}\n`, { flag: "wx", mode: 0o600 });
+    } catch (error: any) {
+      // Another process made the key first: its key is the one.
+      if (error?.code !== "EEXIST") return undefined;
+    }
+    found = await settledSpoolKey(file);
+    return found instanceof Buffer ? (spoolKeyCache = found) : undefined;
+  }
+
+  // What the signature covers: every field of a spool but the signature, in a fixed order, and
+  // where the spool lies: its session (the name of the artifact directory carries the session id,
+  // and a move keeps it) and its own file name. A spool copied into another session, or under
+  // another name, does not verify.
+  function spoolSignedText(spool: any, file: string): string {
+    const prompt = (item: any) => [item.text, item.images, item.savedAt ?? null];
+    const twin = spool.twin ? [spool.twin.file, spool.twin.keep.map(prompt)] : null;
+    return JSON.stringify([path.basename(path.dirname(file)), path.basename(file), spool.pid ?? null, spool.savedAt ?? null, spool.id ?? null, twin, spool.sources ?? [], spool.prompts.map(prompt)]);
+  }
+
+  function spoolSignature(key: Buffer, spool: any, file: string): string {
+    return createHmac("sha256", key).update(spoolSignedText(spool, file)).digest("hex");
+  }
+
+  // Whether `file` is inside `root`, by name.
+  function pathInside(root: string, file: string): boolean {
+    const relative = path.relative(root, path.resolve(file));
+    return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+  }
+
+  // An image of a spool, if it may be put in the editor: one of OMP's session files (the project's
+  // sessions directory is two levels above the spool: `<sessions>/<session>/<spool>`) or one of the
+  // person's own files, as recorded when the prompt was held (`sources`). Anything else is gone.
+  function spoolImage(file: string, sources: string[], image: string): string {
+    if (!path.isAbsolute(image) || image.length > 4096 || image.includes("\0")) return "";
+    return pathInside(path.dirname(path.dirname(file)), image) || sources.includes(image) ? image : "";
+  }
+
+  // The prompts of a spool's `prompts` array, or undefined when one of them is not valid or the
+  // list is over the caps. `image` says which images stay.
+  function parseSpoolPrompts(list: unknown, fallback: number, image: (image: string) => string): SpoolPrompt[] | undefined {
+    if (!Array.isArray(list)) return undefined;
+    const sane = (time: unknown): number => (typeof time === "number" && time > 1e12 && time <= Date.now() + 60_000 ? time : fallback);
+    const prompts: SpoolPrompt[] = [];
+    for (const prompt of list) {
+      const record = recordOf(prompt);
+      if (typeof record.text !== "string" || !Array.isArray(record.images)) return undefined;
+      if (record.images.some((value: unknown) => typeof value !== "string")) return undefined;
+      // An image that may not go back stays a blank place, so the prompt's other images keep
+      // their markers; it is counted among the images that are gone.
+      prompts.push({ text: record.text, images: (record.images as string[]).map(image), savedAt: sane(record.savedAt) });
+    }
+    return withinSpoolCaps(prompts) ? prompts : undefined;
+  }
+
+  // What a spool file holds. A file that is not a spool this code wrote and can read in full is
+  // `corrupt` (a link, too big, not valid, over the caps) or `unverified` (no signature
+  // of this user's key), so nothing in it is dropped without a word and nothing planted is
+  // believed; one that cannot be read at all is `unreadable`.
+  async function readSpool(file: string): Promise<SpoolRead> {
+    let raw: string;
+    let mtime: number;
+    try {
+      // Looked at without following a link, and before it is read: a link, a FIFO or a huge file
+      // named like a spool must not make the restore follow it or wait on it. A link is set aside
+      // itself (its target stays as it is), a file of another kind is left alone.
+      const info = await lstat(file);
+      if (info.isSymbolicLink() || (info.isFile() && info.size > SPOOL_MAX_BYTES)) return { state: "corrupt" };
+      if (!info.isFile()) return { state: "unreadable" };
+      mtime = info.mtimeMs;
+      raw = await readFile(file, "utf8");
+    } catch (error: any) {
+      return { state: error?.code === "ENOENT" ? "none" : "unreadable" };
+    }
+    let spool: any;
+    try {
+      spool = JSON.parse(raw);
+    } catch {
+      return { state: "corrupt" };
+    }
+    if (!Array.isArray(spool?.prompts)) return { state: "corrupt" };
+    const key = await spoolKey(false);
+    let signed = false;
+    try {
+      const expected = key && typeof spool.sig === "string" ? Buffer.from(spoolSignature(key, spool, file), "hex") : undefined;
+      const given = Buffer.from(typeof spool.sig === "string" ? spool.sig : "", "hex");
+      signed = expected !== undefined && expected.length === given.length && timingSafeEqual(expected, given);
+    } catch {}
+    if (!signed) return { state: "unverified" };
+    // A save time that cannot be one is the file's modification time.
+    const sane = (time: unknown, fallback: number): number =>
+      typeof time === "number" && time > 1e12 && time <= Date.now() + 60_000 ? time : fallback;
+    const savedAt = sane(spool.savedAt, mtime);
+    const sources = Array.isArray(spool.sources) ? spool.sources.filter((source: unknown): source is string => typeof source === "string") : [];
+    const image = (value: string) => spoolImage(file, sources, value);
+    const prompts = parseSpoolPrompts(spool.prompts, savedAt, image);
+    if (!prompts) return { state: "corrupt" };
+    // The twin is a hint for the restore: one that is not valid is left out.
+    const twinRecord = recordOf(spool.twin);
+    const keep = parseSpoolPrompts(twinRecord.keep, savedAt, image);
+    const twin =
+      typeof spool.id === "string" && typeof twinRecord.file === "string" && path.isAbsolute(twinRecord.file) && keep
+        ? { file: twinRecord.file, keep }
+        : undefined;
+    return {
+      state: "ok",
+      prompts,
+      pid: typeof spool.pid === "number" ? spool.pid : undefined,
+      savedAt,
+      id: typeof spool.id === "string" ? spool.id : undefined,
+      twin,
+    };
+  }
+
+  async function writeSpoolFile(file: string, prompts: SpoolPrompt[], meta?: SpoolMeta): Promise<void> {
+    const key = await spoolKey(true);
+    if (!key) throw new Error("no key to sign the spool with");
+    if (!withinSpoolCaps(prompts) || !withinSpoolCaps(meta?.twin?.keep ?? [])) throw new Error("too many held prompts, images or words");
+    // The person's own image files: the ones outside OMP's session directories.
+    const root = path.dirname(path.dirname(file));
+    const sources = [...new Set([...prompts, ...(meta?.twin?.keep ?? [])].flatMap((prompt) => prompt.images).filter((image) => image && !pathInside(root, image)))];
+    const spool: any = { v: 3, pid: process.pid, savedAt: Date.now(), ...meta, sources, prompts };
+    spool.sig = spoolSignature(key, spool, file);
+    const text = JSON.stringify(spool);
+    if (Buffer.byteLength(text) > SPOOL_MAX_BYTES) throw new Error("the spool is too big");
+    await writeAtomic(file, text);
+  }
+
+  function warnOnce(ctx: any, text: string) {
+    if (spoolWarned) return;
+    spoolWarned = true;
+    try {
+      ctx?.ui?.notify?.(text, "warning");
+    } catch {}
+  }
+
+  // Sets a spool that cannot be read in full, or that this integration did not write, aside where
+  // the person can find it (it is not put in the editor). Returns whether it is out of the way.
+  async function setSpoolAside(ctx: any, file: string, reason: "corrupt" | "unverified" = "corrupt"): Promise<boolean> {
+    const aside = path.join(path.dirname(file), `herdr-held-prompt.${reason}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.json`);
+    try {
+      await rename(file, aside);
+    } catch {
+      return false;
+    }
+    try {
+      ctx?.ui?.notify?.(
+        reason === "unverified"
+          ? `herdr found a held prompt beside this session that it did not write, did not put it in the editor, and set the file aside as ${aside}`
+          : `herdr could not read a held prompt saved beside this session and set the file aside as ${aside}`,
+        "warning",
+      );
+    } catch {}
+    return true;
+  }
+
+  // Whether a running process other than this one wrote the spool a moment ago: its change is not
+  // over, and the file is its own.
+  function ownedByOtherLiveProcess(found: { pid: number | undefined; savedAt: number }): boolean {
+    return found.pid !== undefined && found.pid !== process.pid && processAlive(found.pid) && Date.now() - found.savedAt < spoolLiveMs;
+  }
+
+  // Writes every held prompt to one spool file in the session's artifact directory (mode 0600, the
+  // images by path). Writes run one at a time and replace the file whole. A spool already there
+  // (not this process's) keeps its prompts, in front. While herdr has not yet accepted the report
+  // of the session OMP changed to, a second copy stays in the directory of the session herdr has
+  // registered (the one a restart resumes), and each names the other (`twin`) so that whichever
+  // is restored removes the other. The copy stays until the prompt is in the new session (`dropSpool`),
+  // when the spool of the session left is rewritten with only the prompts that were already in it,
+  // or removed.
+  function writeSpool(ctx: any): Promise<void> {
+    spoolQueue = spoolQueue.then(async () => {
+      const dir = artifactsDir(ctx);
+      if (heldReplays.length === 0 && pendingTakes.length === 0) return;
+      try {
+        if (!dir) throw new Error("no artifact directory");
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        const previous = heldSpool;
+        let file = previous && path.dirname(previous.file) === dir ? previous.file : path.join(dir, SPOOL_NAME);
+        let inherited = previous?.file === file ? previous.inherited : [];
+        if (previous?.file !== file) {
+          const found = await readSpool(file);
+          // Never write over what cannot be read: set it aside, and stop when that fails.
+          if ((found.state === "corrupt" || found.state === "unverified") && !(await setSpoolAside(ctx, file, found.state))) throw new Error("spool cannot be set aside");
+          else if (found.state === "unreadable") throw new Error("spool unreadable");
+          else if (found.state === "ok" && ownedByOtherLiveProcess(found)) {
+            // Another running OMP's spool is theirs: write ours beside it, taking none of its prompts.
+            file = path.join(dir, `herdr-held-prompt.${process.pid}.json`);
+          } else if (found.state === "ok") inherited = found.prompts;
+        }
+        const prompts: SpoolPrompt[] = [];
+        for (const { text, images, savedAt } of [...pendingTakes.flatMap((take) => take.prompts), ...heldReplays]) {
+          const held: string[] = [];
+          for (const image of images) {
+            let source = imageSourcePath(image, dir);
+            if (source !== undefined && !(await isFile(source))) source = undefined;
+            source ??= heldImageFiles.get(image) ?? (await saveHeldImage(dir, image));
+            if (source) held.push(source);
+          }
+          prompts.push({ text, images: held, savedAt });
+        }
+        // The second copy, in the session herdr has registered while it is not this one.
+        const twinDir = registeredArtifacts !== undefined && registeredArtifacts !== dir ? registeredArtifacts : undefined;
+        let twin = heldTwin;
+        if (!twin && previous && previous.file !== file && twinDir !== undefined && path.dirname(previous.file) === twinDir) {
+          twin = { file: previous.file, inherited: previous.inherited };
+        }
+        if (!twin && twinDir !== undefined) {
+          try {
+            await mkdir(twinDir, { recursive: true, mode: 0o700 });
+            let twinFile = path.join(twinDir, SPOOL_NAME);
+            const found = await readSpool(twinFile);
+            if (found.state === "ok" && ownedByOtherLiveProcess(found)) twinFile = path.join(twinDir, `herdr-held-prompt.${process.pid}.json`);
+            // A file that cannot be read stays as it is: this copy is only a second chance.
+            if (found.state === "none" || found.state === "ok") {
+              twin = { file: twinFile, inherited: found.state === "ok" && twinFile === path.join(twinDir, SPOOL_NAME) ? found.prompts : [] };
+            }
+          } catch {}
+        }
+        const id = previous?.id ?? crypto.randomUUID();
+        // The copy in the registered session first: an OMP killed between the two writes is
+        // resumed in that session, and there the prompt is.
+        if (twin) await writeSpoolFile(twin.file, [...twin.inherited, ...prompts], { id, twin: { file, keep: inherited } }).catch(() => {});
+        await writeSpoolFile(file, [...inherited, ...prompts], { id, twin: twin ? { file: twin.file, keep: twin.inherited } : undefined });
+        heldSpool = { file, inherited, id };
+        heldTwin = twin;
+        if (previous && previous.file !== file && previous.file !== twin?.file) await leaveSpoolBehind(previous);
+      } catch {
+        warnOnce(ctx, "herdr could not save your prompt's images; if OMP exits before the session change ends, they are lost");
+      }
+    });
+    return spoolQueue;
+  }
+
+  // The prompts that were in a spool before this process added its own stay in that file, for the
+  // next start of that session; with none, the file goes.
+  async function leaveSpoolBehind(spool: { file: string; inherited: SpoolPrompt[] }): Promise<void> {
+    if (spool.inherited.length === 0) {
+      await unlink(spool.file).catch(() => {});
+      return;
+    }
+    await writeSpoolFile(spool.file, spool.inherited).catch(() => {});
+  }
+
+  // The change ended and the prompts were handled: the copies herdr made go, and so does the spool
+  // unless it held earlier prompts, which are put back in the editor (never sent) at once.
+  function dropSpool(ctx: any, prompts: HeldPrompt[]): Promise<void> {
+    spoolQueue = spoolQueue.then(async () => {
+      const spool = heldSpool;
+      const twin = heldTwin;
+      heldSpool = undefined;
+      heldTwin = undefined;
+      for (const { images } of prompts) {
+        for (const image of images) {
+          const copy = heldImageFiles.get(image);
+          if (copy) await unlink(copy).catch(() => {});
+        }
+      }
+      if (twin) await leaveSpoolBehind(twin);
+      if (!spool) return;
+      await leaveSpoolBehind(spool);
+      if (spool.inherited.length > 0 && path.dirname(spool.file) === artifactsDir(ctx)) {
+        await restoreSpool(ctx, spool.file);
+      }
+    });
+    return spoolQueue;
+  }
+
+  // herdr accepted the report of the session OMP runs now. The spool copy kept in the session OMP
+  // left stays until the prompt is in the new session's file (`dropSpool`): herdr's own saved state
+  // may still name the old session when OMP dies right after the report.
+  function sessionRegistered(ctx: any) {
+    registeredArtifacts = artifactsDir(ctx);
+  }
+
+  // The text without the held words herdr put at its start. The `input` hold writes the words of
+  // each held prompt, one per line, then a newline, then the person's draft (see the `input` hold).
+  // Each word is cut in order, only with the newline after it. A draft that merely starts with the
+  // same words (the person typed them, or herdr already took its own out) has no newline there
+  // and stays whole, as do the same words elsewhere and words the person edited or typed in front
+  // of.
+  function withoutHeldWords(text: string, words: string[]): string {
+    let rest = text;
+    for (const word of words) {
+      if (word && rest.startsWith(`${word}\n`)) rest = rest.slice(word.length + 1);
+    }
+    return rest;
+  }
+
+  // Takes held words out of the editor, where hold put them (see `withoutHeldWords`).
+  function removeWords(ctx: any, words: string[]) {
+    if (!editorIsReal(ctx)) return;
+    try {
+      const before = ctx?.ui?.getEditorText?.();
+      if (typeof before !== "string") return;
+      const text = withoutHeldWords(before, words);
+      if (text !== before) ctx.ui.setEditorText?.(text);
+    } catch {}
+  }
+
+  // Sent held prompts that OMP has not yet taken: the spool (the only durable copy of their images
+  // and words) stays until OMP has the message in its session.
+  type PendingTake = { prompts: HeldPrompt[]; taking: boolean };
+  let pendingTakes: PendingTake[] = [];
+  // How long to wait for OMP to put a taken prompt in its session before leaving the spool for the
+  // next start (which looks in the session file first).
+  const takeWaitMs = 5000;
+
+  // An object's fields as unknown values (an empty record for anything else).
+  function recordOf(value: unknown): Record<string, unknown> {
+    return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  }
+
+  // Whether a user message's content carries these prompts: their words as typed (without OMP's
+  // image markers) and, when they had images, at least one image.
+  function contentHasPrompts(content: unknown, prompts: { text: string; images: unknown[] }[]): boolean {
+    const parts = Array.isArray(content) ? content.map(recordOf) : typeof content === "string" ? [{ type: "text", text: content }] : [];
+    const text = typedText(
+      parts
+        .map((part) => (part.type === "text" && typeof part.text === "string" ? part.text : ""))
+        .filter(Boolean)
+        .join("\n"),
+    );
+    if (prompts.some((prompt) => prompt.images.length > 0) && !parts.some((part) => part.type === "image")) return false;
+    return prompts.every((prompt) => {
+      const words = wordsOf(prompt.text);
+      return !words || text.includes(words);
+    });
+  }
+
+  // Whether a session entry is the user message that carries these prompts, written after they were held.
+  function entryHasPrompts(entry: unknown, prompts: { text: string; images: unknown[]; savedAt: number }[]): boolean {
+    const record = recordOf(entry);
+    const message = recordOf(record.message);
+    if (record.type !== "message" || message.role !== "user") return false;
+    const at = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : NaN;
+    if (Number.isFinite(at) && at < Math.max(...prompts.map((prompt) => prompt.savedAt)) - 1000) return false;
+    return contentHasPrompts(message.content, prompts);
+  }
+
+  // The user messages in a session file (none when it cannot be read).
+  async function userEntriesOfSession(file: unknown): Promise<unknown[]> {
+    try {
+      if (typeof file !== "string") return [];
+      const entries: unknown[] = [];
+      for (const line of (await readFile(file, "utf8")).split("\n")) {
+        if (!/"role"\s*:\s*"user"/.test(line)) continue;
+        try {
+          entries.push(JSON.parse(line));
+        } catch {}
+      }
+      return entries;
+    } catch {
+      return [];
+    }
+  }
+
+  // Which of these prompts a session file already carries, split from those none carries. `files`
+  // are the session files to look in: the one OMP runs now, and the session of a spool's other copy
+  // (herdr may have restarted the old session while the new one already has the prompt). Every
+  // path that would show a held prompt's words again asks this first.
+  async function splitWritten(files: unknown[], prompts: SpoolPrompt[]): Promise<{ written: SpoolPrompt[]; unwritten: SpoolPrompt[] }> {
+    const users = (await Promise.all(files.map((file) => userEntriesOfSession(file)))).flat();
+    const written = prompts.filter((prompt) => users.some((entry) => entryHasPrompts(entry, [prompt])));
+    return { written, unwritten: prompts.filter((prompt) => !written.includes(prompt)) };
+  }
+
+  function removeHeldCopies(prompts: HeldPrompt[]): Promise<unknown> {
+    return Promise.all(
+      prompts
+        .flatMap(({ images }) => images.map((image) => heldImageFiles.get(image)))
+        .filter((copy): copy is string => copy !== undefined)
+        .map((copy) => unlink(copy).catch(() => {})),
+    );
+  }
+
+  // OMP's user message that carries a sent held prompt has started (the transcript shows it now).
+  // The spool goes once the entry is in the session file. When OMP never writes it, the spool
+  // stays, and the next start looks in the session file before it puts the prompt back.
+  async function completeTake(ctx: any, take: PendingTake) {
+    take.taking = true;
+    try {
+      ctx?.ui?.notify?.("herdr sent your prompt with images after the session change", "info");
+    } catch {}
+    const manager = ctx?.sessionManager;
+    const until = Date.now() + takeWaitMs;
+    let saved = false;
+    while (!saved && Date.now() < until) {
+      try {
+        saved = ((manager?.getEntries?.() ?? []) as unknown[]).slice(-40).some((entry) => entryHasPrompts(entry, take.prompts));
+      } catch {
+        return;
+      }
+      if (!saved) await delay(25);
+    }
+    if (!saved) return;
+    try {
+      await manager?.flush?.();
+    } catch {
+      return;
+    }
+    pendingTakes = pendingTakes.filter((other) => other !== take);
+    if (heldReplays.length > 0 || pendingTakes.length > 0) {
+      // Another change holds prompts, or another sent prompt waits: the spool goes on without this one.
+      await removeHeldCopies(take.prompts);
+      await writeSpool(ctx);
+    } else {
+      await dropSpool(ctx, take.prompts);
+    }
+  }
+
+  function replayHeld(ctx: any) {
+    const prompts = heldReplays;
+    heldReplays = [];
+    if (prompts.length === 0) return;
+    // One message, in the order typed: two sends would race (the first waits for OMP to prepare its
+    // images, the second then queues ahead of it). Later prompts' image markers follow the earlier
+    // prompts' images.
+    const images: unknown[] = [];
+    const texts: string[] = [];
+    for (const prompt of prompts) {
+      texts.push(shiftMarkers(prompt.text, images.length, prompt.images.length));
+      images.push(...prompt.images);
+    }
+    const text = texts.filter(Boolean).join("\n\n");
+    // The words leave the editor before the message does: an OMP that exits from here on saves its
+    // draft without them, and writes the message (or not) with the spool as the one other copy. A
+    // draft saved earlier still has them; the restore then finds the prompt in the session file.
+    removeWords(ctx, prompts.map((prompt) => wordsOf(prompt.text)));
+    try {
+      pi.sendUserMessage([...(text ? [{ type: "text", text }] : []), ...images] as never, ctx?.isIdle?.() === true ? undefined : { deliverAs: "followUp" });
+    } catch {
+      // Nothing was sent: the spool puts the words and the images back.
+      const own = heldSpool?.file;
+      spoolQueue = spoolQueue
+        .then(async () => {
+          if (own !== undefined && path.dirname(own) === artifactsDir(ctx)) await restoreSpool(ctx, own);
+        })
+        .catch(() => {});
+      return;
+    }
+    // Queued, not taken: the spool stays until OMP's `message_start` for it.
+    pendingTakes.push({ prompts, taking: false });
+  }
+
+  // What a chip looks like in the editor's text: an icon, then `#N`.
+  const CHIP_LABEL = /[\p{So}\p{Sk}]\s?#\d+/gu;
+  function chipCount(text: string): number {
+    return (text.match(CHIP_LABEL) ?? []).length;
+  }
+
+  // Waits for OMP's editor to show what a pasted image path became: a new chip once OMP has read
+  // the file (which can come after a later paste of text), or the path itself for a file OMP does
+  // not take as an image. A person typing meanwhile ends neither.
+  async function waitForChip(ui: any, before: string, pasted: string): Promise<boolean> {
+    const until = Date.now() + chipWaitMs;
+    const chips = chipCount(before);
+    while (Date.now() < until) {
+      const now = ui?.getEditorText?.();
+      // Without a way to look, do not wait.
+      if (typeof now !== "string") return true;
+      if (chipCount(now) > chips || now.includes(pasted)) return true;
+      await delay(10);
+    }
+    return false;
+  }
+
+  // Puts spooled prompts into the editor as the person typed them: words and image chips in their
+  // original order, then the draft that was there (minus the words OMP's own draft restore already
+  // brought back: they go whatever the draft holds, see `withoutHeldWords`). The words go in
+  // exactly as saved, with only OMP's marker for each chip and the one space OMP put after it left
+  // out: OMP puts that space back with the chip. Text and image paths go in as pastes, one at a
+  // time, because OMP turns an image path into a chip only as a paste and sets the chip into the
+  // text once the file is read. The draft goes back even when a paste throws, and the error goes
+  // on to the caller. Returns how many images could not be put back and how many were slow to
+  // appear.
+  async function putBack(ui: any, prompts: SpoolPrompt[]): Promise<{ lost: number; slow: number }> {
+    let lost = 0;
+    let slow = 0;
+    const current = ui?.getEditorText?.();
+    const draft = typeof current === "string" ? withoutHeldWords(current, prompts.map((prompt) => wordsOf(prompt.text))) : undefined;
+    // OMP keeps the images of chips and the text of `[Paste #N]` markers apart from the editor's
+    // text, so `setEditorText` leaves them. Their labels still have to be in the text, though:
+    // with chips in the draft it stays where it is and the prompts are added at the cursor;
+    // without, it goes back after them.
+    const rebuild = draft !== undefined && !EDITOR_CHIP.test(draft);
+    let remaining = "";
+    if (rebuild) {
+      remaining = draft;
+      ui.setEditorText?.("");
+    } else if (draft !== undefined && draft !== current) {
+      ui.setEditorText?.(draft);
+    }
+    let wrote = false;
+    const pasteText = (text: string) => {
+      if (!text) return;
+      ui?.pasteToEditor?.(text);
+      wrote = true;
+    };
+    try {
+      for (const prompt of prompts) {
+        if (wrote) pasteText("\n");
+        const pieces = prompt.text.split(IMAGE_MARKER).map((piece, i) => (i > 0 && piece.startsWith(" ") ? piece.slice(1) : piece));
+        let next = 0;
+        const putImage = async () => {
+          const image = prompt.images[next++];
+          if (image === undefined) return;
+          if (!path.isAbsolute(image) || !(await isFile(image))) {
+            lost += 1;
+            return;
+          }
+          const before = ui?.getEditorText?.() ?? "";
+          ui?.pasteToEditor?.(/\s/.test(image) ? `"${image}"` : image);
+          wrote = true;
+          if (!(await waitForChip(ui, before, image))) slow += 1;
+        };
+        for (let i = 0; i < pieces.length; i += 1) {
+          pasteText(pieces[i]);
+          if (i < pieces.length - 1) await putImage();
+        }
+        // Images with no marker in the text (a marker the person deleted) go after the words.
+        while (next < prompt.images.length) await putImage();
+      }
+    } finally {
+      if (remaining) {
+        try {
+          if (wrote) pasteText("\n");
+          pasteText(remaining);
+        } catch {}
+      }
+    }
+    return { lost, slow };
+  }
+
+  // Reads one spool file for a restore. `own` is this process's spool, restored whatever its state.
+  // Another file is left when it is this process's change that is writing it, or when another
+  // process that still runs wrote it a moment ago: that process's change is not over (`wait` is
+  // when to look again). A file that cannot be read is set aside or left.
+  async function readForRestore(
+    ctx: any,
+    file: string,
+    own: boolean,
+  ): Promise<{ item?: SpoolItem; wait?: number }> {
+    if (!own && (heldSpool?.file === file || heldTwin?.file === file)) return {};
+    const found = await readSpool(file);
+    if (found.state === "none" || found.state === "unreadable") return {};
+    if (found.state === "corrupt" || found.state === "unverified") {
+      await setSpoolAside(ctx, file, found.state);
+      return {};
+    }
+    if (!own && ownedByOtherLiveProcess(found)) return { wait: spoolPollMs };
+    return { item: { file, prompts: found.prompts, id: found.id, twin: found.twin } };
+  }
+
+  // Puts the prompts of the spool files beside the session (or just `only`, this process's own)
+  // back in the editor in one go, oldest first whichever file they came from, without sending
+  // anything, then removes the files (image copies stay: the chips use them). Only in the terminal
+  // UI, where the editor is real: elsewhere the files are left as they are. Runs in `spoolQueue`,
+  // so it never overlaps a write. A restore that cannot finish keeps every file. Returns how long
+  // to wait before looking again, when it should.
+  async function restoreSpool(ctx: any, only?: string): Promise<number | undefined> {
+    if (!editorIsReal(ctx)) return undefined;
+    const dir = artifactsDir(ctx);
+    if (!dir) return undefined;
+    if (only === undefined && sessionHold) return spoolRestoreMs;
+    await removeDeadTemporaries(dir);
+    const names = only !== undefined ? [path.basename(only)] : (await readdir(dir).catch(() => [] as string[])).filter((name) => SPOOL_FILE.test(name));
+    let again: number | undefined;
+    const items: SpoolItem[] = [];
+    for (const name of names) {
+      const { item, wait } = await readForRestore(ctx, path.join(dir, name), only !== undefined);
+      if (item) items.push(item);
+      if (wait !== undefined) again = Math.min(again ?? wait, wait);
+    }
+    if (items.length === 0) return again;
+    // By time, not by name: a pid sorts as text, and the main file has none.
+    const oldestOf = (item: { prompts: SpoolPrompt[] }) => Math.min(Infinity, ...item.prompts.map((prompt) => prompt.savedAt));
+    items.sort((a, b) => oldestOf(a) - oldestOf(b));
+    // A prompt OMP already wrote into a session (it died after taking the prompt, before herdr
+    // removed the spool) is not put back: it would be sent twice. A spool written as two copies
+    // (see `writeSpool`) also looks in the session of its other copy. Its words go out of the
+    // editor too: OMP's own draft restore ran first, and brings back the words of a prompt that was
+    // held when OMP exited.
+    const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+    const stale: string[] = [];
+    for (const item of items) {
+      const { written, unwritten } = await splitWritten(item.twin ? [sessionFile, `${path.dirname(item.twin.file)}.jsonl`] : [sessionFile], item.prompts);
+      item.prompts = unwritten;
+      stale.push(...written.map((prompt) => wordsOf(prompt.text)));
+    }
+    removeWords(ctx, stale);
+    const prompts = items.flatMap((item) => item.prompts);
+    const ui = ctx?.ui;
+    let result = { lost: 0, slow: 0 };
+    const worth = prompts.some((prompt) => wordsOf(prompt.text) || prompt.images.length > 0);
+    if (worth) {
+      try {
+        result = await putBack(ui, prompts);
+      } catch {
+        // Part of the prompt may be in the editor: keep the saved copies, and say where they are.
+        try {
+          ui?.notify?.(`herdr could not put your saved prompt back in the editor; the saved copy is ${items.map((item) => item.file).join(", ")}`, "warning");
+        } catch {}
+        return again;
+      }
+    }
+    // The saved copies go before the notice, so the notice never shows while they are still there.
+    for (const { file } of items) {
+      if (heldSpool?.file === file) heldSpool = undefined;
+      if (heldTwin?.file === file) heldTwin = undefined;
+      await unlink(file).catch(() => {});
+    }
+    // The other copy of a spool written while a session change was not yet registered goes too
+    // (or keeps only the prompts that were in its file before), so the prompt is offered once.
+    for (const { id, twin } of items) {
+      if (!twin || id === undefined) continue;
+      const other = await readSpool(twin.file);
+      if (other.state !== "ok" || other.id !== id) continue;
+      if (heldSpool?.file === twin.file) heldSpool = undefined;
+      if (heldTwin?.file === twin.file) heldTwin = undefined;
+      if (twin.keep.length > 0) await writeSpoolFile(twin.file, twin.keep).catch(() => {});
+      else await unlink(twin.file).catch(() => {});
+    }
+    if (worth) {
+      const { lost, slow } = result;
+      const oldest = Math.min(...prompts.map((prompt) => prompt.savedAt));
+      const extras =
+        (lost > 0 ? `; ${lost} image${lost === 1 ? " is" : "s are"} gone` : "") +
+        (slow > 0 ? `; ${slow} image${slow === 1 ? " was" : "s were"} slow to appear, check the editor` : "");
+      try {
+        ui?.notify?.(
+          `herdr put the prompt you sent during a session change back in the editor after OMP restarted; nothing was sent. Press Enter to send it (saved ${ageText(Date.now() - oldest)} ago)${extras}`,
+          "info",
+        );
+      } catch {}
+    }
+    return again;
+  }
+
+  // Temporary files of spool writes whose process is gone.
+  async function removeDeadTemporaries(dir: string): Promise<void> {
+    try {
+      for (const name of await readdir(dir)) {
+        const pid = SPOOL_TEMPORARY.exec(name)?.[1];
+        if (pid !== undefined && Number(pid) !== process.pid && !processAlive(Number(pid))) {
+          await unlink(path.join(dir, name)).catch(() => {});
+        }
+      }
+    } catch {}
+  }
+
+  // Looks once per session directory, after OMP's own start-up draft restore; while a change runs
+  // or another running OMP holds a spool it looks again later.
+  function scheduleSpoolRestore(ctx: any, delayMs = spoolRestoreMs, first = true) {
+    const dir = artifactsDir(ctx);
+    if (!dir || (first && dir === spoolCheckedFor)) return;
+    spoolCheckedFor = dir;
+    clearTimeout(spoolRestoreTimer);
+    spoolRestoreTimer = setTimeout(async () => {
+      if (!rootSession || artifactsDir(ctx) !== dir) return;
+      let again: number | undefined;
+      spoolQueue = spoolQueue.then(async () => {
+        again = await restoreSpool(ctx).catch(() => undefined);
+      });
+      await spoolQueue;
+      if (again !== undefined) scheduleSpoolRestore(ctx, again, false);
+    }, delayMs);
+    spoolRestoreTimer.unref?.();
+  }
+
+  // A prompt the person submits while herdr's session change runs. The editor cleared it before
+  // this event, and nothing runs now. A text prompt goes back into the editor as typed (a slash
+  // command stays a command), and the person sends it into the session they now see. A prompt
+  // with images is held (see above); the words of every held prompt go back into the editor at once
+  // too, so OMP's draft keeps them if OMP exits during the change. They are the lines at the start
+  // of the editor, the last one closed by a newline, then the person's draft: `withoutHeldWords`
+  // takes exactly that out, and nothing the person typed.
+  pi.on("input", async (event: any, ctx: any) => {
+    const hold = sessionHold;
+    if (!hold || event?.source !== "interactive" || !editorIsReal(ctx)) return undefined;
+    let text = typeof event.text === "string" ? event.text : "";
+    const images = Array.isArray(event.images) ? event.images : [];
+    const draft = ctx?.ui?.getEditorText?.() ?? "";
+    const heldWords = () => heldReplays.map((prompt) => wordsOf(prompt.text)).filter(Boolean).join("\n");
+    if (images.length > 0) {
+      // The editor still showed the words of earlier held prompts, so a person who goes on typing
+      // sends them again: they are already held, and are not part of this prompt.
+      text = withoutHeldWords(text, heldReplays.map((earlier) => wordsOf(earlier.text)));
+      heldReplays.push({ text, images, savedAt: Date.now() });
+      const shown = heldWords();
+      if (shown) ctx?.ui?.setEditorText?.(`${shown}\n${draft}`);
+      await writeSpool(ctx);
+    } else if (text) {
+      hold.held = true;
+      // OMP trims the text it submits: Enter on an editor that holds only the held words brings
+      // them back without the newline that closes them, so the line is closed again.
+      const held = heldWords();
+      const typed = held && text === held ? `${text}\n` : text;
+      ctx?.ui?.setEditorText?.(draft ? `${typed}\n${draft}` : typed);
+    }
+    return { handled: true };
+  });
+
+  // OMP's summary abort signal for the `tree` herdr runs (Esc aborts through it).
+  pi.on("session_before_tree", (event: any) => {
+    if (sessionHold?.summarizing && event?.signal) sessionHold.signal = event.signal;
+    return undefined;
+  });
 
   function registerInstructionListener(ctx: {
     isIdle?: () => boolean;
@@ -2073,6 +3471,8 @@ export default function (pi) {
     // registers a fresh one.
     unsubscribeInstructions?.();
     unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => {
+      const held = holdKey(ctx, data);
+      if (held) return held;
       const key = takeKey(data);
       if (key) return key;
       const taken = takeAction(ctx, data) ?? takeInstruction(ctx, data);
@@ -2085,10 +3485,13 @@ export default function (pi) {
       return taken;
     });
     instructionListener = typeof unsubscribeInstructions === "function";
+    actionListener = instructionListener && editorIsReal(ctx);
+    listenerMode = typeof ctx?.mode === "string" ? ctx.mode : undefined;
   }
 
   // Removes herdr blocks for this runtime from the editor text; returns whether it found any.
   function scrubLeakedBlocks(ctx: any): boolean {
+    if (!editorIsReal(ctx)) return false;
     const ui = ctx?.ui;
     const text = ui?.getEditorText?.();
     if (typeof text !== "string" || !text.includes("herdr-")) return false;
@@ -2175,6 +3578,7 @@ export default function (pi) {
       moveWatch.unref?.();
     }
     onRegistered = (lost) => {
+      sessionRegistered(detailCtx ?? ctx);
       if (lost) publishState(true);
       if (instructionListener) scheduleDetail(undefined, true);
     };
@@ -2212,9 +3616,40 @@ export default function (pi) {
         if (typeof off === "function") unsubscribeRegistry = off;
       } catch {}
     }
+    // OMP reports a redirect through its session manager only. A session change keeps the
+    // manager, so one subscription per manager. OMP replays earlier notices to a new subscriber:
+    // each is checked against the session OMP runs now.
+    const manager = ctx?.sessionManager;
+    if (manager !== redirectManager && typeof manager?.onPersistenceNotice === "function") {
+      unsubscribeRedirects?.();
+      try {
+        const off = manager.onPersistenceNotice(() => {
+          if (rootSession && instructionListener && detailCtx) followSessionRedirect(detailCtx);
+        });
+        unsubscribeRedirects = typeof off === "function" ? off : undefined;
+        redirectManager = manager;
+      } catch {}
+    }
     registerInstructionListener(ctx);
+    // A held prompt's spool follows the session into its new directory; a spool that an earlier OMP
+    // left is offered back to the editor.
+    if ((heldReplays.length > 0 || pendingTakes.length > 0) && heldSpool && path.dirname(heldSpool.file) !== artifactsDir(ctx)) void writeSpool(ctx);
+    scheduleSpoolRestore(ctx);
     updateSessionRef(ctx);
-    void reportSession(sessionStartSource);
+    if (sessionHold || heldReplays.length > 0 || pendingTakes.length > 0) {
+      // A restart resumes the session herdr has registered. During a change herdr runs, the new
+      // session is registered only once its file exists (a session OMP never wrote restarts as a
+      // different one, away from a held prompt's spool) and the spool copies are written.
+      void (async () => {
+        await spoolQueue;
+        try {
+          await ctx?.sessionManager?.ensureOnDisk?.();
+        } catch {}
+        await reportSession(sessionStartSource);
+      })();
+    } else {
+      void reportSession(sessionStartSource);
+    }
     return true;
   }
 
@@ -2324,6 +3759,8 @@ export default function (pi) {
 
   pi.on("message_start", (event, ctx) => {
     if (noteSubagent("message_start", event, ctx)) return;
+    const taken = pendingTakes.find((take) => !take.taking && recordOf(event?.message).role === "user" && contentHasPrompts(recordOf(event?.message).content, take.prompts));
+    if (taken && rootSession) void completeTake(ctx, taken);
     const message = event?.message;
     if (!rootSession || awaitingAdmission.length === 0 || message?.role !== "user") {
       return;
@@ -2538,7 +3975,8 @@ export default function (pi) {
   // handlers that each hit the cap take longer than the wait; a block that then arrives after
   // OMP changed its session is still refused at take time (`liveSessionMoved`). The withdrawal
   // report gets one attempt of at most 1 s, so a herdr that accepts but does not answer delays the
-  // person's switch by that much.
+  // person's switch by that much. A change herdr asked for (`changeSession`) knows how it ended and
+  // registers again at once.
   for (const event of ["session_before_switch", "session_before_branch"]) {
     pi.on(event, async (_event, ctx) => {
       if (!rootSession) return undefined;
@@ -2552,6 +3990,17 @@ export default function (pi) {
       if (sessionRef) {
         await sendRequestAttempt(sessionReport("startup", sessionRef), shutdownReportTimeoutMs);
       }
+      const hold = sessionHold;
+      if (!hold) return undefined;
+      // A change herdr started: OMP cleared every input listener before this event, so a person
+      // may have submitted a prompt since herdr checked. It would run in the session being left.
+      if (ctx?.isIdle?.() !== true || hold.session.hasAdmittedSubmission === true || ctx?.hasPendingMessages?.() === true) {
+        hold.personSubmitted = true;
+        return { cancel: true };
+      }
+      // OMP dropped herdr's listener: keep the raw keys the `input` event cannot see (Esc, the
+      // continue shortcuts) for the rest of the change (other extensions' handlers, the swap).
+      unsubscribeInstructions = ctx.ui?.onTerminalInput?.((data: string) => holdKey(ctx, data));
       return undefined;
     });
   }
@@ -2563,6 +4012,13 @@ export default function (pi) {
     activations += 1;
     clearInterval(moveWatch);
     moveWatch = undefined;
+    clearTimeout(spoolRestoreTimer);
+    spoolRestoreTimer = undefined;
+    // A session that starts again in the same directory (a reload) looks for a spool again.
+    spoolCheckedFor = undefined;
+    unsubscribeRedirects?.();
+    unsubscribeRedirects = undefined;
+    redirectManager = undefined;
     unsubscribeRegistry?.();
     unsubscribeRegistry = undefined;
     onSubagentChange = undefined;

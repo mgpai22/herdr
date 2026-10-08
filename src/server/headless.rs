@@ -3287,6 +3287,8 @@ impl HeadlessServer {
             changed = true;
         }
 
+        self.app.check_pending_action_owners(now);
+
         changed |= self.app.handle_tab_bar_status_tasks(now);
 
         if geometry_dirty {

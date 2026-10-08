@@ -83,7 +83,13 @@ pane_history = true
 resume_agents_on_restore = false
 ```
 
-Herdr が resume するのは、現行の公式 Herdr インテグレーションを通じてネイティブセッション参照を報告したペインだけです。
+Herdr が resume するのは、現行の公式 Herdr インテグレーションを通じてネイティブセッション参照を報告したペインだけです。OMP はさらに起動プロファイルと検証済みのプロセスオーナーも報告します。オーナーが稼働中または不明な場合、保存したプロファイルが未登録の場合、またはプラットフォームが保存した Linux プロセスの世代を検証できない場合、Herdr は OMP の自動復旧をブロックします。オーナー不明とは、最後の resume の後に検証済みの OMP レポートが Herdr に届いていないことを意味します。レポートの前に Herdr が停止した、ランチャーが別のプロファイルで OMP を起動した、またはそのプロファイルに OMP インテグレーション 11 がインストールされていない（`herdr integration install omp` を実行してください）のいずれかです。
+
+ブロックされたペインは、保存した画面に続いて、理由と対処を示す `herdr:` 行が付いたシェルとして復元されます。例: `add "neurable" = "<launcher executable>" to [session.omp_launchers]`。この行はペインが何度復元されても 1 回だけ表示されます。resume を始める時点で初めてブロックが見つかった場合（たとえば設定のリロード後や、復旧バリアを保存できない場合）、シェルにはこの行だけが表示されます。そのペインで `herdr pane current` を実行すると、同じテキストが `restore_error` として、保存したセッション参照が `agent_session` として表示されます。手動で resume するには、そのペインで `herdr agent start NAME --kind omp --pane PANE --profile PROFILE -- --resume=REF` を実行します。この start は保存したセッションを置き換え、resume した OMP が `PROFILE` で再び登録するため、以降の再起動では自動的に resume されます。
+
+Herdr は、復旧した OMP プロセスを保存したプロファイルを `OMP_PROFILE` に設定して起動します。プロセスを起動する前に、オーナー不明のバリアを非公開の永続ストレージに保存します。保存に失敗するとプロセスは起動しません。resume された OMP プロセスは、起動後のディレクトリ変更を含め、保存されたフォアグラウンド OMP のディレクトリを使います。
+
+OMP がセッションファイルを書くのは、最初の応答があったとき、未送信の下書きを終了時に保存するとき、または実行中の最初のプロンプトを終了時に止めるときです。OMP を強制終了(kill)した場合は何も書かれません。保存した OMP セッションのファイルが存在しない、または空の場合、resume するものがなく、OMP 18.7 は `--resume=<file>` で `Session "<file>" not found` と表示して停止します。その場合 Herdr は `--session-dir <保存したファイルのディレクトリ>` を付けて OMP を起動し、新しいセッションを古いセッションの隣に作ります。素の `omp` は決して起動しません。OMP の `autoResume` 設定が有効だと、素の起動は端末の最後のセッションやディレクトリ内で最新のセッションを続行し、それは別のペインが実行中のものかもしれないためです。新しいセッションは、OMP が報告した時点で保存した参照を置き換えます。ファイルなしで OMP が報告したセッション（`--no-session` で起動）は `--no-session` で復元されます。
 
 クライアントがアタッチしてターミナルサイズとテーマのコンテキストを提供すると、Herdr は各ペインがフォーカスされるのを待たずに、ワークスペースとタブをまたいで復元対象のエージェントペインを resume します。
 
@@ -92,7 +98,7 @@ Herdr が resume するのは、現行の公式 Herdr インテグレーショ�
 | エージェント | 最低 Herdr インテグレーションバージョン | resume コマンド |
 | --- | --- | --- |
 | Pi | `2` | `pi --session <path-or-id>` |
-| OMP | `11` | `<configured-profile-executable> --resume=<path-or-id>` |
+| OMP | `11` | `OMP_PROFILE=<profile> <configured-profile-executable> --resume=<path>`、または resume するセッションファイルがない場合は `--session-dir <dir>` か `--no-session` |
 | Claude Code | `6` | `claude --resume <id>` |
 | Codex | `5` | `codex resume <id>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |

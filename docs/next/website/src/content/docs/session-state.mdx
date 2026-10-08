@@ -87,6 +87,8 @@ A blocked pane restores as a shell with its saved screen, followed by a `herdr:`
 
 Herdr starts a recovered OMP process with `OMP_PROFILE` set to the saved profile. Before it starts the process, it saves an owner-unknown barrier to private durable storage. A failed save prevents the process from starting. The resumed OMP process uses the saved foreground OMP directory, including directory changes made after launch.
 
+OMP writes a session's file at its first reply, when it saves an unsent draft on exit, or when it stops a first prompt that was still running at exit; a hard kill of OMP writes nothing. A saved OMP session whose file does not exist or is empty has nothing to resume, and OMP 18.7 stops at `--resume=<file>` with `Session "<file>" not found`. Herdr then starts OMP with `--session-dir <the directory of the saved file>`, so the new session lands next to the old one. It never starts a bare `omp`: with OMP's `autoResume` setting on, a bare start continues the terminal's last session or the newest one in the directory, which another pane may run. The new session replaces the saved reference when OMP reports it. A session that OMP reports without a file (started with `--no-session`) restores with `--no-session`.
+
 :::caution[Back up before downgrade]
 An older Herdr binary can replace a version 4 snapshot and erase saved layout and OMP recovery data. Downgrade is unsupported. Back up the session directory and use an isolated data path before you run an older binary.
 :::
@@ -99,7 +101,7 @@ Native session restore requires these Herdr integration versions or newer:
 | --- | --- | --- |
 | Pi | `2` | `pi --session <path-or-id>` |
 | Antigravity CLI | `1` | `agy --conversation <id>` |
-| OMP | `11` | `OMP_PROFILE=<profile> <configured-profile-executable> --resume=<path-or-id>` |
+| OMP | `11` | `OMP_PROFILE=<profile> <configured-profile-executable> --resume=<path>`, or `--session-dir <dir>` or `--no-session` when there is no session file to resume |
 | Claude Code | `6` | `claude --resume <id>` |
 | Codex | `5` | `codex resume <id>` |
 | Cursor Agent CLI | `1` | `cursor-agent --resume <id>` |

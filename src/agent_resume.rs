@@ -194,6 +194,182 @@ pub fn persisted_session_from_launch_args(
     })
 }
 
+/// Whether `session_ref` names a session file that OMP 18.7 cannot open: it does not exist, or it
+/// is empty. OMP writes a session's file at the first reply, when it saves an unsent draft, and
+/// when it stops a first prompt at exit; a pane with none of these has no file. OMP 18.7 refuses
+/// `--resume=<file>` for such a file and exits (`Session ... not found`, `the session file holds
+/// no entries`); 18.6 opened an empty session at that path.
+pub fn omp_session_file_is_unresumable(session_ref: &AgentSessionRef) -> bool {
+    session_ref.kind == AgentSessionRefKind::Path
+        && match std::fs::metadata(&session_ref.value) {
+            Ok(meta) => meta.is_file() && meta.len() == 0,
+            Err(err) => matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ),
+        }
+}
+
+/// The arguments that start a new OMP session in the saved session's directory, for a saved
+/// session OMP cannot open (see [`omp_session_file_is_unresumable`]). Never a bare launcher:
+/// with OMP's `autoResume` on, a bare `omp` continues the terminal's last session or the newest
+/// one in the directory, which another pane may be running. `--session-dir` is checked before
+/// `autoResume`, creates the new session there, and keeps a custom directory the pane was
+/// started with.
+pub fn omp_fresh_session_args(session_ref: &AgentSessionRef) -> Option<Vec<String>> {
+    if !omp_session_file_is_unresumable(session_ref) {
+        return None;
+    }
+    let dir = Path::new(&session_ref.value).parent()?.to_str()?;
+    Some(vec!["--session-dir".into(), dir.into()])
+}
+
+/// The session values an OMP command line asks to resume: `--resume`, `-r` and `--session`, as
+/// `--flag value` (a value that does not start with `-`) or `--flag=value`.
+pub fn omp_resume_args(args: &[String]) -> Vec<&str> {
+    let mut values = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (arg, None),
+        };
+        if matches!(flag, "--resume" | "-r" | "--session") {
+            match inline {
+                Some(value) if !value.is_empty() => values.push(value),
+                Some(_) => {}
+                None => {
+                    if let Some(next) = args
+                        .get(i + 1)
+                        .filter(|next| !next.is_empty() && !next.starts_with('-'))
+                    {
+                        values.push(next.as_str());
+                        i += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    values
+}
+
+/// What `--continue` / `-c` asks of OMP, read as OMP's own parser and `normalizeContinueSessionArgs`
+/// read it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OmpContinue<'a> {
+    /// No continue, or one that does not open the newest session of the cwd's session directory:
+    /// another flag decides the session (`--resume`, `-r`, `--session`, `--fork`, `--no-session`)
+    /// or the directory (`--session-dir`), or the flag is only text after `--`.
+    Other,
+    /// A plain `--continue`: the newest session of the cwd's session directory.
+    Newest,
+    /// `--continue <session id>`: OMP takes that as `--resume <id>`.
+    Session(&'a str),
+}
+
+pub fn omp_continue(args: &[String]) -> OmpContinue<'_> {
+    let mut continue_at = None;
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            break;
+        }
+        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+        match flag {
+            "--continue" | "-c" if continue_at.is_none() => continue_at = Some(i),
+            "--resume" | "-r" | "--session" | "--fork" | "--no-session" | "--session-dir" => {
+                return OmpContinue::Other;
+            }
+            _ => {}
+        }
+    }
+    let Some(at) = continue_at else {
+        return OmpContinue::Other;
+    };
+    match args.get(at + 1).map(|next| next.trim()) {
+        Some(next) if is_session_uuid(next) => OmpContinue::Session(next),
+        _ => OmpContinue::Newest,
+    }
+}
+
+/// OMP's `SESSION_ID_ARG_RE`: a session id as a UUID.
+fn is_session_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The session file `omp --continue` opens among the sessions beside `session_path`: the
+/// `.jsonl` file in that directory with the newest modification time (the name breaks a tie).
+/// OMP also prefers the terminal's own last session when it has one, which Herdr cannot see.
+pub fn newest_session_beside(session_path: &str) -> Option<std::path::PathBuf> {
+    let dir = Path::new(session_path).parent()?;
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok().filter(|meta| meta.is_file())?;
+            Some((meta.modified().ok()?, entry.path()))
+        })
+        .max()
+        .map(|(_, path)| path)
+}
+
+/// Whether two paths name the same session file: the same path or, for absolute paths, the same
+/// file by device and inode. That also covers a symlink, a `..` segment and a hard link, which
+/// are other names a second OMP could open to write the one file. Windows has no stable inode
+/// to read: there only paths that resolve to one canonical path match.
+pub fn same_session_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    if !a.is_absolute() || !b.is_absolute() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!(
+            (std::fs::metadata(a), std::fs::metadata(b)),
+            (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
+}
+
+/// Whether `omp --resume <value>`, run in `cwd`, can open the session file `session_path`: the
+/// same file (see `same_session_file`) for a path value (one with a separator or ending in
+/// `.jsonl`); otherwise OMP's prefix rule, case-insensitive, on the file's name and on the
+/// session id at its end.
+pub fn omp_resume_value_matches(value: &str, cwd: &Path, session_path: &str) -> bool {
+    if value.contains('/') || value.contains('\\') || value.ends_with(".jsonl") {
+        return same_session_file(&cwd.join(value), Path::new(session_path));
+    }
+    let prefix = value.to_lowercase();
+    let Some(stem) = Path::new(session_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_lowercase)
+    else {
+        return false;
+    };
+    stem.starts_with(&prefix)
+        || stem
+            .rsplit_once('_')
+            .is_some_and(|(_, id)| id.starts_with(&prefix))
+}
+
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
     match value.as_deref().map(str::trim) {
         Some(
@@ -280,10 +456,16 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
         }
-        ("herdr:omp", "omp", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
+        ("herdr:omp", "omp", AgentSessionRefKind::Path) => {
             // omp resume is `-r, --resume=<value>` (ID prefix or path); it has no
             // `--session` flag, unlike pi.
             vec!["omp".into(), format!("--resume={}", session_ref.value)]
+        }
+        ("herdr:omp", "omp", AgentSessionRefKind::Id) => {
+            // The integration reports a session id and no file for a session OMP keeps in
+            // memory (`--no-session`). There is nothing to resume by id: `--resume=<id>` stops
+            // with `Session ... not found`.
+            vec!["omp".into(), "--no-session".into()]
         }
         ("herdr:hermes", "hermes", AgentSessionRefKind::Id) => {
             vec![
@@ -425,6 +607,63 @@ mod tests {
             .join(name)
             .display()
             .to_string()
+    }
+
+    #[test]
+    fn an_omp_session_file_is_unresumable_when_the_path_names_nothing_or_an_empty_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-omp-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = dir.join("written.jsonl");
+        std::fs::write(&written, "{}\n").unwrap();
+        let empty = dir.join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
+        let path = |p: &std::path::Path| AgentSessionRef::path(p.to_str().unwrap()).unwrap();
+        assert!(!omp_session_file_is_unresumable(&path(&written)));
+        assert!(!omp_session_file_is_unresumable(&path(&dir)));
+        assert!(omp_session_file_is_unresumable(&path(&empty)));
+        assert!(omp_session_file_is_unresumable(&path(
+            &dir.join("none.jsonl")
+        )));
+        assert!(omp_session_file_is_unresumable(&path(
+            &written.join("below.jsonl")
+        )));
+        let id = AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f").unwrap();
+        assert!(!omp_session_file_is_unresumable(&id));
+
+        // A session OMP cannot open restarts in its own directory, never as a bare launcher.
+        let in_its_dir = Some(vec![
+            "--session-dir".to_string(),
+            dir.to_str().unwrap().to_string(),
+        ]);
+        assert_eq!(omp_fresh_session_args(&path(&empty)), in_its_dir);
+        assert_eq!(
+            omp_fresh_session_args(&path(&dir.join("none.jsonl"))),
+            in_its_dir
+        );
+        assert_eq!(omp_fresh_session_args(&path(&written)), None);
+        assert_eq!(omp_fresh_session_args(&id), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_omp_session_reported_without_a_file_restores_as_no_session() {
+        let id = AgentSessionRef::id("01a113e4-bc1f-77e4-b4ad-5f232f8a2a5f").unwrap();
+        assert_eq!(
+            plan("herdr:omp", "omp", &id).unwrap().argv,
+            vec!["omp", "--no-session"]
+        );
+        let path = AgentSessionRef::path(absolute_test_path("omp-session.jsonl")).unwrap();
+        assert_eq!(
+            plan("herdr:omp", "omp", &path).unwrap().argv,
+            vec!["omp".to_string(), format!("--resume={}", path.value)]
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1058,5 +1297,110 @@ mod tests {
             &AgentSessionRef::path(&agy_session).unwrap()
         )
         .is_none());
+    }
+
+    #[test]
+    fn omp_continue_flags_are_found_and_the_newest_session_is_the_latest_file() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        let id = "0A1B2C3D-4e5f-6789-abcd-ef0123456789";
+        assert_eq!(omp_continue(&args(&["--continue"])), OmpContinue::Newest);
+        assert_eq!(
+            omp_continue(&args(&["--model", "x", "-c"])),
+            OmpContinue::Newest
+        );
+        assert_eq!(
+            omp_continue(&args(&["-c", "fix the bug"])),
+            OmpContinue::Newest
+        );
+        let with_id = args(&["--continue", id]);
+        assert_eq!(omp_continue(&with_id), OmpContinue::Session(id));
+        // Another flag decides the session or the directory, or the flag is text after `--`.
+        for other in [
+            vec!["--resume", "abc"],
+            vec!["--continue", "--resume", "abc"],
+            vec!["--session-dir", "/elsewhere", "--continue"],
+            vec!["--continue", "--session-dir=/elsewhere"],
+            vec!["--continue", "--fork", "abc"],
+            vec!["--continue", "--no-session"],
+            vec!["--continue-later"],
+            vec!["--", "--continue"],
+            vec![],
+        ] {
+            assert_eq!(omp_continue(&args(&other)), OmpContinue::Other, "{other:?}");
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-continue-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = dir.join("2026-01-01T00-00-00-000Z_aaa.jsonl");
+        let newer = dir.join("2026-01-02T00-00-00-000Z_bbb.jsonl");
+        std::fs::write(&older, "{}\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::create_dir(dir.join("2026-01-03T00-00-00-000Z_ccc.jsonl")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&newer, "{}\n").unwrap();
+        let found = newest_session_beside(older.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, Some(newer));
+        assert_eq!(
+            newest_session_beside("/nonexistent-dir-for-herdr/x.jsonl"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_session_file_is_found_under_every_name_a_second_omp_could_open_it_by() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-same-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let live = dir.join("2026-01-01T00-00-00-000Z_aaaa.jsonl");
+        let other = dir.join("2026-01-02T00-00-00-000Z_bbbb.jsonl");
+        std::fs::write(&live, "{}\n").unwrap();
+        std::fs::write(&other, "{}\n").unwrap();
+        let hard = dir.join("alias.jsonl");
+        std::fs::hard_link(&live, &hard).unwrap();
+        let soft = dir.join("soft.jsonl");
+        std::os::unix::fs::symlink(&live, &soft).unwrap();
+        let dotted = dir
+            .join("sub")
+            .join("..")
+            .join("2026-01-01T00-00-00-000Z_aaaa.jsonl");
+        for name in [&live, &hard, &soft, &dotted] {
+            assert!(same_session_file(name, &live), "{name:?}");
+            assert!(same_session_file(&live, name), "{name:?}");
+            assert!(
+                omp_resume_value_matches(name.to_str().unwrap(), &dir, live.to_str().unwrap()),
+                "{name:?}"
+            );
+        }
+        // A relative value is read from the pane's directory.
+        assert!(omp_resume_value_matches(
+            "alias.jsonl",
+            &dir,
+            live.to_str().unwrap()
+        ));
+        // Another file, a file that is gone and a relative path are not the same file.
+        assert!(!same_session_file(&other, &live));
+        assert!(!same_session_file(&dir.join("gone.jsonl"), &live));
+        assert!(!same_session_file(Path::new("alias.jsonl"), &live));
+        assert!(!omp_resume_value_matches(
+            other.to_str().unwrap(),
+            &dir,
+            live.to_str().unwrap()
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

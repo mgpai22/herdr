@@ -19,8 +19,24 @@ const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(test)]
 pub(super) const INSTRUCTION_ACK_TIMEOUT: Duration = Duration::from_millis(200);
+/// How long a session change (`tree`, `fork`, `new_session`, `switch_session`) waits for its
+/// result: OMP's branch summary is a model call, and other extensions' session handlers may each
+/// take up to 30 s.
+#[cfg(not(test))]
+const SESSION_ACTION_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const SESSION_ACTION_ACK_TIMEOUT: Duration = Duration::from_millis(600);
+
+fn action_ack_timeout(op: crate::api::schema::AgentActionOp) -> Duration {
+    if op.is_session_change() {
+        SESSION_ACTION_ACK_TIMEOUT
+    } else {
+        INSTRUCTION_ACK_TIMEOUT
+    }
+}
 /// The longest an instruction may wait in the server queue before it is written. With the ack
-/// wait this stays under the 15 s that callers allow for an answer.
+/// wait this stays under the 15 s that callers allow for an answer (125 s for the session
+/// changes, whose ack wait is `SESSION_ACTION_ACK_TIMEOUT`).
 const INSTRUCTION_QUEUE_LIMIT: Duration = Duration::from_secs(5);
 /// The integration discards a block that reaches it later than this after it was written. The
 /// rest of the ack timeout leaves time for the take to be acked.
@@ -175,6 +191,16 @@ pub(super) fn record_action_outcome(
     );
 }
 
+/// Whether the process that owned a pending action no longer runs: it is not there, or its pid
+/// now belongs to another process. A platform that cannot observe processes never says so.
+fn owner_process_gone(owner: &crate::platform::OwnerProcessIncarnation) -> bool {
+    match crate::platform::observe_process(owner.pid) {
+        Ok(None) => true,
+        Ok(Some(live)) => live != *owner,
+        Err(_) => false,
+    }
+}
+
 /// An `agent.action` block written to the PTY whose result has not come back.
 pub(crate) struct PendingActionAck {
     pub(super) op: crate::api::schema::AgentActionOp,
@@ -188,6 +214,9 @@ pub(crate) struct PendingActionAck {
     pub(super) withdraws_listener: bool,
     /// The answer keys of the first ack were written; a second set is refused.
     pub(super) keys_written: bool,
+    /// The session file a pending `switch_session` asked for: no other pane may switch to it
+    /// until this one has its result.
+    pub(super) switch_target: Option<String>,
 }
 
 pub(crate) enum ActionResult {
@@ -259,6 +288,14 @@ fn valid_listener_runtime(runtime: &str) -> bool {
         && runtime
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// A mode name the integration may report: what OMP calls its modes (`tui`, `rpc`, `print`).
+pub(super) fn valid_ui_mode(mode: &str) -> bool {
+    (1..=16).contains(&mode.len())
+        && mode
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// Ends a delivery that got no final outcome: its `last_instruction` becomes `unconfirmed`, and a
@@ -554,6 +591,54 @@ impl App {
             ListenerWrite::Action,
             |agent| params.validate(agent),
         )?;
+        let switch_target = (params.op == crate::api::schema::AgentActionOp::SwitchSession)
+            .then(|| {
+                params
+                    .args
+                    .get("session_path")
+                    .and_then(|path| path.as_str())
+            })
+            .flatten();
+        if let Some(path) = switch_target {
+            // The same file under another name (a hard link, a symlink, a `..` segment) is as taken
+            // as the path itself: a second OMP on it would write the one file.
+            let same_file = |other: &str| {
+                crate::agent_resume::same_session_file(
+                    std::path::Path::new(other),
+                    std::path::Path::new(path),
+                )
+            };
+            if self
+                .pending_action_acks
+                .values()
+                .any(|pending| pending.switch_target.as_deref().is_some_and(&same_file))
+            {
+                return Err(encode_error(
+                    id,
+                    "agent_action_refused",
+                    "session_in_use: another pane is switching to that session now; nothing was sent"
+                        .to_string(),
+                ));
+            }
+            let runs_it = self.collect_agent_infos().into_iter().find(|other| {
+                other.terminal_id != agent.terminal_id
+                    && other
+                        .agent_session
+                        .as_ref()
+                        .is_some_and(|session| same_file(&session.value))
+            });
+            if let Some(other) = runs_it {
+                return Err(encode_error(
+                    id,
+                    "agent_action_refused",
+                    format!(
+                        "session_in_use: agent {} in pane {} runs that session; nothing was sent",
+                        other.name.as_deref().unwrap_or("(unnamed)"),
+                        other.pane_id
+                    ),
+                ));
+            }
+        }
         let action_id = new_instruction_id(&id, terminal_id.as_str());
         // The session herdr checked `expected_session` against: OMP may have changed it since,
         // before its session report reached herdr.
@@ -565,7 +650,7 @@ impl App {
             .to_string();
         let block = listener_block(ACTION_BLOCK, &action_id, &body, &block_runtime, true);
         self.write_listener_block(&id, ws_idx, pane_id, block)?;
-        let deadline = Instant::now() + INSTRUCTION_ACK_TIMEOUT;
+        let deadline = Instant::now() + action_ack_timeout(params.op);
         let (tx, rx) = std::sync::mpsc::channel();
         record_action_outcome(
             &mut self.last_actions,
@@ -585,6 +670,7 @@ impl App {
                 deadline,
                 withdraws_listener: true,
                 keys_written: false,
+                switch_target: switch_target.map(str::to_string),
             },
         );
         let op = params.op;
@@ -616,6 +702,31 @@ impl App {
             let _ = respond_to.send(response);
         });
         Ok(())
+    }
+
+    /// The session files that `switch_session` actions still waiting for their result are about
+    /// to open, with the terminal that asked.
+    pub(crate) fn pending_switch_claims(&self) -> Vec<(crate::terminal::TerminalId, String)> {
+        self.pending_action_acks
+            .values()
+            .filter_map(|pending| {
+                pending
+                    .switch_target
+                    .clone()
+                    .map(|target| (pending.terminal_id.clone(), target))
+            })
+            .collect()
+    }
+
+    /// The mode OMP runs in, as the listener of `target` reported it.
+    fn listener_ui_mode(&self, target: &str) -> Option<String> {
+        let resolved = self.resolve_agent_target(target).ok()?;
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)?
+            .terminal_id(resolved.pane_id)?;
+        self.state.terminals.get(terminal_id)?.ui_mode.clone()
     }
 
     /// Every check a guarded write to a pane's OMP listener needs, in one app-loop step.
@@ -658,6 +769,19 @@ impl App {
             ListenerWrite::Action => agent.accepts_actions,
         };
         if !accepts {
+            // A listener that takes instructions but runs outside OMP's terminal UI (RPC or print
+            // mode) never takes actions: the refusal the integration itself gives there.
+            if write == ListenerWrite::Action && agent.accepts_instructions {
+                if let Some(mode) = self.listener_ui_mode(target).filter(|mode| mode != "tui") {
+                    return Err(encode_error(
+                        id,
+                        "agent_action_refused",
+                        format!(
+                            "unsupported_mode: agent {target} runs OMP in {mode} mode, not in its terminal UI, and takes no actions there; nothing was written"
+                        ),
+                    ));
+                }
+            }
             return Err(encode_error(
                 id,
                 write.unsupported_code(),
@@ -833,7 +957,7 @@ impl App {
     /// gone (OMP dropped it on a session change or an exec restart), so the agent stops accepting
     /// instructions until the integration reports its listener again; at most one block can then
     /// reach the editor. Either way the outcome becomes `unconfirmed`.
-    pub(super) fn expire_instruction_acks(&mut self) {
+    pub(crate) fn expire_instruction_acks(&mut self) {
         let now = Instant::now();
         let terminals = &mut self.state.terminals;
         let recent = &mut self.recent_instructions;
@@ -845,10 +969,15 @@ impl App {
                 settle_unconfirmed(terminals, recent, instruction_id, pending, now);
                 false
             });
-        // An action block nobody acked may mean the listener is gone, as for an instruction.
+        // An action block nobody acked may mean the listener is gone, as for an instruction. An
+        // action to a closed pane, or to an OMP that exited or was killed while the change ran
+        // (the pane stays a shell), gets no result: it ends at once, and with it a switch claim.
         let last_actions = &mut self.last_actions;
         self.pending_action_acks.retain(|action_id, pending| {
-            if pending.deadline > now {
+            if pending.deadline > now
+                && terminals.contains_key(&pending.terminal_id)
+                && !owner_process_gone(&pending.owner)
+            {
                 return true;
             }
             record_action_outcome(
@@ -1329,6 +1458,7 @@ mod tests {
                 agent_pid: pid,
                 accepts_instructions,
                 accepts_actions: accepts_instructions,
+                ui_mode: None,
                 runtime_instance: runtime.map(str::to_string),
                 block_token: None,
                 peer_pid: Some(pid),
@@ -3073,6 +3203,8 @@ mod tests {
                 "active_tools": ["t".repeat(tool_bytes)],
                 "inactive_tools": ["bash"],
                 "status_text": "sahur: reviewing",
+                "session_name": "Fix the parser",
+                "leaf_id": "a1b2c3d4",
                 "subagents": {
                     "total": 2,
                     "running": 1,
@@ -3114,6 +3246,8 @@ mod tests {
         assert_eq!(json["subagents"]["truncated"], true);
         assert_eq!(json["subagents"]["items"][0]["run"], 2);
         assert_eq!(json["subagents"]["items"][0]["person"], true);
+        assert_eq!(json["session_name"], "Fix the parser");
+        assert_eq!(json["leaf_id"], "a1b2c3d4");
         assert!(report(&mut app, detail(33 * 1024)).contains("too large"));
         assert_eq!(app.agent_info_for_target(&target).unwrap().omp, Some(kept));
     }
@@ -3128,6 +3262,12 @@ mod tests {
             ("status", Op::Status),
             ("subagent_steer", Op::SubagentSteer),
             ("subagent_cancel", Op::SubagentCancel),
+            ("tree", Op::Tree),
+            ("fork", Op::Fork),
+            ("new_session", Op::NewSession),
+            ("switch_session", Op::SwitchSession),
+            ("label", Op::Label),
+            ("rename", Op::Rename),
         ] {
             let parsed: Op = serde_json::from_value(serde_json::json!(op)).unwrap();
             assert_eq!(parsed, expected);
@@ -3156,6 +3296,8 @@ mod tests {
             inactive_tools: None,
             status_text: None,
             subagents: None,
+            session_name: None,
+            leaf_id: None,
             updated_ms: 1,
         };
         let report = |app: &mut App, runtime: &str, peer_pid: u32| {
@@ -3187,6 +3329,685 @@ mod tests {
         let info = app.agent_info_for_target(&target).unwrap();
         assert!(info.accepts_actions);
         assert_eq!(info.omp, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_session_change_waits_longer_for_its_result_than_other_actions() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::NewSession, serde_json::json!({})),
+        );
+        let (action_id, body) = sent_action(&mut rx);
+        assert_eq!(body["op"], "new_session");
+        // Past the deadline of every other op, the session change still waits for its result.
+        std::thread::sleep(INSTRUCTION_ACK_TIMEOUT + Duration::from_millis(150));
+        app.expire_instruction_acks();
+        let ok = ack_action(
+            &mut app,
+            &target,
+            &action_id,
+            std::process::id(),
+            true,
+            None,
+            vec![],
+        );
+        assert!(ok.contains("\"ok\""), "{ok}");
+        let done = response.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(done.contains("\"new_session\""), "{done}");
+        assert!(!done.contains("action_unconfirmed"), "{done}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn switch_session_is_refused_for_a_file_another_pane_runs() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let other_path = std::env::current_dir()
+            .unwrap()
+            .join("other-omp.jsonl")
+            .display()
+            .to_string();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].tabs[0].panes[&other_pane]
+            .attached_terminal_id
+            .clone();
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let terminal = app.state.terminals.get_mut(&other_terminal).unwrap();
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+        assert!(terminal
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::agent_resume::AgentSessionRef::path(other_path.clone()),
+                Some(1),
+                Some("startup".into()),
+                Some(("default".into(), owner)),
+            )
+            .is_some());
+        let refused = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": other_path }),
+            ),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+        let refused: crate::api::schema::ErrorResponse = serde_json::from_str(&refused).unwrap();
+        assert_eq!(refused.error.code, "agent_action_refused");
+        assert!(
+            refused.error.message.starts_with("session_in_use:"),
+            "{}",
+            refused.error.message
+        );
+        assert!(rx.try_recv().is_err(), "nothing was written");
+        // A file no other pane runs is sent on to OMP.
+        start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": "/elsewhere/free.jsonl" }),
+            ),
+        );
+        assert_eq!(sent_action(&mut rx).1["op"], "switch_session");
+        // While that switch waits for its result, no other pane may switch to the same file. The
+        // pending switch is handed to the other pane, so this agent can write again.
+        for pending in app.pending_action_acks.values_mut() {
+            pending.terminal_id = other_terminal.clone();
+        }
+        let claimed = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": "/elsewhere/free.jsonl" }),
+            ),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+        let claimed: crate::api::schema::ErrorResponse = serde_json::from_str(&claimed).unwrap();
+        assert!(
+            claimed.error.message.starts_with("session_in_use:"),
+            "{}",
+            claimed.error.message
+        );
+        assert!(rx.try_recv().is_err(), "nothing was written");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_start_refuses_to_resume_a_session_a_live_omp_pane_runs() {
+        let (mut app, _instruct, _rx) = guarded_fixture(AgentState::Idle);
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, args: &[&str]| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: args.iter().map(|arg| arg.to_string()).collect(),
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        let path = fixture_session_path();
+        // From another directory (the new pane's): OMP also searches other projects for a prefix,
+        // so a prefix, a path and an id all open the live pane's file from here.
+        for args in [
+            vec!["--resume", path.as_str()],
+            vec!["--resume=OMP-NAT"],
+            vec!["-r", "omp-nat"],
+            vec!["--session", "omp-native"],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{args:?}: {response}"
+            );
+        }
+        // Another session, and a flag value OMP would not take, pass this check (the fixture has
+        // no terminal runtime, so the start stops at the next one).
+        for args in [vec!["--resume", "zz9"], vec!["-r", "-omp"]] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_pane_unavailable",
+                "{args:?}: {response}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_start_refuses_to_resume_a_session_another_pane_is_switching_to() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .action_listener = true;
+        let claimed = "/elsewhere/2026-02-02T00-00-00-000Z_claimed.jsonl";
+        let _response = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": claimed }),
+            ),
+        );
+        sent_action(&mut rx);
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        // The new pane's directory is not the claimant's: a prefix counts from any directory.
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, arg: &str| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: vec!["--resume".into(), arg.into()],
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        // The file the switch is about to open is as taken as one a pane runs now.
+        for arg in [claimed, "2026-02-02T00-00", "claimed"] {
+            let response = start(&mut app, arg);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{arg}: {response}"
+            );
+        }
+        let free = start(&mut app, "/elsewhere/free.jsonl");
+        assert_eq!(free["error"]["code"], "agent_pane_unavailable", "{free}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_start_refuses_to_continue_a_session_a_live_omp_pane_runs() {
+        let (mut app, _instruct, _rx) = guarded_fixture(AgentState::Idle);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-continue-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("2026-01-01T00-00-00-000Z_0a1b2c3d-4e5f-6789-abcd-ef0123456789.jsonl");
+        std::fs::write(&live, "{}\n").unwrap();
+        // The live pane runs the newest file of its directory.
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let terminal_id = fixture_terminal_id(&app);
+        assert!(app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                Some(
+                    crate::agent_resume::AgentSessionRef::path(live.display().to_string()).unwrap()
+                ),
+                Some(2),
+                Some("startup".into()),
+                Some(("default".into(), owner)),
+            )
+            .is_some());
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let target_terminal = app.state.workspaces[1]
+            .terminal_id(target_pane)
+            .cloned()
+            .unwrap();
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, args: &[&str]| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: args.iter().map(|arg| arg.to_string()).collect(),
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        // Another directory: the live pane's sessions are not this pane's to continue (the
+        // fixture has no terminal runtime, so the start stops at the next check).
+        let elsewhere = start(&mut app, &["--continue"]);
+        assert_eq!(
+            elsewhere["error"]["code"], "agent_pane_unavailable",
+            "{elsewhere}"
+        );
+        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
+        for args in [
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--model", "m", "--continue"],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{args:?}: {response}"
+            );
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("`--continue`"),
+                "{response}"
+            );
+        }
+        // `--continue <session id>` is a resume of that id: refused for the live pane's id, free
+        // for another. `--session-dir` moves the lookup away from the live pane's directory.
+        let live_id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        let refused = start(&mut app, &["--continue", live_id]);
+        assert_eq!(
+            refused["error"]["code"], "agent_session_in_use",
+            "{refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("--resume {live_id}")),
+            "{refused}"
+        );
+        for args in [
+            vec!["--continue", "ffffffff-4e5f-6789-abcd-ef0123456789"],
+            vec!["--session-dir", "/elsewhere", "--continue"],
+            vec!["--continue", "--session-dir=/elsewhere"],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_pane_unavailable",
+                "{args:?}: {response}"
+            );
+        }
+        // A newer file that no live pane runs is what `--continue` opens.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.join("2026-01-02T00-00-00-000Z_dead.jsonl"), "{}\n").unwrap();
+        let free = start(&mut app, &["--continue"]);
+        assert_eq!(free["error"]["code"], "agent_pane_unavailable", "{free}");
+        // Without the flag nothing changes.
+        let plain = start(&mut app, &["--model", "m"]);
+        assert_eq!(plain["error"]["code"], "agent_pane_unavailable", "{plain}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A temporary directory with a session file and a hard link to it.
+    #[cfg(target_os = "linux")]
+    fn session_file_with_hard_link(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-{tag}-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("2026-01-01T00-00-00-000Z_0a1b2c3d-4e5f-6789-abcd-ef0123456789.jsonl");
+        std::fs::write(&live, "{}\n").unwrap();
+        let hard = dir.join("zz-alias.jsonl");
+        std::fs::hard_link(&live, &hard).unwrap();
+        (dir, live, hard)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn switch_session_is_refused_for_another_name_of_a_file_another_pane_runs_or_claims() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .action_listener = true;
+        let (dir, live, hard) = session_file_with_hard_link("switch");
+        let soft = dir.join("soft.jsonl");
+        std::os::unix::fs::symlink(&live, &soft).unwrap();
+        let dotted = dir.join("sub").join("..").join(live.file_name().unwrap());
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].tabs[0].panes[&other_pane]
+            .attached_terminal_id
+            .clone();
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let terminal = app.state.terminals.get_mut(&other_terminal).unwrap();
+        terminal.set_detected_state(Some(Agent::Omp), AgentState::Idle);
+        assert!(terminal
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::agent_resume::AgentSessionRef::path(live.display().to_string()),
+                Some(1),
+                Some("startup".into()),
+                Some(("default".into(), owner)),
+            )
+            .is_some());
+        // Every name the live pane's file has is as taken as its own path.
+        for name in [&live, &hard, &soft, &dotted] {
+            let refused = start_action(
+                &mut app,
+                action_params(
+                    &instruct,
+                    AgentActionOp::SwitchSession,
+                    serde_json::json!({ "session_path": name.display().to_string() }),
+                ),
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+            let refused: crate::api::schema::ErrorResponse =
+                serde_json::from_str(&refused).unwrap();
+            assert!(
+                refused.error.message.starts_with("session_in_use: agent"),
+                "{name:?}: {}",
+                refused.error.message
+            );
+        }
+        assert!(rx.try_recv().is_err(), "nothing was written");
+        // A file no pane runs is sent on; while its switch waits for a result, another name of it
+        // is claimed too.
+        let free = dir.join("free.jsonl");
+        std::fs::write(&free, "{}\n").unwrap();
+        let free_alias = dir.join("free-alias.jsonl");
+        std::fs::hard_link(&free, &free_alias).unwrap();
+        start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": free.display().to_string() }),
+            ),
+        );
+        assert_eq!(sent_action(&mut rx).1["op"], "switch_session");
+        for pending in app.pending_action_acks.values_mut() {
+            pending.terminal_id = other_terminal.clone();
+        }
+        let claimed = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": free_alias.display().to_string() }),
+            ),
+        )
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+        let claimed: crate::api::schema::ErrorResponse = serde_json::from_str(&claimed).unwrap();
+        assert!(
+            claimed
+                .error
+                .message
+                .starts_with("session_in_use: another pane is switching"),
+            "{}",
+            claimed.error.message
+        );
+        assert!(rx.try_recv().is_err(), "nothing was written");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn agent_start_refuses_to_resume_or_continue_another_name_of_a_file_a_live_omp_pane_runs()
+    {
+        let (mut app, _instruct, _rx) = guarded_fixture(AgentState::Idle);
+        let (dir, live, hard) = session_file_with_hard_link("start");
+        let owner = crate::platform::observe_process(std::process::id())
+            .unwrap()
+            .unwrap();
+        let terminal_id = fixture_terminal_id(&app);
+        assert!(app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_session_ref_for_session_start_with_recovery(
+                "herdr:omp".into(),
+                "omp".into(),
+                crate::agent_resume::AgentSessionRef::path(live.display().to_string()),
+                Some(2),
+                Some("startup".into()),
+                Some(("default".into(), owner)),
+            )
+            .is_some());
+        app.state
+            .workspaces
+            .push(Workspace::test_new("start-target"));
+        app.state.ensure_test_terminals();
+        let target_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let target_terminal = app.state.workspaces[1]
+            .terminal_id(target_pane)
+            .cloned()
+            .unwrap();
+        let pane_id = app.public_pane_id(1, target_pane).unwrap();
+        let start = |app: &mut App, args: &[&str]| -> serde_json::Value {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: "start".into(),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: "second".into(),
+                        kind: "omp".into(),
+                        pane_id: pane_id.clone(),
+                        args: args.iter().map(|arg| arg.to_string()).collect(),
+                        timeout_ms: Some(4_000),
+                        profile: None,
+                    },
+                ),
+            });
+            serde_json::from_str(&response).unwrap()
+        };
+        // Another name for the live pane's file opens that file: refused, as its own path is.
+        let hard_path = hard.display().to_string();
+        for args in [
+            vec!["--resume", hard_path.as_str()],
+            vec!["--session", hard_path.as_str()],
+        ] {
+            let response = start(&mut app, &args);
+            assert_eq!(
+                response["error"]["code"], "agent_session_in_use",
+                "{args:?}: {response}"
+            );
+        }
+        // `--continue` opens the newest file of the live pane's directory, and that is the other
+        // name (the same modification time, the later name).
+        app.state.terminals.get_mut(&target_terminal).unwrap().cwd = "/fixture/project".into();
+        let response = start(&mut app, &["--continue"]);
+        assert_eq!(
+            response["error"]["code"], "agent_session_in_use",
+            "{response}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_action_ends_at_once_when_the_omp_that_ran_it_exits() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .action_listener = true;
+        let response = start_action(
+            &mut app,
+            action_params(&instruct, AgentActionOp::NewSession, serde_json::json!({})),
+        );
+        sent_action(&mut rx);
+        // The server looks at pending actions on its own, once a second, not only when a request
+        // comes in; with none pending it has nothing to look at.
+        assert!(app.next_pending_action_owner_check().is_some());
+        let later = Instant::now() + Duration::from_secs(2);
+        // The OMP is alive: the action keeps waiting.
+        app.check_pending_action_owners(later);
+        assert!(response.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(app.pending_action_acks.len(), 1);
+        // The OMP that owns it is killed while its session change runs; the pane stays open.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let owner = crate::platform::observe_process(child.id())
+            .unwrap()
+            .unwrap();
+        for pending in app.pending_action_acks.values_mut() {
+            pending.owner = owner.clone();
+        }
+        app.check_pending_action_owners(later + Duration::from_secs(2));
+        assert_eq!(app.pending_action_acks.len(), 1, "the owner still runs");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        app.check_pending_action_owners(later + Duration::from_secs(4));
+        // The caller hears at once, not after the session ack deadline of 120 s.
+        let ended = response.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(ended.contains("action_unconfirmed"), "{ended}");
+        assert!(app.pending_action_acks.is_empty());
+        assert!(app.next_pending_action_owner_check().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closing_a_pane_ends_its_pending_switch_and_its_claim() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let terminal_id = fixture_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .action_listener = true;
+        let target = "/elsewhere/claimed.jsonl";
+        let response = start_action(
+            &mut app,
+            action_params(
+                &instruct,
+                AgentActionOp::SwitchSession,
+                serde_json::json!({ "session_path": target }),
+            ),
+        );
+        sent_action(&mut rx);
+        // The pane closes while the switch waits for its result.
+        app.state.workspaces[0].tabs[0].panes.clear();
+        app.state.remove_unattached_terminal_ids([terminal_id]);
+        app.shutdown_detached_terminal_runtimes();
+        // The caller hears at once, long before the session ack deadline.
+        let ended = response.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(ended.contains("action_unconfirmed"), "{ended}");
+        assert!(app
+            .pending_action_acks
+            .values()
+            .all(|pending| pending.switch_target.as_deref() != Some(target)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_omp_branch_report_moves_the_session_to_the_branch_file() {
+        let (mut app, instruct, _rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        let branch_path = std::env::current_dir()
+            .unwrap()
+            .join("omp-branch.jsonl")
+            .display()
+            .to_string();
+        // The integration's state reports name the session, which makes it the hook's session.
+        app.state
+            .terminals
+            .get_mut(&fixture_terminal_id(&app))
+            .unwrap()
+            .set_hook_authority_with_session_ref(
+                "herdr:omp".into(),
+                "omp".into(),
+                AgentState::Idle,
+                None,
+                crate::agent_resume::AgentSessionRef::path(fixture_session_path()),
+                Some(60),
+            );
+        let pid = std::process::id();
+        let reply = app.handle_pane_report_agent_session_v2(
+            "v2".into(),
+            crate::api::schema::PaneReportAgentSessionV2Params {
+                pane_id: target.clone(),
+                source: "herdr:omp".into(),
+                agent: "omp".into(),
+                seq: Some(70),
+                agent_session_id: None,
+                agent_session_path: Some(branch_path.clone()),
+                session_start_source: Some("branch".into()),
+                launch_profile: "default".into(),
+                agent_pid: pid,
+                accepts_instructions: true,
+                accepts_actions: true,
+                ui_mode: None,
+                runtime_instance: Some(FIXTURE_RUNTIME.into()),
+                block_token: None,
+                peer_pid: Some(pid),
+            },
+        );
+        assert!(reply.contains("\"ok\""), "{reply}");
+        let info = app.agent_info_for_target(&target).unwrap();
+        assert_eq!(info.agent_session.unwrap().value, branch_path);
+        assert!(info.accepts_actions);
     }
 
     #[cfg(target_os = "linux")]
@@ -3303,6 +4124,83 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn an_action_for_a_listener_outside_the_terminal_ui_is_refused_as_unsupported_mode() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        let pid = std::process::id();
+        // A listener that takes instructions only, in the mode the integration names.
+        let mut seq = 80;
+        let mut report = |app: &mut App, ui_mode: Option<&str>, accepts_instructions: bool| {
+            seq += 1;
+            let reply = app.handle_pane_report_agent_session_v2(
+                "v2".into(),
+                crate::api::schema::PaneReportAgentSessionV2Params {
+                    pane_id: target.clone(),
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    seq: Some(seq),
+                    agent_session_id: None,
+                    agent_session_path: Some(fixture_session_path()),
+                    session_start_source: Some("startup".into()),
+                    launch_profile: "default".into(),
+                    agent_pid: pid,
+                    accepts_instructions,
+                    accepts_actions: false,
+                    ui_mode: ui_mode.map(str::to_string),
+                    runtime_instance: Some(FIXTURE_RUNTIME.into()),
+                    block_token: None,
+                    peer_pid: Some(pid),
+                },
+            );
+            assert!(reply.contains("\"ok\""), "{reply}");
+        };
+        let refusal = |app: &mut App| {
+            let response = start_action(
+                app,
+                action_params(&instruct, AgentActionOp::NewSession, serde_json::json!({})),
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+            serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+                .unwrap()
+                .error
+        };
+        for mode in ["rpc", "print"] {
+            report(&mut app, Some(mode), true);
+            let refused = refusal(&mut app);
+            assert_eq!(refused.code, "agent_action_refused", "{mode}");
+            assert!(
+                refused.message.starts_with("unsupported_mode:"),
+                "{}",
+                refused.message
+            );
+            assert!(
+                refused
+                    .message
+                    .contains(&format!("{mode} mode, not in its terminal UI")),
+                "{}",
+                refused.message
+            );
+            assert!(rx.try_recv().is_err(), "nothing was written");
+        }
+        // No mode (an integration older than v16), the terminal UI without action support, a
+        // name that is not a mode, and no listener at all: the listener-is-gone refusal as before.
+        for (mode, accepts_instructions) in [
+            (None, true),
+            (Some("tui"), true),
+            (Some("RPC mode!"), true),
+            (Some("rpc"), false),
+        ] {
+            report(&mut app, mode, accepts_instructions);
+            let refused = refusal(&mut app);
+            assert_eq!(refused.code, "agent_action_unsupported", "{mode:?}");
+            assert!(rx.try_recv().is_err(), "nothing was written");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn an_instruction_to_an_action_listener_names_its_session() {
         let (mut app, params, mut rx) = guarded_fixture(AgentState::Idle);
         app.state
@@ -3349,6 +4247,7 @@ mod tests {
                     agent_pid: pid,
                     accepts_instructions: true,
                     accepts_actions: true,
+                    ui_mode: None,
                     runtime_instance: Some(FIXTURE_RUNTIME.into()),
                     block_token: Some(token.into()),
                     peer_pid: Some(pid),
