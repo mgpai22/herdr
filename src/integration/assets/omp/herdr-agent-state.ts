@@ -203,6 +203,9 @@ let instructionListener = false;
 // Whether that listener may also run `agent.action` ops: only in OMP's terminal UI, where the editor
 // and the session commands they use are real. RPC and print mode have a stand-in UI.
 let actionListener = false;
+// The mode OMP says it runs in (`tui`, `rpc`, `json`, `print`): herdr names it when it refuses an action
+// for a listener outside the terminal UI.
+let listenerMode: string | undefined;
 let unsubscribeInstructions: (() => void) | undefined;
 // Idle deliveries handed to OMP and acked as taken, acked again when OMP starts their turn or
 // goes idle without starting it.
@@ -760,6 +763,7 @@ function sessionReport(sessionStartSource: string, sessionRef: Record<string, un
       agent_pid: process.pid,
       accepts_instructions: instructionListener,
       accepts_actions: instructionListener && actionListener,
+      ...(listenerMode ? { ui_mode: listenerMode } : {}),
       runtime_instance: runtimeInstance,
       block_token: blockTokens.current,
       ...sessionRef,
@@ -2700,39 +2704,77 @@ export default function (pi) {
   // 0600 file made the first time a spool is written, in herdr's configuration directory
   // (`HERDR_OMP_SPOOL_KEY_FILE` names another file).
   let spoolKeyCache: Buffer | undefined;
+  // What a key file holds: the key, "missing", "invalid" (a file or directory that is not a key:
+  // empty, cut short, damaged) or "unreadable" (permissions and the like).
+  async function readSpoolKey(file: string): Promise<Buffer | "missing" | "invalid" | "unreadable"> {
+    try {
+      const text = (await readFile(file, "utf8")).trim();
+      return /^[0-9a-f]{64}$/.test(text) ? Buffer.from(text, "hex") : "invalid";
+    } catch (error: any) {
+      return error?.code === "ENOENT" ? "missing" : error?.code === "EISDIR" ? "invalid" : "unreadable";
+    }
+  }
+
+  // The key file once a process that is still writing it has had its time: a file made a moment ago
+  // is empty until its key is written.
+  async function settledSpoolKey(file: string): Promise<Buffer | "missing" | "invalid" | "unreadable"> {
+    let found = await readSpoolKey(file);
+    for (let attempt = 0; attempt < 5 && found === "invalid"; attempt += 1) {
+      await delay(20);
+      found = await readSpoolKey(file);
+    }
+    return found;
+  }
+
+  // The key, made when `create` and there is none. A key file that stays something else than a key
+  // (a crash between creating it and writing it, damage, a directory) is set aside, never deleted,
+  // and replaced on the next spool write; a notice names both files. A spool signed with the old
+  // key is then set aside as unverified, with its own notice.
   async function spoolKey(create: boolean): Promise<Buffer | undefined> {
     if (spoolKeyCache) return spoolKeyCache;
     const file =
       process.env.HERDR_OMP_SPOOL_KEY_FILE || path.join(process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"), "herdr", "omp-spool.key");
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        const text = (await readFile(file, "utf8")).trim();
-        if (/^[0-9a-f]{64}$/.test(text)) return (spoolKeyCache = Buffer.from(text, "hex"));
-        // Not a key, or one another process is still writing: look again.
-      } catch (error: any) {
-        if (error?.code !== "ENOENT" || !create) return undefined;
-        try {
-          await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-          await writeFile(file, `${randomBytes(32).toString("hex")}\n`, { flag: "wx", mode: 0o600 });
-        } catch (writeError: any) {
-          if (writeError?.code !== "EEXIST") return undefined;
+    let found = await settledSpoolKey(file);
+    if (found instanceof Buffer) return (spoolKeyCache = found);
+    if (!create || found === "unreadable") return undefined;
+    try {
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+      if (found === "invalid") {
+        // Looked at once more: another process may have replaced it since.
+        const again = await readSpoolKey(file);
+        if (again instanceof Buffer) return (spoolKeyCache = again);
+        if (again === "invalid") {
+          const aside = `${file}.invalid-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+          await rename(file, aside);
+          try {
+            detailCtx?.ui?.notify?.(
+              `herdr found its held-prompt key file ${file} empty or damaged, kept it as ${aside}, and made a new key; a held prompt saved with the old key is set aside, not put in the editor`,
+              "warning",
+            );
+          } catch {}
         }
-        continue;
       }
-      await delay(20);
+      await writeFile(file, `${randomBytes(32).toString("hex")}\n`, { flag: "wx", mode: 0o600 });
+    } catch (error: any) {
+      // Another process made the key first: its key is the one.
+      if (error?.code !== "EEXIST") return undefined;
     }
-    return undefined;
+    found = await settledSpoolKey(file);
+    return found instanceof Buffer ? (spoolKeyCache = found) : undefined;
   }
 
-  // What the signature covers: every field of a spool but the signature, in a fixed order.
-  function spoolSignedText(spool: any): string {
+  // What the signature covers: every field of a spool but the signature, in a fixed order, and
+  // where the spool lies: its session (the name of the artifact directory carries the session id,
+  // and a move keeps it) and its own file name. A spool copied into another session, or under
+  // another name, does not verify.
+  function spoolSignedText(spool: any, file: string): string {
     const prompt = (item: any) => [item.text, item.images, item.savedAt ?? null];
     const twin = spool.twin ? [spool.twin.file, spool.twin.keep.map(prompt)] : null;
-    return JSON.stringify([spool.pid ?? null, spool.savedAt ?? null, spool.id ?? null, twin, spool.sources ?? [], spool.prompts.map(prompt)]);
+    return JSON.stringify([path.basename(path.dirname(file)), path.basename(file), spool.pid ?? null, spool.savedAt ?? null, spool.id ?? null, twin, spool.sources ?? [], spool.prompts.map(prompt)]);
   }
 
-  function spoolSignature(key: Buffer, spool: any): string {
-    return createHmac("sha256", key).update(spoolSignedText(spool)).digest("hex");
+  function spoolSignature(key: Buffer, spool: any, file: string): string {
+    return createHmac("sha256", key).update(spoolSignedText(spool, file)).digest("hex");
   }
 
   // Whether `file` is inside `root`, by name.
@@ -2795,7 +2837,7 @@ export default function (pi) {
     const key = await spoolKey(false);
     let signed = false;
     try {
-      const expected = key && typeof spool.sig === "string" ? Buffer.from(spoolSignature(key, spool), "hex") : undefined;
+      const expected = key && typeof spool.sig === "string" ? Buffer.from(spoolSignature(key, spool, file), "hex") : undefined;
       const given = Buffer.from(typeof spool.sig === "string" ? spool.sig : "", "hex");
       signed = expected !== undefined && expected.length === given.length && timingSafeEqual(expected, given);
     } catch {}
@@ -2833,7 +2875,7 @@ export default function (pi) {
     const root = path.dirname(path.dirname(file));
     const sources = [...new Set([...prompts, ...(meta?.twin?.keep ?? [])].flatMap((prompt) => prompt.images).filter((image) => image && !pathInside(root, image)))];
     const spool: any = { v: 3, pid: process.pid, savedAt: Date.now(), ...meta, sources, prompts };
-    spool.sig = spoolSignature(key, spool);
+    spool.sig = spoolSignature(key, spool, file);
     const text = JSON.stringify(spool);
     if (Buffer.byteLength(text) > SPOOL_MAX_BYTES) throw new Error("the spool is too big");
     await writeAtomic(file, text);
@@ -3444,6 +3486,7 @@ export default function (pi) {
     });
     instructionListener = typeof unsubscribeInstructions === "function";
     actionListener = instructionListener && editorIsReal(ctx);
+    listenerMode = typeof ctx?.mode === "string" ? ctx.mode : undefined;
   }
 
   // Removes herdr blocks for this runtime from the editor text; returns whether it found any.

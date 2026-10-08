@@ -3838,6 +3838,13 @@
             },
             "source": {
               "type": "string"
+            },
+            "ui_mode": {
+              "description": "The mode OMP runs in (`tui`, `rpc`, `json` or `print`), when the integration says. A\nlistener in another mode than `tui` takes no actions, and Herdr refuses an action for it\nas `unsupported_mode` (OMP integration v16+).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

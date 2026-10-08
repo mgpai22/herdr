@@ -1806,6 +1806,10 @@ impl App {
             terminal.instruction_listener = listener;
             terminal.instruction_listener_runtime = runtime;
             terminal.action_listener = params.accepts_instructions && params.accepts_actions;
+            terminal.ui_mode = params
+                .ui_mode
+                .clone()
+                .filter(|mode| params.accepts_instructions && super::agents::valid_ui_mode(mode));
             terminal.block_token = params
                 .block_token
                 .clone()

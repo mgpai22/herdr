@@ -290,6 +290,14 @@ fn valid_listener_runtime(runtime: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+/// A mode name the integration may report: what OMP calls its modes (`tui`, `rpc`, `print`).
+pub(super) fn valid_ui_mode(mode: &str) -> bool {
+    (1..=16).contains(&mode.len())
+        && mode
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// Ends a delivery that got no final outcome: its `last_instruction` becomes `unconfirmed`, and a
 /// never-taken delivery withdraws the listener of the process it was written to, which may be
 /// gone.
@@ -710,6 +718,17 @@ impl App {
             .collect()
     }
 
+    /// The mode OMP runs in, as the listener of `target` reported it.
+    fn listener_ui_mode(&self, target: &str) -> Option<String> {
+        let resolved = self.resolve_agent_target(target).ok()?;
+        let terminal_id = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)?
+            .terminal_id(resolved.pane_id)?;
+        self.state.terminals.get(terminal_id)?.ui_mode.clone()
+    }
+
     /// Every check a guarded write to a pane's OMP listener needs, in one app-loop step.
     fn check_listener_write(
         &mut self,
@@ -750,6 +769,19 @@ impl App {
             ListenerWrite::Action => agent.accepts_actions,
         };
         if !accepts {
+            // A listener that takes instructions but runs outside OMP's terminal UI (RPC or print
+            // mode) never takes actions: the refusal the integration itself gives there.
+            if write == ListenerWrite::Action && agent.accepts_instructions {
+                if let Some(mode) = self.listener_ui_mode(target).filter(|mode| mode != "tui") {
+                    return Err(encode_error(
+                        id,
+                        "agent_action_refused",
+                        format!(
+                            "unsupported_mode: agent {target} runs OMP in {mode} mode, not in its terminal UI, and takes no actions there; nothing was written"
+                        ),
+                    ));
+                }
+            }
             return Err(encode_error(
                 id,
                 write.unsupported_code(),
@@ -1426,6 +1458,7 @@ mod tests {
                 agent_pid: pid,
                 accepts_instructions,
                 accepts_actions: accepts_instructions,
+                ui_mode: None,
                 runtime_instance: runtime.map(str::to_string),
                 block_token: None,
                 peer_pid: Some(pid),
@@ -3965,6 +3998,7 @@ mod tests {
                 agent_pid: pid,
                 accepts_instructions: true,
                 accepts_actions: true,
+                ui_mode: None,
                 runtime_instance: Some(FIXTURE_RUNTIME.into()),
                 block_token: None,
                 peer_pid: Some(pid),
@@ -4090,6 +4124,83 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn an_action_for_a_listener_outside_the_terminal_ui_is_refused_as_unsupported_mode() {
+        use crate::api::schema::AgentActionOp;
+        let (mut app, instruct, mut rx) = guarded_fixture(AgentState::Idle);
+        let target = instruct.target.clone();
+        let pid = std::process::id();
+        // A listener that takes instructions only, in the mode the integration names.
+        let mut seq = 80;
+        let mut report = |app: &mut App, ui_mode: Option<&str>, accepts_instructions: bool| {
+            seq += 1;
+            let reply = app.handle_pane_report_agent_session_v2(
+                "v2".into(),
+                crate::api::schema::PaneReportAgentSessionV2Params {
+                    pane_id: target.clone(),
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    seq: Some(seq),
+                    agent_session_id: None,
+                    agent_session_path: Some(fixture_session_path()),
+                    session_start_source: Some("startup".into()),
+                    launch_profile: "default".into(),
+                    agent_pid: pid,
+                    accepts_instructions,
+                    accepts_actions: false,
+                    ui_mode: ui_mode.map(str::to_string),
+                    runtime_instance: Some(FIXTURE_RUNTIME.into()),
+                    block_token: None,
+                    peer_pid: Some(pid),
+                },
+            );
+            assert!(reply.contains("\"ok\""), "{reply}");
+        };
+        let refusal = |app: &mut App| {
+            let response = start_action(
+                app,
+                action_params(&instruct, AgentActionOp::NewSession, serde_json::json!({})),
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+            serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+                .unwrap()
+                .error
+        };
+        for mode in ["rpc", "print"] {
+            report(&mut app, Some(mode), true);
+            let refused = refusal(&mut app);
+            assert_eq!(refused.code, "agent_action_refused", "{mode}");
+            assert!(
+                refused.message.starts_with("unsupported_mode:"),
+                "{}",
+                refused.message
+            );
+            assert!(
+                refused
+                    .message
+                    .contains(&format!("{mode} mode, not in its terminal UI")),
+                "{}",
+                refused.message
+            );
+            assert!(rx.try_recv().is_err(), "nothing was written");
+        }
+        // No mode (an integration older than v16), the terminal UI without action support, a
+        // name that is not a mode, and no listener at all: the listener-is-gone refusal as before.
+        for (mode, accepts_instructions) in [
+            (None, true),
+            (Some("tui"), true),
+            (Some("RPC mode!"), true),
+            (Some("rpc"), false),
+        ] {
+            report(&mut app, mode, accepts_instructions);
+            let refused = refusal(&mut app);
+            assert_eq!(refused.code, "agent_action_unsupported", "{mode:?}");
+            assert!(rx.try_recv().is_err(), "nothing was written");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn an_instruction_to_an_action_listener_names_its_session() {
         let (mut app, params, mut rx) = guarded_fixture(AgentState::Idle);
         app.state
@@ -4136,6 +4247,7 @@ mod tests {
                     agent_pid: pid,
                     accepts_instructions: true,
                     accepts_actions: true,
+                    ui_mode: None,
                     runtime_instance: Some(FIXTURE_RUNTIME.into()),
                     block_token: Some(token.into()),
                     peer_pid: Some(pid),
