@@ -17,6 +17,8 @@ const originalEnvironment = {
   HERDR_OMP_INSTRUCTION_POLL_MS: process.env.HERDR_OMP_INSTRUCTION_POLL_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
+  HERDR_STATE_SOCKET_PATH: process.env.HERDR_STATE_SOCKET_PATH,
+  HERDR_STATE_TOKEN: process.env.HERDR_STATE_TOKEN,
   HERDR_OMP_SPOOL_RESTORE_MS: process.env.HERDR_OMP_SPOOL_RESTORE_MS,
   OMPCODE: process.env.OMPCODE,
   OMP_PROFILE: process.env.OMP_PROFILE,
@@ -133,6 +135,8 @@ function configureIntegrationEnvironment(recordingSocketPath: string) {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = recordingSocketPath;
   process.env.HERDR_PANE_ID = "test:p1";
+  delete process.env.HERDR_STATE_SOCKET_PATH;
+  delete process.env.HERDR_STATE_TOKEN;
 }
 
 function captureConnectionEndpoint() {
@@ -322,6 +326,82 @@ test("OMP accepts POSIX and Windows session paths", async () => {
   );
   expect(isAbsoluteSessionPath("C:/Users/User/.omp/agent/sessions/omp-session.jsonl")).toBe(true);
   expect(isAbsoluteSessionPath("relative/omp-session.jsonl")).toBe(false);
+});
+
+test("OMP reports through the state socket with the pane's token when herdr gives one", async () => {
+  const requests = await startRecordingServer("omp-state-socket");
+  process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `herdr-missing-${process.pid}.sock`);
+  process.env.HERDR_STATE_TOKEN = "pane-token";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+
+  expect(requestStates(requests)).toEqual(["idle", "working"]);
+  expect(requests.every((request) => isRecord(request) && request.state_token === "pane-token")).toBe(true);
+});
+
+test("OMP never falls back to the full socket when the state socket is gone", async () => {
+  await startRecordingServer("omp-state-socket-gone");
+  const statePath = join(tmpdir(), `herdr-missing-state-${process.pid}.sock`);
+  process.env.HERDR_STATE_SOCKET_PATH = statePath;
+  process.env.HERDR_STATE_TOKEN = "pane-token";
+  const endpoints: unknown[] = [];
+  net.createConnection = ((...args: Parameters<typeof net.createConnection>) => {
+    endpoints.push(args[0]);
+    return originalCreateConnection(...args);
+  }) as typeof net.createConnection;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+  // Both attempts of the first report go to the state socket. Integrations other tests loaded may
+  // still retry against their own sockets, so only this test's two paths count.
+  await waitFor(() => endpoints.filter((endpoint) => endpoint === statePath).length >= 2, 5_000);
+
+  expect(endpoints).not.toContain(process.env.HERDR_SOCKET_PATH);
+});
+
+test("OMP sends nothing when it has the state socket but no token", async () => {
+  const requests = await startRecordingServer("omp-state-socket-no-token");
+  process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+  // Nothing observable happens when the integration is off, so give its request queue a moment.
+  await Bun.sleep(200);
+
+  expect(requests).toEqual([]);
+});
+
+test("OMP treats a refusal on the state socket as final", async () => {
+  const requests = await startRecordingServer("omp-state-token-refused");
+  process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
+  process.env.HERDR_STATE_TOKEN = "stale-token";
+  recordingReply = (request) => ({ id: request.id, error: { code: "forbidden", message: "stale" } });
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  try {
+    await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+    await waitFor(() => requests.length >= 2, 5_000);
+  } finally {
+    recordingReply = undefined;
+  }
+
+  expect(requests.every((request) => isRecord(request) && request.state_token === "stale-token")).toBe(true);
 });
 
 test("Pi reports a Windows session path", async () => {

@@ -1462,6 +1462,7 @@ mod tests {
                 runtime_instance: runtime.map(str::to_string),
                 block_token: None,
                 peer_pid: Some(pid),
+                via_state_socket: false,
             },
         )
     }
@@ -2382,6 +2383,90 @@ mod tests {
         wait_unconfirmed(response);
         let _response = start_instruct(&mut app, p);
         sent_instruction_id(&mut rx, "Report current status");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_state_socket_report_may_only_name_the_profile_herdr_holds() {
+        let (mut app, p, _rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target;
+        let pid = std::process::id();
+        let report = |app: &mut App, seq: u64| {
+            app.handle_pane_report_agent_session_v2(
+                "v2".into(),
+                crate::api::schema::PaneReportAgentSessionV2Params {
+                    pane_id: target.clone(),
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    seq: Some(seq),
+                    agent_session_id: None,
+                    agent_session_path: Some(fixture_session_path()),
+                    session_start_source: Some("startup".into()),
+                    launch_profile: "default".into(),
+                    agent_pid: pid,
+                    accepts_instructions: true,
+                    accepts_actions: true,
+                    ui_mode: None,
+                    runtime_instance: Some(FIXTURE_RUNTIME.into()),
+                    block_token: None,
+                    peer_pid: Some(pid),
+                    via_state_socket: true,
+                },
+            )
+        };
+        let set_managed = |app: &mut App, profile: &str| {
+            for terminal in app.state.terminals.values_mut() {
+                terminal.set_managed_omp_launch_profile(profile.into());
+            }
+        };
+        let saved = |app: &App| {
+            app.state
+                .terminals
+                .values()
+                .map(|terminal| terminal.persisted_agent_session.clone())
+                .collect::<Vec<_>>()
+        };
+        for terminal in app.state.terminals.values_mut() {
+            terminal.persisted_agent_session = None;
+        }
+        let before = saved(&app);
+
+        // Not started with a profile, or started with another one: the agent cannot choose.
+        assert!(report(&mut app, 10).contains("\"forbidden\""));
+        set_managed(&mut app, "restricted");
+        assert!(report(&mut app, 11).contains("\"forbidden\""));
+        assert_eq!(saved(&app), before);
+
+        set_managed(&mut app, "default");
+        // Another pane's saved session file is not the agent's to claim.
+        let other = crate::terminal::TerminalId::alloc();
+        let mut holder = crate::terminal::TerminalState::new(other.clone(), "/tmp".into());
+        holder.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:omp".into(),
+            agent: "omp".into(),
+            session_ref: crate::agent_resume::AgentSessionRef {
+                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                value: fixture_session_path(),
+            },
+            launch_profile: Some("default".into()),
+            owner_process: None,
+        });
+        app.state.terminals.insert(other.clone(), holder);
+        assert!(report(&mut app, 12).contains("\"forbidden\""));
+        app.state.terminals.remove(&other);
+
+        let reported = report(&mut app, 12);
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        // The saved session's profile (what a handoff or restore carries) still admits it.
+        set_managed(&mut app, "restricted");
+        let reported = report(&mut app, 13);
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -4002,6 +4087,7 @@ mod tests {
                 runtime_instance: Some(FIXTURE_RUNTIME.into()),
                 block_token: None,
                 peer_pid: Some(pid),
+                via_state_socket: false,
             },
         );
         assert!(reply.contains("\"ok\""), "{reply}");
@@ -4151,6 +4237,7 @@ mod tests {
                     runtime_instance: Some(FIXTURE_RUNTIME.into()),
                     block_token: None,
                     peer_pid: Some(pid),
+                    via_state_socket: false,
                 },
             );
             assert!(reply.contains("\"ok\""), "{reply}");
@@ -4251,6 +4338,7 @@ mod tests {
                     runtime_instance: Some(FIXTURE_RUNTIME.into()),
                     block_token: Some(token.into()),
                     peer_pid: Some(pid),
+                    via_state_socket: false,
                 },
             );
             assert!(reply.contains("\"ok\""), "{reply}");

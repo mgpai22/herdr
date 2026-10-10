@@ -157,19 +157,18 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     else {
         return;
     };
+    reserve_workspace_number(next);
+}
 
-    let mut current = NEXT_WORKSPACE_ID.load(Ordering::Relaxed);
-    while current < next {
-        match NEXT_WORKSPACE_ID.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
+// Read only by live handoff, which is Unix-only.
+#[cfg(unix)]
+pub(crate) fn next_workspace_number() -> u64 {
+    NEXT_WORKSPACE_ID.load(Ordering::Relaxed)
+}
+
+/// Raises the next workspace number to at least `next`.
+pub(crate) fn reserve_workspace_number(next: u64) {
+    NEXT_WORKSPACE_ID.fetch_max(next, Ordering::Relaxed);
 }
 
 /// A named workspace containing tabs.
