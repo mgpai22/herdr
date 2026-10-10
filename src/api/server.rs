@@ -13,6 +13,7 @@ use std::fs;
 use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
+use crate::api::state_socket::{self, StateKey};
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
@@ -38,12 +39,23 @@ pub struct ServerHandle {
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    state: Option<StateSocket>,
+}
+
+struct StateSocket {
+    _thread: std::thread::JoinHandle<()>,
+    path: PathBuf,
+    identity: SocketFileIdentity,
+    generation: u64,
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
 
+        if let Some(state) = &self.state {
+            state_socket::deactivate(state.generation);
+        }
         if let Err(err) = self.remove_socket_file_if_owned() {
             if err.kind() != std::io::ErrorKind::NotFound {
                 warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
@@ -53,17 +65,43 @@ impl Drop for ServerHandle {
 }
 
 impl ServerHandle {
+    /// Removes the API socket file and the state socket file, each only if this handle still owns
+    /// it, so a live handoff frees both paths for the importing server.
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
-        remove_socket_file_if_owned(&self.path, &self.identity)
+        let state = self.state.as_ref().map_or(Ok(()), |state| {
+            remove_socket_file_if_owned(&state.path, &state.identity)
+        });
+        let state = match state {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+        remove_socket_file_if_owned(&self.path, &self.identity).and(state)
     }
+}
+
+/// Whether a starting server keeps the state socket key on disk or makes a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateKeyPolicy {
+    /// Cold start: no pane outlived the previous server, and pane ids repeat across server
+    /// lifetimes, so old tokens must stop working.
+    Rotate,
+    /// Live handoff import or rollback: surviving panes still hold tokens made with the key.
+    Keep,
 }
 
 pub(crate) fn start_server_with_stop_control(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_stop: Arc<AtomicBool>,
+    state_key: StateKeyPolicy,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
+    start_server_inner(
+        api_tx,
+        event_hub,
+        default_capabilities(),
+        Some(server_stop),
+        state_key,
+    )
 }
 
 fn default_capabilities() -> Option<ServerCapabilities> {
@@ -88,6 +126,7 @@ fn start_server_inner(
     event_hub: EventHub,
     mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
+    state_key: StateKeyPolicy,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -123,6 +162,20 @@ fn start_server_inner(
     }
 
     let running = Arc::new(AtomicBool::new(true));
+    let state = match start_state_listener(
+        &path,
+        state_key,
+        api_tx.clone(),
+        capabilities.clone(),
+        server_stop.clone(),
+        Arc::clone(&running),
+    ) {
+        Ok(state) => Some(state),
+        Err(err) => {
+            warn!(err = %err, "state socket unavailable; panes get no HERDR_STATE_SOCKET_PATH");
+            None
+        }
+    };
     let listener_running = Arc::clone(&running);
     let thread = std::thread::spawn(move || {
         let mut connection_threads = ConnectionThreads::new("api");
@@ -162,7 +215,142 @@ fn start_server_inner(
         path,
         identity,
         running,
+        state,
     })
+}
+
+/// Serves the state socket beside the API socket and publishes it to new panes.
+fn start_state_listener(
+    api_socket_path: &Path,
+    state_key: StateKeyPolicy,
+    api_tx: ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<Arc<AtomicBool>>,
+    running: Arc<AtomicBool>,
+) -> std::io::Result<StateSocket> {
+    if state_key == StateKeyPolicy::Rotate {
+        state_socket::discard_key(api_socket_path)?;
+    }
+    let key = state_socket::load_or_create_key(&state_socket::key_path(api_socket_path))?;
+    let path = state_socket::state_socket_path(api_socket_path);
+    prepare_socket_path(&path)?;
+    let listener = bind_local_listener(&path)?;
+    restrict_socket_permissions(&path)?;
+    let identity = socket_file_identity(&path)?;
+    info!(path = %path.display(), "state socket listening");
+    let generation = state_socket::activate(path.clone(), key);
+
+    let thread = std::thread::spawn(move || {
+        let mut connection_threads = ConnectionThreads::new("state");
+        run_accept_loop(
+            listener.incoming(),
+            &running,
+            ACCEPT_ERROR_BACKOFF,
+            |stream| {
+                let api_tx = api_tx.clone();
+                let capabilities = capabilities.clone();
+                let server_stop = server_stop.clone();
+                connection_threads.spawn(move || {
+                    if let Err(err) = handle_state_connection(
+                        stream,
+                        &key,
+                        &api_tx,
+                        capabilities,
+                        server_stop.as_ref(),
+                    ) {
+                        warn!(err = %err, "state connection failed");
+                    }
+                });
+            },
+        );
+        debug!("state socket thread exiting");
+    });
+
+    Ok(StateSocket {
+        _thread: thread,
+        path,
+        identity,
+        generation,
+    })
+}
+
+/// One request per connection, like the API socket, admitted only by `state_socket::authorize`.
+fn handle_state_connection(
+    mut stream: LocalStream,
+    key: &StateKey,
+    api_tx: &ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<()> {
+    if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
+        debug!(err = %err, "state connection write timeout unavailable");
+    }
+    let Some(line) = read_initial_request_line(&mut stream)? else {
+        return Ok(());
+    };
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+    let mut request = match state_socket::authorize(line, key) {
+        Ok(request) => request,
+        Err(response) => {
+            debug!(code = %response.error.code, message = %response.error.message, "state socket refused request");
+            return write_json_line_allow_disconnect(&mut stream, &response);
+        }
+    };
+    stamp_request(&mut request, peer_pid(&stream));
+    if let Method::PaneReportAgentSessionV2(params) = &mut request.method {
+        params.via_state_socket = true;
+    }
+
+    let request_id = request.id.clone();
+    let method = api_method_name(&request.method);
+    let changes_ui = request_changes_ui(&request);
+    crate::logging::api_request_started(&request_id, method, changes_ui);
+    let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
+    let response = handle_request(
+        request,
+        api_tx,
+        capabilities,
+        server_stop,
+        Some(response_write_rx),
+    );
+    let result = write_text_line_allow_disconnect(&mut stream, &response);
+    let _ = response_write_tx.send(());
+    match &result {
+        Ok(()) => crate::logging::api_request_completed(
+            &request_id,
+            method,
+            api_response_outcome(&response),
+            changes_ui,
+        ),
+        Err(err) => crate::logging::api_request_failed(&request_id, method, &err.to_string()),
+    }
+    result
+}
+
+fn peer_pid(stream: &LocalStream) -> Option<u32> {
+    let peer_pid = stream
+        .peer_creds()
+        .ok()
+        .and_then(|credentials| credentials.pid());
+    #[cfg(unix)]
+    let peer_pid = peer_pid.and_then(|pid| u32::try_from(pid).ok());
+    peer_pid
+}
+
+/// Server-side facts a request carries that its sender cannot set.
+fn stamp_request(request: &mut Request, peer_pid: Option<u32>) {
+    match &mut request.method {
+        Method::PaneReportAgentSessionV2(params) => params.peer_pid = peer_pid,
+        Method::PaneAckInstruction(params) => params.peer_pid = peer_pid,
+        Method::PaneAckAction(params) => params.peer_pid = peer_pid,
+        Method::PaneReportOmpDetail(params) => params.peer_pid = peer_pid,
+        Method::AgentInstruct(params) => params.received_at = Some(std::time::Instant::now()),
+        Method::AgentAction(params) => params.received_at = Some(std::time::Instant::now()),
+        _ => {}
+    }
 }
 
 fn run_accept_loop<S>(
@@ -387,12 +575,6 @@ fn handle_connection_with_stop(
         return Ok(());
     }
 
-    let peer_pid = stream
-        .peer_creds()
-        .ok()
-        .and_then(|credentials| credentials.pid());
-    #[cfg(unix)]
-    let peer_pid = peer_pid.and_then(|pid| u32::try_from(pid).ok());
     let mut request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
@@ -421,15 +603,7 @@ fn handle_connection_with_stop(
             return Ok(());
         }
     };
-    match &mut request.method {
-        Method::PaneReportAgentSessionV2(params) => params.peer_pid = peer_pid,
-        Method::PaneAckInstruction(params) => params.peer_pid = peer_pid,
-        Method::PaneAckAction(params) => params.peer_pid = peer_pid,
-        Method::PaneReportOmpDetail(params) => params.peer_pid = peer_pid,
-        Method::AgentInstruct(params) => params.received_at = Some(std::time::Instant::now()),
-        Method::AgentAction(params) => params.received_at = Some(std::time::Instant::now()),
-        _ => {}
-    }
+    stamp_request(&mut request, peer_pid(&stream));
 
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -1823,6 +1997,69 @@ mod tests {
         let response = thread.join().unwrap();
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_2");
+    }
+
+    #[test]
+    fn state_connection_dispatches_only_reports_for_the_tokens_pane() {
+        let key = [3u8; 32];
+        let token = state_socket::token(&key, "w1:p1");
+        let report = |id: &str, pane: &str| {
+            serde_json::json!({
+                "id": id,
+                "method": "pane.report_agent",
+                "params": { "pane_id": pane, "source": "herdr:omp", "agent": "omp", "state": "working", "seq": 1 },
+                "state_token": token,
+            })
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let exchange = |name: &str, line: serde_json::Value| {
+            let (mut client, server, _path) = local_stream_pair(name);
+            let tx = tx.clone();
+            let thread =
+                std::thread::spawn(move || handle_state_connection(server, &key, &tx, None, None));
+            client.write_all(format!("{line}\n").as_bytes()).unwrap();
+            (client, thread)
+        };
+
+        for (name, line) in [
+            (
+                "state-split",
+                serde_json::json!({
+                    "id": "split",
+                    "method": "pane.split",
+                    "params": { "target": "w1:p1", "direction": "right", "env": { "HOME": "/" } },
+                    "state_token": token,
+                }),
+            ),
+            ("state-other-pane", report("other", "w1:p2")),
+        ] {
+            let (mut client, thread) = exchange(name, line);
+            let response: serde_json::Value =
+                serde_json::from_str(&read_line(&mut client)).unwrap();
+            assert_eq!(response["error"]["code"], "forbidden", "{name}");
+            thread.join().unwrap().unwrap();
+        }
+        assert!(rx.try_recv().is_err(), "a refused request reached the app");
+
+        let (mut client, thread) = exchange("state-own-pane", report("own", "w1:p1"));
+        let message = rx.blocking_recv().unwrap();
+        assert!(matches!(
+            &message.request.method,
+            Method::PaneReportAgent(params) if params.pane_id == "w1:p1"
+        ));
+        message
+            .respond_to
+            .send(
+                serde_json::to_string(&SuccessResponse {
+                    id: "own".into(),
+                    result: ResponseResult::Ok {},
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let parsed: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(parsed.id, "own");
+        thread.join().unwrap().unwrap();
     }
 
     #[test]

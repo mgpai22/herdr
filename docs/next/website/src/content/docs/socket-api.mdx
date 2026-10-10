@@ -778,6 +778,41 @@ Use `ttl_ms` for short-lived metadata. It must be between `1` and `86400000` mil
 
 Use `seq` when a hook may send updates out of order. For the same `source`, reports with a sequence number less than or equal to the last accepted sequence are accepted by the API but ignored by the pane state. A pane or workspace accepts sequenced token reports from at most 32 distinct sources during its lifetime; clearing or expiry does not release those source slots.
 
+### State socket
+
+An agent that should not hold the full API socket can report through the state
+socket. Herdr serves it beside the API socket (`herdr.sock` →
+`herdr-state.sock`) and gives every pane it starts two variables:
+
+- `HERDR_STATE_SOCKET_PATH`: the state socket's path.
+- `HERDR_STATE_TOKEN`: a token bound to that pane's `HERDR_PANE_ID`.
+
+Requests on the state socket carry the token in a top-level `state_token` field.
+Herdr accepts only `pane.report_agent`, `pane.report_agent_session_v2`,
+`pane.report_omp_detail`, `pane.report_metadata`, `pane.ack_instruction` and
+`pane.ack_action`, and only when `params.pane_id` is the pane the token belongs
+to. Any other method, or a token for another pane, gets a `forbidden` error. A
+`pane.report_agent_session_v2` on the state socket must name the launch profile
+Herdr already holds for the pane (its saved OMP session's, else the one
+`agent.start --profile` used), and not a session file another pane has saved;
+the agent cannot choose the launcher Herdr resumes its session with, or take
+another pane's session. Both refusals are `forbidden`. The token key
+(`herdr-state.key`, mode 0600 beside the socket) survives a live handoff, so
+agents in surviving panes keep reporting; a cold start makes a new key.
+
+The OMP integration (version 17 and later) uses the state socket when both
+variables are set. When the state socket is missing or answers `forbidden`, it
+sends the same request to `HERDR_SOCKET_PATH` if that is set.
+
+```json
+{
+  "id": "req_1",
+  "method": "pane.report_agent",
+  "params": { "pane_id": "w1:p1", "source": "custom:docs", "agent": "docs-bot", "state": "idle" },
+  "state_token": "<HERDR_STATE_TOKEN>"
+}
+```
+
 ## Event subscriptions
 
 Subscribe to events when you need a long-lived stream:

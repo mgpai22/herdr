@@ -17,6 +17,8 @@ const originalEnvironment = {
   HERDR_OMP_INSTRUCTION_POLL_MS: process.env.HERDR_OMP_INSTRUCTION_POLL_MS,
   HERDR_PANE_ID: process.env.HERDR_PANE_ID,
   HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
+  HERDR_STATE_SOCKET_PATH: process.env.HERDR_STATE_SOCKET_PATH,
+  HERDR_STATE_TOKEN: process.env.HERDR_STATE_TOKEN,
   HERDR_OMP_SPOOL_RESTORE_MS: process.env.HERDR_OMP_SPOOL_RESTORE_MS,
   OMPCODE: process.env.OMPCODE,
   OMP_PROFILE: process.env.OMP_PROFILE,
@@ -133,6 +135,8 @@ function configureIntegrationEnvironment(recordingSocketPath: string) {
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = recordingSocketPath;
   process.env.HERDR_PANE_ID = "test:p1";
+  delete process.env.HERDR_STATE_SOCKET_PATH;
+  delete process.env.HERDR_STATE_TOKEN;
 }
 
 function captureConnectionEndpoint() {
@@ -322,6 +326,63 @@ test("OMP accepts POSIX and Windows session paths", async () => {
   );
   expect(isAbsoluteSessionPath("C:/Users/User/.omp/agent/sessions/omp-session.jsonl")).toBe(true);
   expect(isAbsoluteSessionPath("relative/omp-session.jsonl")).toBe(false);
+});
+
+test("OMP reports through the state socket with the pane's token when herdr gives one", async () => {
+  const requests = await startRecordingServer("omp-state-socket");
+  process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
+  process.env.HERDR_SOCKET_PATH = join(tmpdir(), `herdr-missing-${process.pid}.sock`);
+  process.env.HERDR_STATE_TOKEN = "pane-token";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  await waitFor(() => requestStates(requests).length === 1);
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+
+  expect(requestStates(requests)).toEqual(["idle", "working"]);
+  expect(requests.every((request) => isRecord(request) && request.state_token === "pane-token")).toBe(true);
+});
+
+test("OMP falls back to the full socket when the state socket is gone", async () => {
+  const requests = await startRecordingServer("omp-state-socket-gone");
+  process.env.HERDR_STATE_SOCKET_PATH = join(tmpdir(), `herdr-missing-state-${process.pid}.sock`);
+  process.env.HERDR_STATE_TOKEN = "pane-token";
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+  await waitFor(() => requestStates(requests).length === 1, 3_000);
+
+  expect(requestStates(requests)).toEqual(["idle"]);
+  expect(requests.some((request) => isRecord(request) && "state_token" in request)).toBe(false);
+});
+
+test("OMP sends to the full socket when the state socket refuses the pane's token", async () => {
+  const requests = await startRecordingServer("omp-state-token-refused");
+  process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
+  process.env.HERDR_STATE_TOKEN = "stale-token";
+  recordingReply = (request) =>
+    request.state_token ? { id: request.id, error: { code: "forbidden", message: "stale" } } : undefined;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  try {
+    await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+    await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.report_agent" && !("state_token" in request)), 3_000);
+  } finally {
+    recordingReply = undefined;
+  }
+
+  const reports = requests.filter((request) => isRecord(request) && request.method === "pane.report_agent");
+  expect(reports.map((request) => isRecord(request) && "state_token" in request)).toEqual([true, false]);
 });
 
 test("Pi reports a Windows session path", async () => {

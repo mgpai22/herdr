@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=omp
-// HERDR_INTEGRATION_VERSION=16
+// HERDR_INTEGRATION_VERSION=17
 // @ts-nocheck
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
@@ -14,9 +14,11 @@ import net from "node:net";
 import path from "node:path";
 
 const HERDR_ENV = process.env.HERDR_ENV;
-const socketPath = process.env.HERDR_SOCKET_PATH;
-const socketEndpoint =
-  process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
+// The state socket takes only this pane's reports, each with the pane's token. Prefer it, so a
+// launcher can withhold the full API socket from the agent.
+const stateToken = process.env.HERDR_STATE_SOCKET_PATH ? process.env.HERDR_STATE_TOKEN : undefined;
+const fullSocketPath = process.env.HERDR_SOCKET_PATH;
+const socketPath = stateToken ? process.env.HERDR_STATE_SOCKET_PATH : fullSocketPath;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:omp";
 // OMP marks every shell it spawns with OMPCODE=1. A nested `omp` launched from
@@ -45,38 +47,64 @@ function sendRequestAttempt(request: any, timeoutMs: number): Promise<Reply> {
     return Promise.resolve("ok");
   }
 
-  return new Promise((resolve) => {
-    let done = false;
-    let response = "";
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const finish = (reply: Reply) => {
-      if (done) return;
-      done = true;
-      if (timeout) clearTimeout(timeout);
-      socket.destroy();
-      resolve(reply);
-    };
+  const { promise, resolve } = Promise.withResolvers<Reply>();
+  let done = false;
+  let response = "";
+  let socket: net.Socket;
+  const finish = (reply: Reply) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timeout);
+    socket.destroy();
+    resolve(reply);
+  };
 
-    const socket = net.createConnection(socketEndpoint!);
-    socket.setEncoding("utf8");
-    socket.on("error", () => finish("unreachable"));
-    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on("data", (chunk) => {
+  const open = (useState: boolean) => {
+    let connected = false;
+    const path = useState ? socketPath : fullSocketPath;
+    const connection = net.createConnection(process.platform === "win32" ? `\\\\.\\pipe\\${path}` : path!);
+    socket = connection;
+    // The state socket did not take the request: it is gone (a live handoff to a herdr without
+    // one), or it refused the pane's token (a key rotated by a handoff from such a herdr). The
+    // same request goes to the full socket, where the launcher passed it.
+    const fallBack = () => {
+      if (!useState || !fullSocketPath || done) return false;
+      connection.destroy();
+      response = "";
+      open(false);
+      return true;
+    };
+    connection.setEncoding("utf8");
+    connection.on("error", () => {
+      if (connection !== socket) return;
+      if (connected || !fallBack()) finish("unreachable");
+    });
+    connection.on("connect", () => {
+      connected = true;
+      connection.write(`${JSON.stringify(useState ? { ...request, state_token: stateToken } : request)}\n`);
+    });
+    connection.on("data", (chunk) => {
+      if (connection !== socket) return;
       response += chunk;
       const newline = response.indexOf("\n");
       if (newline < 0) return;
       try {
         const parsed = JSON.parse(response.slice(0, newline));
         if (parsed?.id === request.id && parsed?.result?.type === "ok") finish("ok");
+        else if (parsed?.error?.code === "forbidden" && fallBack()) return;
         else finish(typeof parsed?.error?.code === "string" ? parsed.error.code : "invalid_response");
       } catch {
         finish("invalid_response");
       }
     });
-    socket.on("end", () => finish("unreachable"));
-    timeout = setTimeout(() => finish("unreachable"), timeoutMs);
-    timeout.unref?.();
-  });
+    connection.on("end", () => {
+      if (connection === socket) finish("unreachable");
+    });
+  };
+  open(!!stateToken);
+  const timeout = setTimeout(() => finish("unreachable"), timeoutMs);
+  timeout.unref?.();
+  return promise;
 }
 
 async function sendRequestNow(buildRequest: () => unknown): Promise<Reply> {

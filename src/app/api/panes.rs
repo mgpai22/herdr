@@ -1671,6 +1671,41 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        // The state socket's sender is the agent itself, so it may not pick the launcher Herdr
+        // resumes its session with: only the profile Herdr holds for the pane, the saved session's
+        // (carried across handoff and restore) or else the one `agent.start` launched it with.
+        if params.via_state_socket && terminal.omp_launch_profile() != Some(profile.as_str()) {
+            return encode_error(
+                id,
+                "forbidden",
+                "a state socket report must name the launch profile Herdr holds for this pane",
+            );
+        }
+        // Nor may it claim a session file another pane saved: a restore would resume that
+        // session in this pane and drop it from its own. (Session paths are absolute by now.)
+        // ponytail: compared once here, so a symlink swapped in after the report still aliases
+        // another pane's file; closing that needs restore to dedupe by file identity.
+        if params.via_state_socket
+            && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path
+            && self.state.terminals.iter().any(|(other_id, other)| {
+                *other_id != terminal_id
+                    && other.persisted_agent_session.as_ref().is_some_and(|saved| {
+                        saved.session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path
+                            && crate::agent_resume::same_session_file(
+                                std::path::Path::new(&saved.session_ref.value),
+                                std::path::Path::new(&session_ref.value),
+                            )
+                    })
+            })
+        {
+            // `forbidden`, like every state-socket-only refusal, so an agent that also holds the
+            // full socket sends it there, where this check does not apply.
+            return encode_error(
+                id,
+                "forbidden",
+                "another pane holds this OMP session; the state socket cannot claim it",
+            );
+        }
         if !terminal.hook_report_is_fresh(&params.source, params.seq) {
             return encode_error(
                 id,

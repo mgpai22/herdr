@@ -1451,6 +1451,136 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
 }
 
 #[test]
+fn live_handoff_keeps_the_state_socket_and_pane_tokens() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let marker = base.join("state-env");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:print-state-env",
+            "method": "pane.send_input",
+            "params": {
+                "pane_id": pane_id,
+                "text": format!("printf '%s %s\\n' \"$HERDR_STATE_SOCKET_PATH\" \"$HERDR_STATE_TOKEN\" > {}", marker.display()),
+                "keys": ["Enter"]
+            }
+        }),
+    ));
+    let printed = wait_for_file_contains(&marker, "\n", Duration::from_secs(5));
+    let (state_socket, token) = printed.trim().split_once(' ').unwrap();
+    let state_socket = PathBuf::from(state_socket);
+    assert_eq!(state_socket, runtime_dir.join("herdr-state.sock"));
+    // A workspace closed before the handoff must not lend its id (and so its panes' tokens) to
+    // a workspace made after it.
+    let closed = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create-closed",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": false}
+        }),
+    );
+    let closed_id = closed["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:close",
+            "method": "workspace.close",
+            "params": {"workspace_id": closed_id}
+        }),
+    ));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let reopened = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create-after",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": false}
+        }),
+    );
+    assert_ne!(
+        reopened["result"]["workspace"]["workspace_id"].as_str(),
+        Some(closed_id.as_str()),
+        "{reopened}"
+    );
+
+    let split = request(
+        &state_socket,
+        serde_json::json!({
+            "id": "test:state-split",
+            "method": "pane.split",
+            "params": {"target": pane_id, "direction": "right"},
+            "state_token": token
+        }),
+    );
+    assert_eq!(split["error"]["code"], "forbidden", "{split}");
+    assert_ok(request(
+        &state_socket,
+        serde_json::json!({
+            "id": "test:state-report",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "source": "handoff-test",
+                "agent": "pi",
+                "state": "working"
+            },
+            "state_token": token
+        }),
+    ));
+    let agents = request(
+        &api_socket,
+        serde_json::json!({"id":"test:agent-list","method":"agent.list","params":{}}),
+    );
+    let found = agents["result"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|agent| {
+            agent["agent"].as_str() == Some("pi")
+                && agent["agent_status"].as_str() == Some("working")
+        });
+    assert!(found, "state socket report after handoff: {agents}");
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     use std::os::unix::fs::PermissionsExt;
 
