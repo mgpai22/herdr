@@ -196,7 +196,15 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             cmd.env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR, workspace_id);
             cmd.env(crate::integration::HERDR_TAB_ID_ENV_VAR, tab_id);
             cmd.env(crate::integration::HERDR_PANE_ID_ENV_VAR, pane_id);
-            match crate::api::state_socket::pane_env(pane_id) {
+            // Only a pane whose creator asked for it gets the state socket; every other pane
+            // keeps reporting over HERDR_SOCKET_PATH as before.
+            let requested = launch_env.extra.iter().any(|(key, value)| {
+                key == crate::api::state_socket::STATE_SOCKET_REQUEST_ENV_VAR && value == "1"
+            });
+            match requested
+                .then(|| crate::api::state_socket::pane_env(pane_id))
+                .flatten()
+            {
                 Some(state_env) => {
                     for (key, value) in state_env {
                         cmd.env(key, value);

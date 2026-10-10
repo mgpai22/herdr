@@ -349,40 +349,59 @@ test("OMP reports through the state socket with the pane's token when herdr give
   expect(requests.every((request) => isRecord(request) && request.state_token === "pane-token")).toBe(true);
 });
 
-test("OMP falls back to the full socket when the state socket is gone", async () => {
-  const requests = await startRecordingServer("omp-state-socket-gone");
-  process.env.HERDR_STATE_SOCKET_PATH = join(tmpdir(), `herdr-missing-state-${process.pid}.sock`);
+test("OMP never falls back to the full socket when the state socket is gone", async () => {
+  await startRecordingServer("omp-state-socket-gone");
+  const statePath = join(tmpdir(), `herdr-missing-state-${process.pid}.sock`);
+  process.env.HERDR_STATE_SOCKET_PATH = statePath;
   process.env.HERDR_STATE_TOKEN = "pane-token";
+  const endpoints: unknown[] = [];
+  net.createConnection = ((...args: Parameters<typeof net.createConnection>) => {
+    endpoints.push(args[0]);
+    return originalCreateConnection(...args);
+  }) as typeof net.createConnection;
   const { handlers, pi } = createExtensionHarness();
   const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
   install(pi);
 
   await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
-  await waitFor(() => requestStates(requests).length === 1, 3_000);
+  // Both attempts of the first report go to the state socket. Integrations other tests loaded may
+  // still retry against their own sockets, so only this test's two paths count.
+  await waitFor(() => endpoints.filter((endpoint) => endpoint === statePath).length >= 2, 5_000);
 
-  expect(requestStates(requests)).toEqual(["idle"]);
-  expect(requests.some((request) => isRecord(request) && "state_token" in request)).toBe(false);
+  expect(endpoints).not.toContain(process.env.HERDR_SOCKET_PATH);
 });
 
-test("OMP sends to the full socket when the state socket refuses the pane's token", async () => {
+test("OMP sends nothing when it has the state socket but no token", async () => {
+  const requests = await startRecordingServer("omp-state-socket-no-token");
+  process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+  install(pi);
+
+  await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+  // Nothing observable happens when the integration is off, so give its request queue a moment.
+  await Bun.sleep(200);
+
+  expect(requests).toEqual([]);
+});
+
+test("OMP treats a refusal on the state socket as final", async () => {
   const requests = await startRecordingServer("omp-state-token-refused");
   process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
   process.env.HERDR_STATE_TOKEN = "stale-token";
-  recordingReply = (request) =>
-    request.state_token ? { id: request.id, error: { code: "forbidden", message: "stale" } } : undefined;
+  recordingReply = (request) => ({ id: request.id, error: { code: "forbidden", message: "stale" } });
   const { handlers, pi } = createExtensionHarness();
   const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
   install(pi);
 
   try {
     await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
-    await waitFor(() => requests.some((request) => isRecord(request) && request.method === "pane.report_agent" && !("state_token" in request)), 3_000);
+    await waitFor(() => requests.length >= 2, 5_000);
   } finally {
     recordingReply = undefined;
   }
 
-  const reports = requests.filter((request) => isRecord(request) && request.method === "pane.report_agent");
-  expect(reports.map((request) => isRecord(request) && "state_token" in request)).toEqual([true, false]);
+  expect(requests.every((request) => isRecord(request) && request.state_token === "stale-token")).toBe(true);
 });
 
 test("Pi reports a Windows session path", async () => {

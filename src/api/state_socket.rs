@@ -1,9 +1,13 @@
 //! The state socket: a second API socket that accepts only the reports an agent integration
-//! sends about its own pane. Each pane gets the socket path and a token bound to its pane id, so
-//! an agent can report its state without holding the full API socket.
+//! sends about its own pane. A pane created with `HERDR_STATE_SOCKET=1` in its env gets the
+//! socket path and a token bound to its pane id, so a launcher can withhold the full API socket
+//! from its agent and the agent still reports its state.
+//!
+//! This stops an agent that only has the env from steering Herdr; it does not stop a same-uid
+//! process that reads the key or connects to the full socket by path.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -15,6 +19,10 @@ use crate::api::schema::{ErrorBody, ErrorResponse, Method, Request};
 
 pub const STATE_SOCKET_PATH_ENV_VAR: &str = "HERDR_STATE_SOCKET_PATH";
 pub const STATE_TOKEN_ENV_VAR: &str = "HERDR_STATE_TOKEN";
+/// Set to `1` in the env a pane is created with to give it the state socket.
+// ponytail: not stored per pane, so a respawned shell, a resumed agent and a restored pane go
+// without; a terminal-state flag saved in the snapshot would carry it.
+pub const STATE_SOCKET_REQUEST_ENV_VAR: &str = "HERDR_STATE_SOCKET";
 /// Top-level request field that carries the pane's token on the state socket.
 const TOKEN_FIELD: &str = "state_token";
 const KEY_LEN: usize = 32;
@@ -23,7 +31,9 @@ const KEY_FILE_MODE: u32 = 0o600;
 
 pub(crate) type StateKey = [u8; KEY_LEN];
 
-/// Every method an agent integration sends about its own pane; each takes `params.pane_id`.
+/// The OMP integration's reports and acks, plus `pane.report_metadata` for metadata extensions
+/// (life-os `herdr-metadata.ts`): labels of the token's own pane, nothing that acts. Each method
+/// takes `params.pane_id`.
 pub(crate) const ALLOWED_METHODS: [&str; 6] = [
     "pane.report_agent",
     "pane.report_agent_session_v2",
@@ -64,13 +74,31 @@ fn sibling(api_socket_path: &Path, suffix: &str) -> PathBuf {
 /// The key survives live handoff, so tokens in the environments of panes that outlive the old
 /// process stay valid. A cold start discards it first (`discard_key`).
 pub(crate) fn load_or_create_key(path: &Path) -> io::Result<StateKey> {
-    match fs::read(path) {
-        Ok(bytes) => bytes.try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{} is not a {KEY_LEN}-byte key", path.display()),
-            )
-        }),
+    // Checked on the handle that is read, so the file cannot be swapped between check and read.
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            trusted_key_file(path, &file.metadata()?)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            bytes.try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a {KEY_LEN}-byte key", path.display()),
+                )
+            })
+        }
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a symlink", path.display()),
+        )),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut key = [0u8; KEY_LEN];
             getrandom::fill(&mut key).map_err(|error| io::Error::other(error.to_string()))?;
@@ -96,6 +124,31 @@ pub(crate) fn load_or_create_key(path: &Path) -> io::Result<StateKey> {
     }
 }
 
+/// A key file someone else could have written or read would let them mint tokens.
+fn trusted_key_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    let refuse = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} {why}", path.display()),
+        ))
+    };
+    if !metadata.file_type().is_file() {
+        return refuse("is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return refuse("belongs to another user");
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return refuse("is readable or writable by other users");
+        }
+    }
+    Ok(())
+}
+
 /// A cold start has no pane that outlived the previous server, so its tokens (pane ids repeat
 /// across server lifetimes) must stop working.
 pub(crate) fn discard_key(api_socket_path: &Path) -> io::Result<()> {
@@ -105,8 +158,23 @@ pub(crate) fn discard_key(api_socket_path: &Path) -> io::Result<()> {
     }
 }
 
-/// HMAC-SHA256 of the pane id, hex encoded.
+/// The pane's token: HMAC-SHA256 of the pane id, hex encoded.
 pub(crate) fn token(key: &StateKey, pane_id: &str) -> String {
+    hmac_sha256(key, pane_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// RFC 2104 HMAC over SHA-256.
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let hashed;
+    let key = if key.len() > 64 {
+        hashed = Sha256::digest(key);
+        hashed.as_slice()
+    } else {
+        key
+    };
     let mut inner = [0x36u8; 64];
     let mut outer = [0x5cu8; 64];
     for (index, byte) in key.iter().enumerate() {
@@ -115,13 +183,13 @@ pub(crate) fn token(key: &StateKey, pane_id: &str) -> String {
     }
     let inner_hash = Sha256::new()
         .chain_update(inner)
-        .chain_update(pane_id.as_bytes())
+        .chain_update(data)
         .finalize();
-    let mac = Sha256::new()
+    Sha256::new()
         .chain_update(outer)
         .chain_update(inner_hash)
-        .finalize();
-    mac.iter().map(|byte| format!("{byte:02x}")).collect()
+        .finalize()
+        .into()
 }
 
 fn same_token(left: &str, right: &str) -> bool {
@@ -213,11 +281,13 @@ pub(crate) fn authorize(line: &str, key: &StateKey) -> Result<Request, ErrorResp
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // Refusals name no sender-supplied value: the method or pane id could be up to the 1 MiB
+    // request cap.
     if !ALLOWED_METHODS.contains(&method) {
         return Err(error(
             id,
             "forbidden",
-            format!("{method:?} is not available on the state socket"),
+            "method is not available on the state socket".into(),
         ));
     }
     let presented = value
@@ -248,7 +318,7 @@ pub(crate) fn authorize(line: &str, key: &StateKey) -> Result<Request, ErrorResp
         return Err(error(
             id,
             "forbidden",
-            format!("{TOKEN_FIELD} does not belong to pane {pane_id}"),
+            format!("{TOKEN_FIELD} does not belong to params.pane_id"),
         ));
     }
     Ok(request)
@@ -305,6 +375,24 @@ mod tests {
         .expect_err("refused");
         assert_eq!(refused.id, "r1");
         assert_eq!(refused.error.code, "forbidden");
+    }
+
+    #[test]
+    fn malformed_requests_are_invalid_not_dispatched() {
+        let token = token(&KEY, "w1:p1");
+        for bad in [
+            "not json".to_string(),
+            line(
+                "pane.report_agent",
+                serde_json::json!({ "pane_id": "w1:p1" }),
+                Some(&token),
+            ),
+        ] {
+            assert_eq!(
+                authorize(&bad, &KEY).expect_err("refused").error.code,
+                "invalid_request"
+            );
+        }
     }
 
     #[test]
@@ -387,5 +475,52 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_others_can_read_or_a_symlinked_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("herdr-state-trust-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = key_path(&dir.join("herdr.sock"));
+        let _ = fs::remove_file(&path);
+        load_or_create_key(&path).expect("created");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert_eq!(
+            load_or_create_key(&path).expect_err("readable").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let real = dir.join("real.key");
+        fs::rename(&path, &real).expect("move");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).expect("chmod");
+        std::os::unix::fs::symlink(&real, &path).expect("symlink");
+        assert_eq!(
+            load_or_create_key(&path).expect_err("symlink").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// RFC 4231 test cases 1, 2 and 6 (a key longer than the block).
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        let hex =
+            |bytes: [u8; 32]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        assert_eq!(
+            hex(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert_eq!(
+            hex(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
     }
 }

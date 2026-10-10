@@ -160,6 +160,8 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     reserve_workspace_number(next);
 }
 
+// Read only by live handoff, which is Unix-only.
+#[cfg(unix)]
 pub(crate) fn next_workspace_number() -> u64 {
     NEXT_WORKSPACE_ID.load(Ordering::Relaxed)
 }

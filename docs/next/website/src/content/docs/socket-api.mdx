@@ -782,27 +782,50 @@ Use `seq` when a hook may send updates out of order. For the same `source`, repo
 
 An agent that should not hold the full API socket can report through the state
 socket. Herdr serves it beside the API socket (`herdr.sock` →
-`herdr-state.sock`) and gives every pane it starts two variables:
+`herdr-state.sock`, mode 0600). A pane gets it only when the env it is created
+with (for example the `env` of `workspace.create`, `tab.create` or `pane.split`)
+contains `HERDR_STATE_SOCKET=1`. Such a pane gets two more variables:
 
 - `HERDR_STATE_SOCKET_PATH`: the state socket's path.
 - `HERDR_STATE_TOKEN`: a token bound to that pane's `HERDR_PANE_ID`.
 
-Requests on the state socket carry the token in a top-level `state_token` field.
-Herdr accepts only `pane.report_agent`, `pane.report_agent_session_v2`,
-`pane.report_omp_detail`, `pane.report_metadata`, `pane.ack_instruction` and
-`pane.ack_action`, and only when `params.pane_id` is the pane the token belongs
-to. Any other method, or a token for another pane, gets a `forbidden` error. A
-`pane.report_agent_session_v2` on the state socket must name the launch profile
-Herdr already holds for the pane (its saved OMP session's, else the one
-`agent.start --profile` used), and not a session file another pane has saved;
-the agent cannot choose the launcher Herdr resumes its session with, or take
-another pane's session. Both refusals are `forbidden`. The token key
-(`herdr-state.key`, mode 0600 beside the socket) survives a live handoff, so
-agents in surviving panes keep reporting; a cold start makes a new key.
+Other panes get neither. Herdr still sets `HERDR_SOCKET_PATH` in every pane; a
+launcher that wants its agent confined drops it before starting the agent. If
+the state socket could not start, a pane that asked for it gets no state
+variables, so a confined agent reports nothing rather than more. The request is
+not remembered: a shell Herdr respawns in the pane, an agent it resumes there,
+and a pane restored after a restart get no state variables either. A live
+handoff keeps the running processes and their environment.
 
-The OMP integration (version 17 and later) uses the state socket when both
-variables are set. When the state socket is missing or answers `forbidden`, it
-sends the same request to `HERDR_SOCKET_PATH` if that is set.
+Requests on the state socket carry the token in a top-level `state_token` field.
+Herdr accepts only these methods, and only when `params.pane_id` is the pane the
+token belongs to:
+
+- `pane.report_agent`, `pane.report_agent_session_v2`, `pane.report_omp_detail`,
+  `pane.ack_instruction` and `pane.ack_action`, which the OMP integration sends;
+- `pane.report_metadata`, for metadata extensions; it changes only the labels of
+  the token's own pane.
+
+Any other method, a missing token or a token for another pane gets `forbidden`.
+A `pane.report_agent_session_v2` on the state socket must also name the launch
+profile Herdr already holds for the pane (its saved OMP session's, else the one
+`agent.start --profile` used), and not a session file another pane has saved, so
+the agent cannot choose the launcher Herdr resumes it with or take another
+pane's session. Both refusals are `forbidden`.
+
+The token key (`herdr-state.key`, mode 0600 beside the socket) survives a live
+handoff, so agents in surviving panes keep reporting; a cold start makes a new
+key. Herdr refuses a key file that is not a regular file, belongs to another
+user or is open to other users.
+
+The state socket keeps an agent that only has its environment from steering
+Herdr. It does not stop a process running as the same user, which can read the
+key or connect to `herdr.sock` by path; confining that needs a separate user.
+
+The OMP integration (version 17 and later) uses only the state socket when
+`HERDR_STATE_SOCKET_PATH` is set, and sends nothing if the token is missing. It
+never falls back to `HERDR_SOCKET_PATH`: an unreachable state socket or a
+`forbidden` reply is final.
 
 ```json
 {

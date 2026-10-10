@@ -1452,6 +1452,7 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
 
 #[test]
 fn live_handoff_keeps_the_state_socket_and_pane_tokens() {
+    use std::os::unix::fs::PermissionsExt;
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1468,7 +1469,7 @@ fn live_handoff_keeps_the_state_socket_and_pane_tokens() {
         serde_json::json!({
             "id": "test:workspace:create",
             "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
+            "params": {"cwd": "/tmp", "focus": true, "env": {"HERDR_STATE_SOCKET": "1"}}
         }),
     );
     let pane_id = created["result"]["root_pane"]["pane_id"]
@@ -1491,6 +1492,10 @@ fn live_handoff_keeps_the_state_socket_and_pane_tokens() {
     let (state_socket, token) = printed.trim().split_once(' ').unwrap();
     let state_socket = PathBuf::from(state_socket);
     assert_eq!(state_socket, runtime_dir.join("herdr-state.sock"));
+    assert_eq!(
+        fs::metadata(&state_socket).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     // A workspace closed before the handoff must not lend its id (and so its panes' tokens) to
     // a workspace made after it.
     let closed = request(
@@ -1505,6 +1510,24 @@ fn live_handoff_keeps_the_state_socket_and_pane_tokens() {
         .as_str()
         .unwrap()
         .to_string();
+    // A pane whose creator did not ask for the state socket gets neither variable.
+    let unrequested = base.join("state-env-unrequested");
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:print-unrequested-env",
+            "method": "pane.send_input",
+            "params": {
+                "pane_id": closed["result"]["root_pane"]["pane_id"],
+                "text": format!("printf '%s%s\\n' \"$HERDR_STATE_SOCKET_PATH\" \"$HERDR_STATE_TOKEN\" > {}", unrequested.display()),
+                "keys": ["Enter"]
+            }
+        }),
+    ));
+    assert_eq!(
+        wait_for_file_contains(&unrequested, "\n", Duration::from_secs(5)),
+        "\n"
+    );
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1577,6 +1600,28 @@ fn live_handoff_keeps_the_state_socket_and_pane_tokens() {
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
+    // A cold start makes a new key: the old token no longer works, whatever pane takes the id.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while api_socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let restarted = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&state_socket, Duration::from_secs(10));
+    let stale = request(
+        &state_socket,
+        serde_json::json!({
+            "id": "test:state-report-after-restart",
+            "method": "pane.report_agent",
+            "params": {"pane_id": pane_id, "source": "handoff-test", "agent": "pi", "state": "idle"},
+            "state_token": token
+        }),
+    );
+    assert_eq!(stale["error"]["code"], "forbidden", "{stale}");
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop-restarted","method":"server.stop","params":{}}),
+    );
+    drop(restarted);
     cleanup_test_base(&base);
 }
 

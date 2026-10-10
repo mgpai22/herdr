@@ -86,6 +86,8 @@ pub(crate) enum StateKeyPolicy {
     /// lifetimes, so old tokens must stop working.
     Rotate,
     /// Live handoff import or rollback: surviving panes still hold tokens made with the key.
+    // Only live handoff (Unix-only) constructs it.
+    #[cfg_attr(windows, allow(dead_code))]
     Keep,
 }
 
@@ -172,7 +174,7 @@ fn start_server_inner(
     ) {
         Ok(state) => Some(state),
         Err(err) => {
-            warn!(err = %err, "state socket unavailable; panes get no HERDR_STATE_SOCKET_PATH");
+            error!(err = %err, "state socket unavailable; panes that ask for it get no HERDR_STATE_SOCKET_PATH and their agents report nothing");
             None
         }
     };
@@ -2032,6 +2034,11 @@ mod tests {
                 }),
             ),
             ("state-other-pane", report("other", "w1:p2")),
+            ("state-no-token", {
+                let mut line = report("bare", "w1:p1");
+                line.as_object_mut().unwrap().remove("state_token");
+                line
+            }),
         ] {
             let (mut client, thread) = exchange(name, line);
             let response: serde_json::Value =
@@ -2059,6 +2066,30 @@ mod tests {
             .unwrap();
         let parsed: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(parsed.id, "own");
+        thread.join().unwrap().unwrap();
+
+        // A session report through the state socket reaches the app marked as such, which is
+        // what holds it to the pane's launch profile and its own session file.
+        let (mut client, thread) = exchange(
+            "state-session",
+            serde_json::json!({
+                "id": "session",
+                "method": "pane.report_agent_session_v2",
+                "params": {
+                    "pane_id": "w1:p1", "source": "herdr:omp", "agent": "omp", "seq": 2,
+                    "agent_session_path": "/tmp/session.jsonl", "launch_profile": "default",
+                    "agent_pid": 1,
+                },
+                "state_token": token,
+            }),
+        );
+        let message = rx.blocking_recv().unwrap();
+        assert!(matches!(
+            &message.request.method,
+            Method::PaneReportAgentSessionV2(params) if params.via_state_socket
+        ));
+        drop(message);
+        let _ = read_line(&mut client);
         thread.join().unwrap().unwrap();
     }
 
