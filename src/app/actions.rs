@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use tracing::warn;
+use tracing::debug;
 
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
@@ -2004,7 +2004,7 @@ impl AppState {
             .position(|ws| ws.find_tab_index_for_pane(pane_id).is_some());
 
         let Some(ws_idx) = ws_idx else {
-            warn!(pane = pane_id.raw(), "PaneDied for unknown pane");
+            debug!(pane = pane_id.raw(), "PaneDied for unknown pane");
             return;
         };
 

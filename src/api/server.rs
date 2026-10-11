@@ -55,11 +55,12 @@ impl Drop for ServerHandle {
 
         if let Some(state) = &self.state {
             state_socket::deactivate(state.generation);
-        }
-        if let Err(err) = self.remove_socket_file_if_owned() {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
+            if let Err(err) = remove_socket_file_if_owned(&state.path, &state.identity) {
+                warn!(path = %state.path.display(), err = %err, "failed to remove state socket on shutdown");
             }
+        }
+        if let Err(err) = remove_socket_file_if_owned(&self.path, &self.identity) {
+            warn!(path = %self.path.display(), err = %err, "failed to remove api socket on shutdown");
         }
     }
 }
@@ -71,10 +72,6 @@ impl ServerHandle {
         let state = self.state.as_ref().map_or(Ok(()), |state| {
             remove_socket_file_if_owned(&state.path, &state.identity)
         });
-        let state = match state {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            other => other,
-        };
         remove_socket_file_if_owned(&self.path, &self.identity).and(state)
     }
 }
@@ -1552,11 +1549,39 @@ mod tests {
         std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
     }
 
+    /// Bounds every wait in these tests: a request that should be answered (or refused) without
+    /// reaching the app would otherwise hang the test forever if it regressed into a dispatch.
+    const WAIT: Duration = Duration::from_secs(10);
+
     fn read_line(stream: &mut LocalStream) -> String {
+        stream.set_recv_timeout(Some(WAIT)).unwrap();
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         line
+    }
+
+    /// `handle_connection` on its own thread, so a request that wrongly dispatches (and waits for
+    /// an app response nobody sends) fails the test instead of hanging it.
+    fn handle_connection_bounded(
+        server: LocalStream,
+        api_tx: &ApiRequestSender,
+    ) -> std::io::Result<()> {
+        let api_tx = api_tx.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let running = Arc::new(AtomicBool::new(true));
+            let _ = done_tx.send(handle_connection(
+                server,
+                &api_tx,
+                &EventHub::default(),
+                &running,
+                None,
+            ));
+        });
+        done_rx
+            .recv_timeout(WAIT)
+            .expect("handle_connection did not finish")
     }
 
     fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
@@ -1821,14 +1846,7 @@ mod tests {
             .unwrap();
             client.flush().unwrap();
 
-            handle_connection(
-                server,
-                &api_tx,
-                &EventHub::default(),
-                &Arc::new(AtomicBool::new(true)),
-                None,
-            )
-            .unwrap();
+            handle_connection_bounded(server, &api_tx).unwrap();
 
             let response = read_line(&mut client);
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1851,14 +1869,7 @@ mod tests {
             .unwrap();
         client.flush().unwrap();
 
-        handle_connection(
-            server,
-            &api_tx,
-            &EventHub::default(),
-            &Arc::new(AtomicBool::new(true)),
-            None,
-        )
-        .unwrap();
+        handle_connection_bounded(server, &api_tx).unwrap();
 
         let response = read_line(&mut client);
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1876,14 +1887,7 @@ mod tests {
             .unwrap();
         client.flush().unwrap();
 
-        handle_connection(
-            server,
-            &api_tx,
-            &EventHub::default(),
-            &Arc::new(AtomicBool::new(true)),
-            None,
-        )
-        .unwrap();
+        handle_connection_bounded(server, &api_tx).unwrap();
 
         let response = read_line(&mut client);
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2013,9 +2017,8 @@ mod tests {
                 "state_token": token,
             })
         };
-        // Every wait below is bounded: a request the state socket refuses is never dispatched, so
-        // an unbounded receive would wait forever instead of failing.
-        const WAIT: Duration = Duration::from_secs(10);
+        // Every wait below is bounded (`WAIT`): a request the state socket refuses is never
+        // dispatched, so an unbounded receive would wait forever instead of failing.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let exchange = |name: &str, line: serde_json::Value| {
             let (mut client, server, _path) = local_stream_pair(name);
@@ -2110,12 +2113,59 @@ mod tests {
         let message = dispatched(&mut rx, &mut client);
         assert!(matches!(
             &message.request.method,
-            Method::PaneReportAgentSessionV2(params) if params.via_state_socket
+            Method::PaneReportAgentSessionV2(params)
+                if params.via_state_socket && params.peer_pid == Some(std::process::id())
         ));
         drop(message);
         let _ = read_line(&mut client);
         drop(client);
         thread.join().unwrap().unwrap();
+
+        // The other allowed methods, with a valid token for their pane, reach the app too.
+        for (method, params) in [
+            (
+                "pane.report_omp_detail",
+                serde_json::json!({ "pane_id": "w1:p1", "agent_pid": 1, "runtime_instance": "r1", "omp": { "updated_ms": 1 } }),
+            ),
+            (
+                "pane.ack_instruction",
+                serde_json::json!({ "pane_id": "w1:p1", "instruction_id": "i1", "agent_pid": 1, "outcome": "prompt" }),
+            ),
+            (
+                "pane.ack_action",
+                serde_json::json!({ "pane_id": "w1:p1", "action_id": "a1", "agent_pid": 1, "ok": true }),
+            ),
+            (
+                "pane.report_metadata",
+                serde_json::json!({ "pane_id": "w1:p1", "source": "herdr:omp", "title": "t" }),
+            ),
+        ] {
+            let (mut client, thread) = exchange(
+                method,
+                serde_json::json!({ "id": method, "method": method, "params": params, "state_token": token }),
+            );
+            let message = dispatched(&mut rx, &mut client);
+            let admitted = match &message.request.method {
+                Method::PaneReportOmpDetail(params) => {
+                    method == "pane.report_omp_detail" && params.pane_id == "w1:p1"
+                }
+                Method::PaneAckInstruction(params) => {
+                    method == "pane.ack_instruction" && params.pane_id == "w1:p1"
+                }
+                Method::PaneAckAction(params) => {
+                    method == "pane.ack_action" && params.pane_id == "w1:p1"
+                }
+                Method::PaneReportMetadata(params) => {
+                    method == "pane.report_metadata" && params.pane_id == "w1:p1"
+                }
+                _ => false,
+            };
+            assert!(admitted, "{method}: {:?}", message.request.method);
+            drop(message);
+            let _ = read_line(&mut client);
+            drop(client);
+            thread.join().unwrap().unwrap();
+        }
     }
 
     #[test]
@@ -2415,8 +2465,7 @@ mod tests {
             let (api_tx, mut api_rx) = mpsc::unbounded_channel();
             let (mut client, server, path) = local_stream_pair("invalid-request-id");
             writeln!(client, "{request}").unwrap();
-            let running = Arc::new(AtomicBool::new(true));
-            handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+            handle_connection_bounded(server, &api_tx).unwrap();
 
             let mut response = String::new();
             BufReader::new(client)

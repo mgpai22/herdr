@@ -16,6 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::api::schema::{ErrorBody, ErrorResponse, Method, Request};
+use crate::server::socket_paths::api_socket_sibling;
 
 pub const STATE_SOCKET_PATH_ENV_VAR: &str = "HERDR_STATE_SOCKET_PATH";
 pub const STATE_TOKEN_ENV_VAR: &str = "HERDR_STATE_TOKEN";
@@ -55,20 +56,11 @@ struct Active {
 }
 
 pub(crate) fn state_socket_path(api_socket_path: &Path) -> PathBuf {
-    sibling(api_socket_path, "state.sock")
+    api_socket_sibling(api_socket_path, "state.sock")
 }
 
 pub(crate) fn key_path(api_socket_path: &Path) -> PathBuf {
-    sibling(api_socket_path, "state.key")
-}
-
-fn sibling(api_socket_path: &Path, suffix: &str) -> PathBuf {
-    let stem = api_socket_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("herdr");
-    let parent = api_socket_path.parent().unwrap_or_else(|| Path::new(""));
-    parent.join(format!("{stem}-{suffix}"))
+    api_socket_sibling(api_socket_path, "state.key")
 }
 
 /// The key survives live handoff, so tokens in the environments of panes that outlive the old

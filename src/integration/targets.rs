@@ -80,6 +80,14 @@ fn ensure_extension_dir(dir: &Path, agent: &str) -> io::Result<()> {
 
 pub(crate) fn install_pi() -> io::Result<PathBuf> {
     let dir = pi_extension_dir()?;
+    // An OMP session exports its own agent dir as PI_CODING_AGENT_DIR; installing the Pi
+    // asset there would put it into OMP's extensions.
+    if dir.parent().is_some_and(is_omp_agent_dir) {
+        return Err(io::Error::other(format!(
+            "{} belongs to an OMP agent directory, not Pi; unset PI_CODING_AGENT_DIR to install pi, or install omp instead",
+            dir.display()
+        )));
+    }
     ensure_extension_dir(&dir, "pi")?;
 
     let path = dir.join(PI_EXTENSION_INSTALL_NAME);

@@ -1605,6 +1605,13 @@ fn live_handoff_keeps_the_state_socket_and_pane_tokens() {
     while api_socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
+    while state_socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !state_socket.exists(),
+        "server.stop must remove the state socket"
+    );
     let restarted = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&state_socket, Duration::from_secs(10));
     let stale = request(
