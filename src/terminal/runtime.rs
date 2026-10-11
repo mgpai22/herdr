@@ -578,6 +578,10 @@ impl TerminalRuntime {
         self.0.foreground_cwd()
     }
 
+    pub fn display_cwds(&self) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        self.0.display_cwds()
+    }
+
     pub fn foreground_cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
         self.0.foreground_cwd_for_persistence()
     }

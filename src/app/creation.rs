@@ -327,6 +327,25 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::PaneInfo> {
+        self.pane_metadata_with_cwds(ws_idx, pane_id, CwdReads::Fresh)
+    }
+
+    /// `pane_metadata` with the cwds `PaneRuntime::display_cwds` keeps, for the client shell
+    /// snapshot that every full render builds.
+    pub(super) fn pane_shell_metadata(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::PaneInfo> {
+        self.pane_metadata_with_cwds(ws_idx, pane_id, CwdReads::Display)
+    }
+
+    fn pane_metadata_with_cwds(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        cwd_reads: CwdReads,
+    ) -> Option<crate::api::schema::PaneInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
@@ -337,18 +356,31 @@ impl App {
                 .focused_pane_id()
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
+        let (cwd, foreground_cwd) = match cwd_reads {
+            CwdReads::Fresh => (
+                ws.tabs[tab_idx].cwd_for_pane(
+                    pane_id,
+                    &self.state.terminals,
+                    &self.terminal_runtimes,
+                ),
+                ws.tabs[tab_idx].foreground_cwd_for_pane(pane_id, &self.terminal_runtimes),
+            ),
+            CwdReads::Display => match self.terminal_runtimes.get(&terminal.id) {
+                Some(runtime) => {
+                    let (cwd, foreground_cwd) = runtime.display_cwds();
+                    (cwd.or_else(|| Some(terminal.cwd.clone())), foreground_cwd)
+                }
+                None => (Some(terminal.cwd.clone()), None),
+            },
+        };
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
             workspace_id: self.public_workspace_id(ws_idx),
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             focused,
-            cwd: ws.tabs[tab_idx]
-                .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
-            foreground_cwd: ws.tabs[tab_idx]
-                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
+            cwd: cwd.map(|cwd| cwd.display().to_string()),
+            foreground_cwd: foreground_cwd.map(|cwd| cwd.display().to_string()),
             restore_error: terminal.restore_error.clone(),
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),
@@ -411,6 +443,14 @@ impl App {
                 }),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum CwdReads {
+    /// Read `/proc` now.
+    Fresh,
+    /// Reuse what the pane read in the last second (`PaneRuntime::display_cwds`).
+    Display,
 }
 
 fn terminal_agent_session_info(
