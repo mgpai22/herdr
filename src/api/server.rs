@@ -2013,14 +2013,36 @@ mod tests {
                 "state_token": token,
             })
         };
+        // Every wait below is bounded: a request the state socket refuses is never dispatched, so
+        // an unbounded receive would wait forever instead of failing.
+        const WAIT: Duration = Duration::from_secs(10);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let exchange = |name: &str, line: serde_json::Value| {
             let (mut client, server, _path) = local_stream_pair(name);
+            client.set_recv_timeout(Some(WAIT)).unwrap();
             let tx = tx.clone();
             let thread =
                 std::thread::spawn(move || handle_state_connection(server, &key, &tx, None, None));
             client.write_all(format!("{line}\n").as_bytes()).unwrap();
             (client, thread)
+        };
+        // The dispatched request, or a failure that names what the server answered instead.
+        let dispatched = |rx: &mut mpsc::UnboundedReceiver<ApiRequestMessage>,
+                          client: &mut LocalStream| {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                match rx.try_recv() {
+                    Ok(message) => return message,
+                    Err(mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => {
+                        let mut answer = String::new();
+                        let _ = BufReader::new(client).read_line(&mut answer);
+                        panic!("the request never reached the app; the server answered {answer:?}");
+                    }
+                }
+            }
         };
 
         for (name, line) in [
@@ -2044,12 +2066,13 @@ mod tests {
             let response: serde_json::Value =
                 serde_json::from_str(&read_line(&mut client)).unwrap();
             assert_eq!(response["error"]["code"], "forbidden", "{name}");
+            drop(client);
             thread.join().unwrap().unwrap();
         }
         assert!(rx.try_recv().is_err(), "a refused request reached the app");
 
         let (mut client, thread) = exchange("state-own-pane", report("own", "w1:p1"));
-        let message = rx.blocking_recv().unwrap();
+        let message = dispatched(&mut rx, &mut client);
         assert!(matches!(
             &message.request.method,
             Method::PaneReportAgent(params) if params.pane_id == "w1:p1"
@@ -2066,6 +2089,7 @@ mod tests {
             .unwrap();
         let parsed: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(parsed.id, "own");
+        drop(client);
         thread.join().unwrap().unwrap();
 
         // A session report through the state socket reaches the app marked as such, which is
@@ -2083,13 +2107,14 @@ mod tests {
                 "state_token": token,
             }),
         );
-        let message = rx.blocking_recv().unwrap();
+        let message = dispatched(&mut rx, &mut client);
         assert!(matches!(
             &message.request.method,
             Method::PaneReportAgentSessionV2(params) if params.via_state_socket
         ));
         drop(message);
         let _ = read_line(&mut client);
+        drop(client);
         thread.join().unwrap().unwrap();
     }
 
