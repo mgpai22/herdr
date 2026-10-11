@@ -24,6 +24,14 @@ fn valid_agent_name(name: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_'))
 }
 
+/// How much of an `AgentInfo` to build: everything (the API), or only what the client shell
+/// snapshot shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentRow {
+    Full,
+    Shell,
+}
+
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
         self.state
@@ -526,13 +534,43 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::AgentInfo> {
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let pane_state = ws.pane_state(pane_id)?;
-        let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
-        if !terminal.is_agent_terminal() {
-            return None;
-        }
+        let terminal = self.agent_terminal(ws_idx, pane_id)?;
         let pane = self.pane_metadata(ws_idx, pane_id)?;
+        Some(self.agent_info_from(terminal, pane, AgentRow::Full))
+    }
+
+    /// The agent row of the client shell snapshot, built from the pane metadata the snapshot
+    /// already read. The shell shows no process identity, OMP detail or instruction history,
+    /// so the row skips the `/proc` read that checks the owner process and the copies of that
+    /// state; `runtime_id`, `omp`, `last_action` and the instruction fields stay empty.
+    pub(super) fn agent_shell_info(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        pane: &crate::api::schema::PaneInfo,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        let terminal = self.agent_terminal(ws_idx, pane_id)?;
+        Some(self.agent_info_from(terminal, pane.clone(), AgentRow::Shell))
+    }
+
+    fn agent_terminal(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&crate::terminal::TerminalState> {
+        let pane_state = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        self.state
+            .terminals
+            .get(&pane_state.attached_terminal_id)
+            .filter(|terminal| terminal.is_agent_terminal())
+    }
+
+    fn agent_info_from(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+        pane: crate::api::schema::PaneInfo,
+        row: AgentRow,
+    ) -> crate::api::schema::AgentInfo {
         let launch_profile = terminal.omp_launch_profile().map(str::to_string);
         let launch_executable = launch_profile
             .as_ref()
@@ -543,7 +581,11 @@ impl App {
         // A resumed native session has a different owner, an unregistered/restored session
         // cannot supply an incarnation guard, and a missed exit leaves a dead owner behind,
         // so the saved owner must still be the live incarnation.
-        let live_owner = terminal.persisted_agent_session.as_ref().and_then(|saved| {
+        let saved_session = terminal
+            .persisted_agent_session
+            .as_ref()
+            .filter(|_| row == AgentRow::Full);
+        let live_owner = saved_session.and_then(|saved| {
             let session = pane.agent_session.as_ref()?;
             let owner = saved.owner_process.as_ref()?;
             (saved.source == session.source
@@ -579,14 +621,17 @@ impl App {
                 .is_some_and(|(owner, at)| {
                     Some(owner) == live_owner && at.elapsed() < LISTENER_WITHDRAWN_FOR
                 });
-        let recent_instructions: Vec<_> = self
-            .recent_instructions
-            .get(&terminal.id)
-            .into_iter()
-            .flatten()
-            .map(|entry| entry.info.clone())
-            .collect();
-        Some(crate::api::schema::AgentInfo {
+        let recent_instructions: Vec<_> = match row {
+            AgentRow::Full => self
+                .recent_instructions
+                .get(&terminal.id)
+                .into_iter()
+                .flatten()
+                .map(|entry| entry.info.clone())
+                .collect(),
+            AgentRow::Shell => Vec::new(),
+        };
+        crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
             agent: pane.agent,
@@ -602,10 +647,13 @@ impl App {
             runtime_id,
             accepts_instructions,
             accepts_actions: accepts_instructions && terminal.action_listener,
-            omp: terminal.omp_detail.clone().filter(|_| accepts_instructions),
+            omp: accepts_instructions
+                .then(|| terminal.omp_detail.clone())
+                .flatten(),
             last_action: self
                 .last_actions
                 .get(&terminal.id)
+                .filter(|_| row == AgentRow::Full)
                 .map(|(info, _)| info.clone()),
             listener_withdrawn,
             last_instruction: recent_instructions.first().cloned(),
@@ -623,7 +671,7 @@ impl App {
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
-        })
+        }
     }
 
     fn agent_name_conflicts(

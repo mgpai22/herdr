@@ -1,4 +1,4 @@
-use crate::api::schema::{PaneInfo, ResponseResult, SessionSnapshot};
+use crate::api::schema::{ResponseResult, SessionSnapshot};
 use crate::app::App;
 
 use super::responses::encode_success;
@@ -15,17 +15,17 @@ impl App {
     }
 
     pub(crate) fn session_snapshot(&self) -> SessionSnapshot {
-        self.session_snapshot_with_pane_info(Self::pane_info)
+        self.session_snapshot_with(SnapshotKind::Public)
     }
 
+    /// The snapshot the client shell renders from, built on every full render: no scroll
+    /// metrics, cwds read at most once a second per pane, and agent rows with only what the
+    /// shell shows (`App::agent_shell_info`).
     pub(crate) fn session_metadata_snapshot(&self) -> SessionSnapshot {
-        self.session_snapshot_with_pane_info(Self::pane_metadata)
+        self.session_snapshot_with(SnapshotKind::Shell)
     }
 
-    fn session_snapshot_with_pane_info(
-        &self,
-        pane_info: fn(&Self, usize, crate::layout::PaneId) -> Option<PaneInfo>,
-    ) -> SessionSnapshot {
+    fn session_snapshot_with(&self, kind: SnapshotKind) -> SessionSnapshot {
         let focused_workspace_id = self
             .state
             .active
@@ -43,6 +43,7 @@ impl App {
         let mut tabs = Vec::new();
         let mut layouts = Vec::new();
         let mut panes = Vec::new();
+        let mut shell_agents = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             workspaces.push(self.workspace_info(ws_idx));
             for tab_idx in 0..ws.tabs.len() {
@@ -52,13 +53,17 @@ impl App {
                 if let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) {
                     layouts.push(layout);
                 }
-                panes.extend(
-                    ws.tabs[tab_idx]
-                        .layout
-                        .pane_ids()
-                        .into_iter()
-                        .filter_map(|pane_id| pane_info(self, ws_idx, pane_id)),
-                );
+                for pane_id in ws.tabs[tab_idx].layout.pane_ids() {
+                    let pane = match kind {
+                        SnapshotKind::Public => self.pane_info(ws_idx, pane_id),
+                        SnapshotKind::Shell => self.pane_shell_metadata(ws_idx, pane_id),
+                    };
+                    let Some(pane) = pane else { continue };
+                    if kind == SnapshotKind::Shell {
+                        shell_agents.extend(self.agent_shell_info(ws_idx, pane_id, &pane));
+                    }
+                    panes.push(pane);
+                }
             }
         }
 
@@ -72,9 +77,18 @@ impl App {
             tabs,
             panes,
             layouts,
-            agents: self.collect_agent_infos(),
+            agents: match kind {
+                SnapshotKind::Public => self.collect_agent_infos(),
+                SnapshotKind::Shell => shell_agents,
+            },
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotKind {
+    Public,
+    Shell,
 }
 
 #[cfg(test)]

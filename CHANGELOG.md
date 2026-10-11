@@ -31,6 +31,7 @@
 - A live server keeps ownership of its session when its sockets disappear, so local startup and SSH bridges refuse to start a second server.
 - The status command exits 1 when its server is not running, while preserving the printed status.
 - Agent detection no longer reads the screen of a pane whose content has not changed since its last read; it reuses the text it read then. A server with 60 idle shell panes used 3.05% of a core and now uses 0.90%.
+- A full render with a client attached no longer reads `/proc` for every pane and every agent. The client shell snapshot reuses each pane's working directories for up to a second, and its agent rows skip the OMP process check and the OMP detail copy, which the shell does not show. With 60 OMP agents and 20 full renders a second, server CPU fell from 21% to 12% of a core.
 
 ## [0.9.1] - 2026-09-16
 

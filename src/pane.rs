@@ -1349,6 +1349,16 @@ async fn run_terminal_compression_task(
     }
 }
 
+/// How long `PaneRuntime::display_cwds` reuses what it read. A `cd` shows in the client
+/// shell within this time.
+const DISPLAY_CWDS_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct DisplayCwds {
+    read_at: std::time::Instant,
+    cwd: Option<std::path::PathBuf>,
+    foreground_cwd: Option<std::path::PathBuf>,
+}
+
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
 /// Dropping this aborts async tasks and closes the PTY. An already-running bounded
 /// compression step may finish before releasing its terminal reference.
@@ -1360,6 +1370,7 @@ pub struct PaneRuntime {
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     persistence_cwd: Mutex<Option<std::path::PathBuf>>,
+    display_cwds: Mutex<Option<DisplayCwds>>,
     cwd_process_exited: Arc<AtomicBool>,
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
@@ -2529,6 +2540,7 @@ impl PaneRuntime {
             child_pid,
             reported_cwd,
             persistence_cwd: Mutex::new(None),
+            display_cwds: Mutex::new(None),
             cwd_process_exited,
             child_wait_completed: None,
             kitty_keyboard_flags,
@@ -3131,6 +3143,7 @@ impl PaneRuntime {
             child_pid,
             reported_cwd,
             persistence_cwd: Mutex::new(None),
+            display_cwds: Mutex::new(None),
             cwd_process_exited: child_wait_completed.clone(),
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
@@ -3688,6 +3701,30 @@ impl PaneRuntime {
         }
     }
 
+    /// `cwd()` and `foreground_cwd()` for display, read from `/proc` at most once per
+    /// `DISPLAY_CWDS_TTL`. Every full render builds the client shell snapshot, which needs
+    /// both for every pane; reading them each time cost several syscalls per pane per frame.
+    pub fn display_cwds(&self) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        let mut cached = self
+            .display_cwds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cached
+            .as_ref()
+            .filter(|cached| cached.read_at.elapsed() < DISPLAY_CWDS_TTL)
+        {
+            return (cached.cwd.clone(), cached.foreground_cwd.clone());
+        }
+        let cwd = self.cwd();
+        let foreground_cwd = self.foreground_cwd();
+        *cached = Some(DisplayCwds {
+            read_at: std::time::Instant::now(),
+            cwd: cwd.clone(),
+            foreground_cwd: foreground_cwd.clone(),
+        });
+        (cwd, foreground_cwd)
+    }
+
     /// Get the current working directory of the process group controlling the pane PTY.
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
@@ -3865,6 +3902,7 @@ impl PaneRuntime {
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
                 persistence_cwd: Mutex::new(None),
+                display_cwds: Mutex::new(None),
                 cwd_process_exited: Arc::new(AtomicBool::new(false)),
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
@@ -5025,6 +5063,7 @@ mod tests {
         let runtime = PaneRuntime {
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),
+            display_cwds: Mutex::new(None),
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {
@@ -5064,6 +5103,7 @@ mod tests {
         let runtime = PaneRuntime {
             cwd_process_exited: Arc::new(AtomicBool::new(false)),
             persistence_cwd: Mutex::new(None),
+            display_cwds: Mutex::new(None),
             pane_id,
             terminal,
             io: PaneRuntimeIo::TestChannel {
