@@ -335,14 +335,38 @@ pub(super) fn codex_prompt_ready(content: &str) -> bool {
         && !recent.contains("Resumingsession")
 }
 
+// Release pairs with the Acquire load in `refresh_detection_text`: a reader
+// that sees the new sequence also sees the terminal write that preceded it.
 pub(super) fn observe_detection_content_change(bytes: &[u8], detection_content_seq: &AtomicU64) {
     if !bytes.is_empty() {
-        detection_content_seq.fetch_add(1, Ordering::Relaxed);
+        detection_content_seq.fetch_add(1, Ordering::Release);
     }
 }
 
 pub(super) fn mark_detection_content_changed(detection_content_seq: &AtomicU64) {
-    detection_content_seq.fetch_add(1, Ordering::Relaxed);
+    detection_content_seq.fetch_add(1, Ordering::Release);
+}
+
+/// Re-reads the detection text only when the pane's content sequence moved
+/// since `text` was read; an unchanged screen is never scraped twice. Returns
+/// whether the text changed.
+pub(super) fn refresh_detection_text(
+    read: impl FnOnce() -> String,
+    detection_content_seq: &AtomicU64,
+    text: &mut String,
+    text_seq: &mut Option<u64>,
+) -> bool {
+    // Loaded before the read: output that lands during the read moves the
+    // sequence again, so the next tick reads once more.
+    let seq = detection_content_seq.load(Ordering::Acquire);
+    if *text_seq == Some(seq) {
+        return false;
+    }
+    let fresh = read();
+    *text_seq = Some(seq);
+    let changed = fresh != *text;
+    *text = fresh;
+    changed
 }
 
 #[cfg(test)]
@@ -604,5 +628,61 @@ mod tests {
         mark_detection_content_changed(&seq);
 
         assert_eq!(seq.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn detection_text_is_read_again_only_after_content_moves() {
+        let seq = AtomicU64::new(0);
+        let mut text = String::new();
+        let mut text_seq = None;
+        let reads = std::cell::Cell::new(0);
+        let read = |screen: &'static str| {
+            let reads = &reads;
+            move || {
+                reads.set(reads.get() + 1);
+                screen.to_string()
+            }
+        };
+
+        assert!(refresh_detection_text(
+            read("a"),
+            &seq,
+            &mut text,
+            &mut text_seq
+        ));
+        assert!(!refresh_detection_text(
+            read("b"),
+            &seq,
+            &mut text,
+            &mut text_seq
+        ));
+        assert_eq!((text.as_str(), reads.get()), ("a", 1));
+
+        observe_detection_content_change(b"x", &seq);
+        assert!(!refresh_detection_text(
+            read("a"),
+            &seq,
+            &mut text,
+            &mut text_seq
+        ));
+        observe_detection_content_change(b"x", &seq);
+        assert!(refresh_detection_text(
+            read("c"),
+            &seq,
+            &mut text,
+            &mut text_seq
+        ));
+        assert_eq!((text.as_str(), reads.get()), ("c", 3));
+
+        // A detection reset forgets the sequence, so the next tick reads.
+        text.clear();
+        text_seq = None;
+        assert!(refresh_detection_text(
+            read("c"),
+            &seq,
+            &mut text,
+            &mut text_seq
+        ));
+        assert_eq!(reads.get(), 4);
     }
 }
