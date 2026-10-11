@@ -426,6 +426,11 @@ pub struct PaneReportAgentSessionV2Params {
     #[serde(skip)]
     #[schemars(skip)]
     pub peer_pid: Option<u32>,
+    /// Set by the server when the report came through the state socket, whose sender may only
+    /// confirm the launch profile Herdr started the pane with.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub via_state_socket: bool,
 }
 
 /// How OMP accepted an `agent.instruct` delivery.

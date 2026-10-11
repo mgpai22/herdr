@@ -37,6 +37,7 @@ pub fn run_server() -> io::Result<()> {
         api_tx.clone(),
         event_hub.clone(),
         should_quit.clone(),
+        api::StateKeyPolicy::Rotate,
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -140,6 +141,16 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     let mut received = crate::server::handoff::receive(socket_path, token)?;
     let server_lock = received.server_lock;
     crate::server::handoff::log_import_result(received.manifest.panes.len());
+    // A sender without `next_workspace_number` predates the state socket: it neither rotated the
+    // key on its own cold start nor kept workspace ids unique, so tokens made with the key on disk
+    // may name reused pane ids.
+    let state_key = match received.manifest.next_workspace_number {
+        Some(next) => {
+            crate::workspace::reserve_workspace_number(next);
+            api::StateKeyPolicy::Keep
+        }
+        None => api::StateKeyPolicy::Rotate,
+    };
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
@@ -183,6 +194,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
+            state_key,
         )?;
         let mut server = HeadlessServer::new(
             app,

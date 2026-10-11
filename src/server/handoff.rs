@@ -51,6 +51,10 @@ pub(crate) struct HandoffManifest {
     /// Servers from before the lock handoff send no lock and leave this false.
     #[serde(default)]
     pub carries_server_lock: bool,
+    /// The sender's next workspace number. Workspace ids must not repeat across a handoff:
+    /// state socket tokens, which survive it, are bound to pane ids. Absent from older senders.
+    #[serde(default)]
+    pub next_workspace_number: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -337,6 +341,7 @@ pub(crate) fn manifest_for(
         panes,
         api_window_title,
         carries_server_lock: true,
+        next_workspace_number: Some(crate::workspace::next_workspace_number()),
     }
 }
 

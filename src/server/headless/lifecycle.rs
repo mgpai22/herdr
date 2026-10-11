@@ -261,6 +261,7 @@ impl HeadlessServer {
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+            api::StateKeyPolicy::Keep,
         )?;
 
         let client_path = client_socket_path();
@@ -391,12 +392,12 @@ impl HeadlessServer {
 pub(super) fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     let api_socket = api::socket_path();
+    let state_socket = api::state_socket::state_socket_path(&api_socket);
     let client_socket = client_socket_path();
+    let open =
+        |path: &std::path::Path| path.exists() && crate::ipc::connect_local_stream(path).is_ok();
     while Instant::now() < deadline {
-        let api_open = api_socket.exists() && crate::ipc::connect_local_stream(&api_socket).is_ok();
-        let client_open =
-            client_socket.exists() && crate::ipc::connect_local_stream(&client_socket).is_ok();
-        if !api_open && !client_open {
+        if !open(&api_socket) && !open(&state_socket) && !open(&client_socket) {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));

@@ -2,13 +2,14 @@ pub mod client;
 mod event_hub;
 pub mod schema;
 mod server;
+pub(crate) mod state_socket;
 mod status;
 mod subscriptions;
 mod wait;
 
 pub use event_hub::EventHub;
 pub use server::ServerHandle;
-pub(crate) use server::{api_method_name, start_server_with_stop_control};
+pub(crate) use server::{api_method_name, start_server_with_stop_control, StateKeyPolicy};
 pub use status::{read_runtime_status_at, RuntimeStatus};
 
 use std::path::PathBuf;
