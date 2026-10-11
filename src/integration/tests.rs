@@ -608,6 +608,36 @@ fn install_pi_expands_tilde_in_pi_coding_agent_dir_env() {
 }
 
 #[test]
+fn install_pi_refuses_an_omp_agent_dir_from_pi_coding_agent_dir() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let profile_agent = home.join(".omp/profiles/work/agent");
+    let pi_ext = home.join(".pi/agent/extensions");
+    fs::create_dir_all(profile_agent.join("extensions")).unwrap();
+    fs::create_dir_all(&pi_ext).unwrap();
+    std::env::set_var("HOME", &home);
+    // What a named-profile OMP session exports to the commands it runs.
+    std::env::set_var(PI_CODING_AGENT_DIR_ENV_VAR, &profile_agent);
+
+    let err = install_pi().unwrap_err();
+
+    assert!(err.to_string().contains("PI_CODING_AGENT_DIR"), "{err}");
+    assert!(!profile_agent
+        .join("extensions")
+        .join(PI_EXTENSION_INSTALL_NAME)
+        .exists());
+
+    std::env::remove_var(PI_CODING_AGENT_DIR_ENV_VAR);
+    let path = install_pi().unwrap();
+    assert_eq!(path, pi_ext.join(PI_EXTENSION_INSTALL_NAME));
+
+    std::env::remove_var("HOME");
+    clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 fn install_omp_writes_embedded_asset_to_omp_extensions_dir() {
     let _lock = integration_env_lock();
     let base = unique_base();

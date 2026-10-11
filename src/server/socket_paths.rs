@@ -37,7 +37,7 @@ pub(crate) fn client_socket_path_from_overrides(
     client_socket_override: Option<&str>,
 ) -> PathBuf {
     if let Some(api_socket_override) = api_socket_override {
-        return derive_client_socket_from_api_socket(Path::new(api_socket_override));
+        return api_socket_sibling(Path::new(api_socket_override), "client.sock");
     }
 
     if let Some(client_socket_override) = client_socket_override {
@@ -47,14 +47,15 @@ pub(crate) fn client_socket_path_from_overrides(
     crate::session::client_socket_path_for(crate::session::active_name().as_deref())
 }
 
-pub(crate) fn derive_client_socket_from_api_socket(api_socket_path: &Path) -> PathBuf {
+/// `<parent>/<stem>-<suffix>` next to the API socket, e.g. `herdr.sock` -> `herdr-client.sock`.
+pub(crate) fn api_socket_sibling(api_socket_path: &Path, suffix: &str) -> PathBuf {
     let stem = api_socket_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("herdr");
     let parent = api_socket_path.parent().unwrap_or_else(|| Path::new(""));
 
-    parent.join(format!("{stem}-client.sock"))
+    parent.join(format!("{stem}-{suffix}"))
 }
 
 /// Prepares a socket path for binding: creates parent directories,
@@ -111,8 +112,8 @@ mod tests {
     }
 
     #[test]
-    fn derive_client_socket_from_api_socket_without_sock_extension() {
-        let derived = derive_client_socket_from_api_socket(Path::new("/tmp/custom-api"));
+    fn api_socket_sibling_without_sock_extension() {
+        let derived = api_socket_sibling(Path::new("/tmp/custom-api"), "client.sock");
         assert_eq!(derived, PathBuf::from("/tmp/custom-api-client.sock"));
     }
 
