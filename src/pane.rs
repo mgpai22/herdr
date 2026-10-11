@@ -38,9 +38,9 @@ mod xtgettcap;
 use self::agent_detection::{
     codex_prompt_ready, decide_detection_screen_read, decide_screen_detection_publish,
     detection_update_for_publish_with_osc, mark_detection_content_changed,
-    observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
-    DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    observe_detection_content_change, refresh_detection_text, DetectionPublishDecision,
+    DetectionScreenReadDecision, DetectionScreenReadInput, PendingIdleConfirmation,
+    ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 #[cfg(unix)]
 pub use self::terminal::InputState;
@@ -826,6 +826,7 @@ fn spawn_basic_detection_task(
         let mut foreground_shell_exit_reported = false;
         let mut release_was_active = false;
         let mut last_detection_text = String::new();
+        let mut last_detection_text_seq = None;
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
@@ -859,6 +860,7 @@ fn spawn_basic_detection_task(
                     foreground_shell_exit_reported = false;
                     release_was_active = false;
                     last_detection_text.clear();
+                    last_detection_text_seq = None;
                     last_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
@@ -1021,15 +1023,19 @@ fn spawn_basic_detection_task(
                 DetectionScreenReadDecision::Skip => continue,
             }
 
-            let content = terminal.detection_text();
             last_screen_scan_detection_content_seq = current_detection_content_seq;
-            let content_changed = content != last_detection_text;
-            last_detection_text.clone_from(&content);
+            let content_changed = refresh_detection_text(
+                || terminal.detection_text(),
+                &detection_content_seq,
+                &mut last_detection_text,
+                &mut last_detection_text_seq,
+            );
+            let content = last_detection_text.as_str();
             let osc_title = terminal.agent_osc_title();
             let osc_progress = terminal.agent_osc_progress();
             let screen_detection = detection_update_for_publish_with_osc(
                 agent,
-                &content,
+                content,
                 &osc_title,
                 &osc_progress,
                 process_exited,
@@ -1038,7 +1044,7 @@ fn spawn_basic_detection_task(
                 &state_events,
                 pane_id,
                 agent,
-                &content,
+                content,
                 screen_detection.as_ref(),
                 process_exited,
                 &mut last_codex_prompt_ready,
@@ -2742,6 +2748,7 @@ impl PaneRuntime {
                 let mut last_visible_working = false;
                 let mut last_visible_signal_refresh = None;
                 let mut last_detection_text = String::new();
+                let mut last_detection_text_seq = None;
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
@@ -2785,6 +2792,7 @@ impl PaneRuntime {
                             last_visible_working = false;
                             last_visible_signal_refresh = None;
                             last_detection_text.clear();
+                            last_detection_text_seq = None;
                             last_screen_scan_detection_content_seq = None;
                             agent_startup_grace_until = None;
                             pending_idle.clear();
@@ -3020,15 +3028,19 @@ impl PaneRuntime {
                         DetectionScreenReadDecision::Skip => continue,
                     }
 
-                    let content = terminal.detection_text();
                     last_screen_scan_detection_content_seq = current_detection_content_seq;
-                    let content_changed = content != last_detection_text;
-                    last_detection_text.clone_from(&content);
+                    let content_changed = refresh_detection_text(
+                        || terminal.detection_text(),
+                        &detection_content_seq,
+                        &mut last_detection_text,
+                        &mut last_detection_text_seq,
+                    );
+                    let content = last_detection_text.as_str();
                     let osc_title = terminal.agent_osc_title();
                     let osc_progress = terminal.agent_osc_progress();
                     let screen_detection = detection_update_for_publish_with_osc(
                         agent,
-                        &content,
+                        content,
                         &osc_title,
                         &osc_progress,
                         process_exited,
@@ -3037,7 +3049,7 @@ impl PaneRuntime {
                         &state_events,
                         pane_id,
                         agent,
-                        &content,
+                        content,
                         screen_detection.as_ref(),
                         process_exited,
                         &mut last_codex_prompt_ready,

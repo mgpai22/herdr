@@ -30,6 +30,7 @@
 - Descriptors received in a live handoff are close-on-exec, so processes started later can no longer keep the server lock after the server exits.
 - A live server keeps ownership of its session when its sockets disappear, so local startup and SSH bridges refuse to start a second server.
 - The status command exits 1 when its server is not running, while preserving the printed status.
+- Agent detection no longer reads the screen of a pane whose content has not changed since its last read; it reuses the text it read then. A server with 60 idle shell panes used 3.05% of a core and now uses 0.90%.
 
 ## [0.9.1] - 2026-09-16
 
