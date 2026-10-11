@@ -19,7 +19,10 @@ const HERDR_ENV = process.env.HERDR_ENV;
 // never retried on HERDR_SOCKET_PATH, so the state socket's limits always hold.
 const stateSocketPath = process.env.HERDR_STATE_SOCKET_PATH;
 const stateToken = process.env.HERDR_STATE_TOKEN;
-const socketPath = stateSocketPath || process.env.HERDR_SOCKET_PATH;
+// Presence, not truthiness: an empty HERDR_STATE_SOCKET_PATH still means "state socket only", and
+// then nothing is sent.
+const stateMode = stateSocketPath !== undefined;
+const socketPath = stateMode ? stateSocketPath : process.env.HERDR_SOCKET_PATH;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:omp";
 // OMP marks every shell it spawns with OMPCODE=1. A nested `omp` launched from
@@ -35,7 +38,7 @@ function enabled() {
   return (
     HERDR_ENV === "1" &&
     !!socketPath &&
-    (!stateSocketPath || !!stateToken) &&
+    (!stateMode || !!stateToken) &&
     !!paneId &&
     !nestedOmpSession &&
     inHerdrPane
@@ -69,7 +72,7 @@ function sendRequestAttempt(request: any, timeoutMs: number): Promise<Reply> {
   socket.setEncoding("utf8");
   socket.on("error", () => finish("unreachable"));
   socket.on("connect", () =>
-    socket.write(`${JSON.stringify(stateSocketPath ? { ...request, state_token: stateToken } : request)}\n`),
+    socket.write(`${JSON.stringify(stateMode ? { ...request, state_token: stateToken } : request)}\n`),
   );
   socket.on("data", (chunk) => {
     response += chunk;

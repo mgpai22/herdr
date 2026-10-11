@@ -1673,8 +1673,11 @@ impl App {
         };
         // The state socket's sender is the agent itself, so it may not pick the launcher Herdr
         // resumes its session with: only the profile Herdr holds for the pane, the saved session's
-        // (carried across handoff and restore) or else the one `agent.start` launched it with.
-        if params.via_state_socket && terminal.omp_launch_profile() != Some(profile.as_str()) {
+        // (carried across handoff and restore), else the one `agent.start` launched it with, else
+        // `default` (a bare start, the profile a bare `omp` reports).
+        if params.via_state_socket
+            && terminal.omp_launch_profile().unwrap_or("default") != profile.as_str()
+        {
             return encode_error(
                 id,
                 "forbidden",
@@ -1698,8 +1701,7 @@ impl App {
                     })
             })
         {
-            // `forbidden`, like every state-socket-only refusal, so an agent that also holds the
-            // full socket sends it there, where this check does not apply.
+            // `forbidden`, like every state-socket-only refusal; the integration treats it as final.
             return encode_error(
                 id,
                 "forbidden",

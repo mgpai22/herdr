@@ -809,7 +809,7 @@ token belongs to:
 Any other method, a missing token or a token for another pane gets `forbidden`.
 A `pane.report_agent_session_v2` on the state socket must also name the launch
 profile Herdr already holds for the pane (its saved OMP session's, else the one
-`agent.start --profile` used), and not a session file another pane has saved, so
+`agent.start --profile` used, else `default`), and not a session file another pane has saved, so
 the agent cannot choose the launcher Herdr resumes it with or take another
 pane's session. Both refusals are `forbidden`.
 

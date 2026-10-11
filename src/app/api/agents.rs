@@ -2431,8 +2431,7 @@ mod tests {
         }
         let before = saved(&app);
 
-        // Not started with a profile, or started with another one: the agent cannot choose.
-        assert!(report(&mut app, 10).contains("\"forbidden\""));
+        // Started with another profile: the agent cannot choose.
         set_managed(&mut app, "restricted");
         assert!(report(&mut app, 11).contains("\"forbidden\""));
         assert_eq!(saved(&app), before);
@@ -2466,6 +2465,53 @@ mod tests {
         assert!(
             serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
             "{reported}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_state_socket_report_registers_a_bare_omp_start() {
+        let (mut app, p, _rx) = guarded_fixture(AgentState::Idle);
+        let target = p.target;
+        let pid = std::process::id();
+        for terminal in app.state.terminals.values_mut() {
+            terminal.persisted_agent_session = None;
+        }
+        let report = |app: &mut App, seq: u64, profile: &str| {
+            app.handle_pane_report_agent_session_v2(
+                "v2".into(),
+                crate::api::schema::PaneReportAgentSessionV2Params {
+                    pane_id: target.clone(),
+                    source: "herdr:omp".into(),
+                    agent: "omp".into(),
+                    seq: Some(seq),
+                    agent_session_id: None,
+                    agent_session_path: Some(fixture_session_path()),
+                    session_start_source: Some("startup".into()),
+                    launch_profile: profile.into(),
+                    agent_pid: pid,
+                    accepts_instructions: true,
+                    accepts_actions: true,
+                    ui_mode: None,
+                    runtime_instance: Some(FIXTURE_RUNTIME.into()),
+                    block_token: None,
+                    peer_pid: Some(pid),
+                    via_state_socket: true,
+                },
+            )
+        };
+        // A bare start (no `--profile`, no saved session) may not pick another launcher.
+        assert!(report(&mut app, 10, "restricted").contains("\"forbidden\""));
+        // But the OMP integration's own report ("default") registers it.
+        let reported = report(&mut app, 11, "default");
+        assert!(
+            serde_json::from_str::<SuccessResponse>(&reported).is_ok(),
+            "{reported}"
+        );
+        assert!(
+            app.agent_info_for_target(&target)
+                .unwrap()
+                .accepts_instructions
         );
     }
 

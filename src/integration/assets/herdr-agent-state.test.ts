@@ -371,25 +371,42 @@ test("OMP never falls back to the full socket when the state socket is gone", as
   expect(endpoints).not.toContain(process.env.HERDR_SOCKET_PATH);
 });
 
-test("OMP sends nothing when it has the state socket but no token", async () => {
-  const requests = await startRecordingServer("omp-state-socket-no-token");
-  process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
-  const { handlers, pi } = createExtensionHarness();
-  const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
-  install(pi);
+test("OMP sends nothing when it has the state socket but no token, or an empty state path", async () => {
+  for (const [name, statePath, token] of [
+    ["no-token", undefined, undefined],
+    ["empty-path", "", "pane-token"],
+  ] as const) {
+    const requests = await startRecordingServer(`omp-state-socket-${name}`);
+    process.env.HERDR_STATE_SOCKET_PATH = statePath ?? process.env.HERDR_SOCKET_PATH;
+    if (token) process.env.HERDR_STATE_TOKEN = token;
+    const { handlers, pi } = createExtensionHarness();
+    const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
+    install(pi);
 
-  await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
-  // Nothing observable happens when the integration is off, so give its request queue a moment.
-  await Bun.sleep(200);
+    await handlers.get("session_start")?.({ reason: "startup" }, piContext(() => true));
+    // Nothing observable happens when the integration is off, so give its request queue a moment.
+    await Bun.sleep(200);
 
-  expect(requests).toEqual([]);
+    expect(requests).toEqual([]);
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = undefined;
+    delete process.env.HERDR_STATE_TOKEN;
+  }
 });
 
 test("OMP treats a refusal on the state socket as final", async () => {
   const requests = await startRecordingServer("omp-state-token-refused");
+  // The full socket is a separate path the integration must never dial.
   process.env.HERDR_STATE_SOCKET_PATH = process.env.HERDR_SOCKET_PATH;
+  const fullPath = join(tmpdir(), `herdr-full-${process.pid}.sock`);
+  process.env.HERDR_SOCKET_PATH = fullPath;
   process.env.HERDR_STATE_TOKEN = "stale-token";
   recordingReply = (request) => ({ id: request.id, error: { code: "forbidden", message: "stale" } });
+  const endpoints: unknown[] = [];
+  net.createConnection = ((...args: Parameters<typeof net.createConnection>) => {
+    endpoints.push(args[0]);
+    return originalCreateConnection(...args);
+  }) as typeof net.createConnection;
   const { handlers, pi } = createExtensionHarness();
   const { default: install } = await importFresh("./omp/herdr-agent-state.ts");
   install(pi);
@@ -401,6 +418,7 @@ test("OMP treats a refusal on the state socket as final", async () => {
     recordingReply = undefined;
   }
 
+  expect(endpoints).not.toContain(fullPath);
   expect(requests.every((request) => isRecord(request) && request.state_token === "stale-token")).toBe(true);
 });
 
